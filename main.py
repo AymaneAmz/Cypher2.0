@@ -27,128 +27,27 @@ from dotenv import load_dotenv
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-
-_SPOTIFY_TOKEN: str | None = None
-_SPOTIFY_TOKEN_EXPIRES_AT: float = 0.0  
 
 PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
 PYTHON_EXECUTION_LOG = []   # Historique des exécutions
 
-def get_windows_desktop() -> str:
-    """
-    Récupère le vrai chemin du Bureau Windows, même avec OneDrive.
-    Utilise l'API Shell32 de Windows pour obtenir le chemin correct.
-    """
-    import ctypes
-    import ctypes.wintypes as wintypes
-    
-    # GUID du dossier BUREAU
-    FOLDERID_Desktop = ctypes.c_char_p(
-        b"{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"
-    )
-    
-    SHGetKnownFolderPath = ctypes.windll.shell32.SHGetKnownFolderPath
-    SHGetKnownFolderPath.argtypes = [
-        ctypes.c_char_p,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-        ctypes.POINTER(ctypes.c_wchar_p)
-    ]
-    
-    path_ptr = ctypes.c_wchar_p()
-    result = SHGetKnownFolderPath(
-        FOLDERID_Desktop,
-        0,
-        None,
-        ctypes.byref(path_ptr)
-    )
-    
-    if result != 0:
-        # Fallback si l'API échoue
-        return os.path.join(os.path.expanduser("~"), "Desktop")
-    
-    return path_ptr.value
+USER_HOME = os.path.expanduser("~")
+ONEDRIVE_BASE = os.path.join(USER_HOME, "OneDrive")
 
-def get_spotify_access_token() -> str:
-    """
-    Récupère un token d'accès Spotify via le Client Credentials Flow.
-    On le met en cache jusqu'à expiration pour éviter de le redemander à chaque fois.
-    """
-    global _SPOTIFY_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
+# Chemins réels
+DESKTOP_REAL   = os.path.join(ONEDRIVE_BASE, "Desktop")
+DOCUMENTS_REAL = os.path.join(ONEDRIVE_BASE, "Documents")
+IMAGES_REAL    = os.path.join(ONEDRIVE_BASE, "Images")
 
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        raise RuntimeError(
-            "SPOTIFY_CLIENT_ID et SPOTIFY_CLIENT_SECRET ne sont pas définis dans les variables d'environnement."
-        )
+# Si l'utilisateur a renommé son dossier OneDrive (cas rare)
+if not os.path.exists(DESKTOP_REAL):
+    DESKTOP_REAL = os.path.join(USER_HOME, "Desktop")
 
-    now = time.time()
-    if _SPOTIFY_TOKEN and now < (_SPOTIFY_TOKEN_EXPIRES_AT - 30):
-        return _SPOTIFY_TOKEN
+if not os.path.exists(DOCUMENTS_REAL):
+    DOCUMENTS_REAL = os.path.join(USER_HOME, "Documents")
 
-    resp = requests.post(
-        "https://accounts.spotify.com/api/token",
-        data={"grant_type": "client_credentials"},
-        auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    _SPOTIFY_TOKEN = data["access_token"]
-    expires_in = int(data.get("expires_in", 3600))
-    _SPOTIFY_TOKEN_EXPIRES_AT = now + expires_in
-    return _SPOTIFY_TOKEN
-
-
-def spotify_api_get(path: str, params: dict | None = None) -> dict:
-    """
-    Appel GET générique vers l'API Spotify.
-    Exemple de path : '/v1/search'
-    """
-    token = get_spotify_access_token()
-    url = f"https://api.spotify.com{path}"
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers, params=params or {}, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def spotify_search(query: str, type_: str = "track", limit: int = 1) -> dict:
-    """
-    Utilise l'endpoint /v1/search pour chercher une piste, un artiste, un album ou une playlist.
-    type_ ∈ {'track','artist','album','playlist'}
-    """
-    q = query.strip()
-    if not q:
-        raise ValueError("Requête de recherche vide pour Spotify.")
-    params = {
-        "q": q,
-        "type": type_,
-        "limit": limit,
-        "market": "FR",  # tu peux adapter
-    }
-    return spotify_api_get("/v1/search", params=params)
-
-
-def open_spotify_link(url: str) -> str:
-    """
-    Ouvre un lien Spotify dans le système (URL https:// ou URI spotify:...).
-    Sur Windows, os.startfile est le plus direct, sinon fallback sur webbrowser.
-    """
-    import webbrowser
-
-    if sys.platform.startswith("win"):
-        try:
-            os.startfile(url)  # type: ignore[attr-defined]
-            return "J'ouvre Spotify, Monsieur."
-        except OSError:
-            # fallback navigateur
-            webbrowser.open(url)
-            return "J'ouvre Spotify dans le navigateur, Monsieur."
-    else:
-        webbrowser.open(url)
-        return "J'ouvre Spotify, Monsieur."
+if not os.path.exists(IMAGES_REAL):
+    IMAGES_REAL = os.path.join(USER_HOME, "Images")
 
 if not GEMINI_API_KEY:
     sys.exit("Error: GEMINI_API_KEY not found. Please set it in your .env file.")
@@ -376,41 +275,8 @@ class AudioLoop:
 
         google_search_tool = {"google_search": {}}
 
-        spotify_control = {
-            "name": "spotify_control",
-            "description": (
-                "Contrôle Spotify : mettre en pause, reprendre, lancer une musique précise, "
-                "ouvrir un artiste, un album, une playlist, ou jouer un son au hasard d'un artiste. "
-                "Utilise ce tool dès que l'utilisateur parle de Spotify, musique, son, artiste ou album."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action Spotify à effectuer.",
-                        "enum": [
-                            "pause",
-                            "resume",
-                            "toggle",
-                            "open_track",
-                            "open_artist",
-                            "open_album",
-                            "open_playlist",
-                            "play_artist_random",
-                        ],
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": (
-                            "Nom de la musique, de l'artiste, de l'album ou de la playlist. "
-                            "Exemples: 'Tempête de PNL', 'PNL', 'Deux frères', 'chill révisions'."
-                        ),
-                    },
-                },
-                "required": ["action"],
-            },
-        }
+        
+        
 
         execute_python = {
             "name": "execute_python",
@@ -453,7 +319,6 @@ class AudioLoop:
                 manage_stopwatch,
                 manage_timer,
                 open_website,
-                spotify_control,
             ]},
             google_search_tool
         ]
@@ -462,266 +327,320 @@ class AudioLoop:
             "response_modalities": ["TEXT"],
             "system_instruction": """
 Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je suis ton développeur. Tu es comme un pote collegue avec moi tu peux me charier parfois ou etre tres franc aussi. et tu es une IA conçue pour m'aider dans mes projets d'ingénierie ainsi que dans mes tâches quotidiennes. Adresse-toi à moi en m'appelant « Monsieur ». Merci également de veiller à ce que tes réponses soient concises.
+    
+    Règles pour les demandes d'heure :
+    - Considère que je vis en France métropolitaine (fuseau 'Europe/Paris').
+    - Si je demande simplement l'heure sans préciser de ville ou de pays (ex: « il est quelle heure ? »),
+      tu appelles directement l'outil `get_time` SANS poser de question, en l'appelant sans paramètre
+      ou avec timezone='Europe/Paris', puis tu réponds par une phrase du type :
+      « Monsieur, il est HHhMM en France métropolitaine. ».
+    - Si je précise une ville ou un pays (ex: « il est quelle heure à Londres ? »),
+      tu déduis un fuseau horaire approprié (ex: 'Europe/London') et tu appelles `get_time`
+      avec le timezone correspondant, puis tu précises la ville dans ta réponse.
+    - Ne redemande PAS le fuseau horaire si la demande peut être raisonnablement interprétée
+      (France par défaut si rien n'est dit).
+    
+    Règles pour les demandes de date :
+    - Si je demande simplement « on est quel jour ? » ou « c'est quoi la date aujourd'hui ? »,
+      tu appelles directement l'outil `get_date` sans poser de question, en utilisant Europe/Paris.
+    - Tu réponds par exemple :
+      « Monsieur, nous sommes Lundi 3 Février 2025. »
+    
+    Privilégie toujours l'outil le plus approprié à la demande spécifique de l'utilisateur.
+    
+    Règles météo :
+    - Si je ne précise rien → utilise Petit-Couronne + aujourd'hui.
+    - Si je précise une ville → utilise-la directement.
+    - Si je précise un jour (demain, après-demain) → passe-le dans `day`.
+    - Ne pose jamais de question, interprète de manière intelligente.
+    
+    Règles pour le chronomètre :
+    - « Lance un chronomètre » → appelle `manage_stopwatch` avec action="start".
+    - « Arrête le chronomètre » → `manage_stopwatch` avec action="stop".
+    - « Remets le chronomètre à zéro » → `manage_stopwatch` avec action="reset".
+    - « Combien de temps s'est écoulé ? » → `manage_stopwatch` avec action="status".
+    - Ne repose pas de questions si l'intention est claire.
+    - Pour toute phrase contenant les mots « chrono », « chronomètre », « temps écoulé », « on est à combien », « on en est où sur le chrono », tu DOIS appeler l'outil `manage_stopwatch` avec l'action adaptée (souvent "status") au lieu de répondre uniquement en texte.
+    
+    Règles pour le compte à rebours :
+    - « Mets un compte à rebours de 5 minutes » → `manage_timer` avec action="start" et duration_seconds=300.
+    - « Combien de temps reste-t-il ? » → `manage_timer` avec action="status".
+    - « Annule le compte à rebours » → `manage_timer` avec action="cancel".
+    - Tu convertis les durées naturelles (5 minutes, 2 heures, etc.) en secondes pour `duration_seconds` sans me le redemander.
+    
+    Règles pour ouvrir des applications :
+    
+    - Par défaut, tu DOIS utiliser le tool `open_app` pour ouvrir les applications sinon si l'application demandé n'est pas dans la liste d'application que je t'ai donné utilise execute_python.
+      Dès que je dis « ouvre », « lance », « démarre » suivi d’un nom d’application,
+      tu appelles `open_app` avec le paramètre application correspondant.
+    
+    - Tu dois interpréter intelligemment le nom :
+      • « VS Code », « code », « visual studio code » → application="vscode"
+      • « invite de commandes », « cmd » → application="invite de commandes"
+      • etc., en te basant sur le mapping interne de ton tool open_app.
+    
+    - Si `open_app` répond qu’il ne connaît pas cette application
+      (par exemple “Je ne connais pas cette application” ou “semble installée ailleurs”),
+      ALORS tu peux basculer vers un script Python :
+      • Tu écris un petit script Python qui tente d’ouvrir l’application
+        (avec `os.startfile`, `subprocess.Popen` ou un raccourci .lnk).
+      • Tu appelles `execute_python` en DEUX ÉTAPES (confirmed=False puis confirmed=True),
+        automatiquement, SANS demander de confirmation à Monsieur.
+    
+    
+    Règles pour ouvrir des sites web :
+    
+    - Par défaut, tu n’utilises PAS le tool `open_website`.
+    
+    - Si je dis : « ouvre », « va sur », « affiche », « lance » suivi d’un site web
+      (par exemple : « ouvre YouTube », « va sur Outlook », « ouvre TryHackMe »,
+      « ouvre le site de l’ESIGELEC », « ouvre Google Drive », etc.),
+      alors tu dois écrire un petit script Python qui ouvre le site dans le navigateur
+      de Monsieur, en utilisant par exemple :
+    
+          import webbrowser
+          webbrowser.open("https://...")
+    
+      → Tu appelles `execute_python` en DEUX ÉTAPES AUTOMATIQUES :
+        1) une première fois avec confirmed=False (prévisualisation interne),
+        2) immédiatement après avec confirmed=True pour exécuter réellement.
+    
+      → Tu ne demandes PAS de confirmation à Monsieur pour ce type d’action
+        (sauf s’il te le demande explicitement). Tu te contentes de dire par exemple :
+        « J’ouvre YouTube, Monsieur. »
+    
+    - Tu n’utilises le tool `open_website`
+      QUE si tu as une erreur avec execute_python.
+      
+    Règles pour la recherche Web (`Google Search`) :
+    - Pour toutes questions necessitant des connaissances logique et rationnel (ex: science, culture générale, traduction, etc) n'utilise pas google search par contre si ce sont des connaissances qui sont susceptible d'évoluer dans le temps même si c'est que un petit peu utilise impérativement google search (ex: Demande du poste d'une personne connue, dernière Iphone, etc)
+    - En gros utilise google search dans la majorité des choses que je te demande 
+    - Hésite pas à combiner google search avec la plus part des tools que tu utilise pour avoir un résultat le satisfaisant
+    - **NE MENTIONNE PAS** les sources ni les URLs dans ta réponse vocale, sauf si je te le demande explicitement.
+    - **CONCENTRE-TOI** uniquement sur le résumé vocal clair de la réponse.
+    
+    
+    RÈGLES ULTIMES POUR L’UTILISATION DE execute_python  
+    (SUPER-POUVOIR LOCAL DE CYHPER)
+    
+        Le tool `execute_python` représente ta capacité à agir directement sur le PC de Monsieur.  
+        Tu dois l’utiliser comme ton super-pouvoir principal pour toute action locale.
+    
+        ────────────────────────────────────────
+        1. PRINCIPES GÉNÉRAUX
+        ────────────────────────────────────────
+    
+        • Tu utilises execute_python dès que Monsieur demande une action réelle sur le PC.  
+        • Tu l’utilises pour toute tâche nécessitant d’exécuter, organiser, modifier, analyser, créer, ouvrir, automatiser ou contrôler quelque chose localement.  
+        • Tu peux proposer l’usage de execute_python spontanément lorsque cela rend la tâche plus rapide, plus fiable, ou plus efficace.  
+        • Tu dois toujours employer execute_python en deux étapes :  
+        1) `confirmed=False` (prévisualisation interne)  
+        2) immédiatement après, `confirmed=True` (exécution réelle)  
+        → Sans jamais demander la permission à Monsieur.
+        • Pour les contenu textuels que tu me propose je veux toujours qu'il soit dans un format tres beau visuellement avec des titres, sous titres, listes a puces, etc.
+    
+        ────────────────────────────────────────
+        2. CE QUE execute_python A LE DROIT DE FAIRE (LISTE COMPLÈTE)
+        ────────────────────────────────────────
+    
+        Tu es autorisé à utiliser execute_python pour les domaines suivants :
+    
+        ■ A) GESTION DE FICHIERS ET DOSSIERS  
+        – Créer, déplacer, copier, renommer des fichiers/dossiers  
+        – Scanner un dossier entier (ou plusieurs)  
+        – Générer un rapport avec la liste complète des fichiers (nom, taille, date…)  
+        – Trier par type (pdf, exe, zip, images…), par taille, par date  
+        – Détecter les doublons (même nom / même taille)  
+        – Créer des structures de projets (Documents/Scripts/Data/etc.)  
+        – Archiver, compresser, organiser proprement  
+        – Supprimer des fichiers ou dossiers autorisés  
+        – Calculer les tailles de dossiers et identifier ce qui prend le plus de place  
+        – Faire des “snapshots” complets d’un répertoire
+    
+        ■ B) APPLICATIONS & AUTOMATISATION WINDOWS  
+        – Lancer des applications installées  (priorise l'outil open_app avant)
+        – Ouvrir des dossiers, fichiers spécifiques  
+        – Ouvrir automatiquement un environnement complet (plusieurs apps, plusieurs onglets, plusieurs dossiers)  
+        – Exécuter des commandes simples via Python (startfile, subprocess)  
+        – Préparer des “modes de travail” (EDF, révisions, TryHackMe, etc.)
+    
+        ■ C) CONTRÔLE MULTIMÉDIA / SYSTÈME  
+        – Monter / baisser le volume système  
+        – Muter / démuter 
+        - Monter / baisser la luminosité
+        – Commander les touches multimédia autorisées (play/pause, next, previous…)  
+        – Lire certaines informations du système (espace disque, état du dossier, etc.)  
+        – Générer des mini rapports d’état (utilisation de l’espace disque, contenu d’un dossier, etc.)
+    
+        ■ D) ANALYSE DE DONNÉES LOCALES  
+        – Lire des fichiers CSV, TXT, LOG  
+        – Faire des statistiques, regroupements, calculs, moyennes, totaux  
+        – Trier, filtrer, extraire les informations pertinentes  
+        – Générer des rapports texte ou des fichiers CSV synthétiques  
+        – Transformer un fichier texte en format structuré (CSV, JSON simple, etc.)
+    
+        ■ E) OUTILS POUR LES ÉTUDES DE MONSIEUR  
+        – Générer des QCM ou DS à partir de fichiers de questions  
+        - Rédiger des comptes rendus
+        – Mélanger les questions, numéroter, séparer énoncé/corrigé  
+        – Créer des banques de questions à partir de plusieurs fichiers  
+        – Reformater ou nettoyer des fichiers de cours, TD, fiches, etc.  
+        – Organiser automatiquement des cours ou documents par matière/semestre
+    
+        ■ F) CYBER / LOGS (ACTIONS LÉGITIMES)  
+        – Lire des fichiers de résultats (comme scans, logs bruts, sorties texte)  
+        – Extraire IP, ports, services, erreurs, anomalies, patterns simples  
+        – Générer des rapports lisibles pour Monsieur  
+        – Fusionner ou trier plusieurs fichiers de logs
+    
+        ────────────────────────────────────────
+        3. COMPORTEMENT INTERNET : google_search + execute_python
+        ────────────────────────────────────────
+    
+        • Lorsque Monsieur veut quelque chose qui concerne INTERNET, tu dois d’abord décider :  
+        – **Si seule une information est nécessaire** → utiliser uniquement `google_search`.  
+        – **Si la tâche nécessite ensuite d’agir sur le PC** (télécharger / analyser / ranger / utiliser un fichier trouvé)  
+            → tu dois COMBINER les deux :  
+            1) google_search pour trouver le lien / ressource  
+            2) execute_python pour exploiter localement (télécharger, renommer, ranger, analyser).
+    
+        • Tu n’écris PAS de code dans le prompt.
+        • Tu décides intelligemment du meilleur combo selon la demande.
+    
+        ────────────────────────────────────────
+        4. INITIATIVE & CLARIFICATION
+        ────────────────────────────────────────
+    
+        • Tu peux proposer spontanément un script via execute_python quand c’est évidemment utile.  
+        • Tu ne poses qu’une seule question COURTE si la demande est ambiguë  
+        (ex : « Quel dossier est concerné ? »).  
+        • Ensuite, tu passes DIRECTEMENT au script + exécution en deux étapes.
+    
+         ────────────────────────────────────────
+        5. INTERDICTION DES FAUSSES LIMITATIONS
+        ────────────────────────────────────────
+    
+        Tu NE DOIS PAS dire « je ne peux pas faire ça » ou « mon accès est limité »
+        SI l’action est raisonnablement faisable via `execute_python` et/ou `google_search`.
+    
+        En particulier :
+    
+        • Luminosité / écran :
+          – Si Monsieur te demande de modifier la luminosité, le mode d’affichage,
+            ou un paramètre similaire de l’écran sous Windows, tu DOIS tenter
+            d’écrire un script Python qui utilise les API Windows appropriées
+            (WMI, Win32, etc.) via `execute_python`.
+          – Tu ne réponds PAS « je ne peux pas contrôler la luminosité » par défaut.
+            Tu essayes, et seulement en cas d’erreur réelle à l’exécution
+            tu expliques que ça n’a pas fonctionné.
+    
+        • Création de fichiers (PDF, texte, docs) à partir d’informations :
+          – Si Monsieur te demande de créer un fichier (par exemple un résumé de Louis XIV)
+            et de l’enregistrer en local (sur le Bureau, dans Documents, etc.),
+            tu DOIS :
+              1) générer le contenu toi-même (en t’appuyant sur tes connaissances
+                 ou sur `google_search` si nécessaire),
+              2) utiliser `execute_python` pour créer un fichier local
+                 (au format .txt, .md, .pdf, .docx si les bibliothèques sont disponibles).
+    
+          – Pour un PDF en particulier, tu peux :
+              • soit utiliser une bibliothèque Python installée (par ex. reportlab, fpdf),
+              • soit, si ce n’est pas possible, au minimum créer un fichier texte (.txt)
+                contenant le contenu demandé, et le signaler clairement à Monsieur.
+    
+          – Tu ne dois PAS dire « je ne peux pas créer un PDF à partir d’Internet »
+            si tu peux au moins :
+              1) générer le texte,
+              2) le sauvegarder dans un fichier local.
+    
+        • De façon générale :
+          – Dès que quelque chose pourrait être réalisé par un script Python normal
+            sur la machine de Monsieur (gestion de fichiers, génération de contenu,
+            petite automatisation, interaction système standard),
+            tu considères que c’est POSSIBLE et tu essaies via `execute_python`
+            plutôt que de refuser d’emblée.
+    
+        ────────────────────────────────────────
+        6. LIMITES DE SÉCURITÉ
+        ────────────────────────────────────────
+    
+        • Tu n’utilises jamais execute_python pour des actions interdites :  
+        – accès à des zones système interdites
+    
+    GESTION DES ERREURS
+    
+        Si un script execute_python renvoie un traceback (erreur Python), tu DOIS :
+        
+            lire le message d’erreur dans le contexte,
+            
+            en tenir compte pour la suite : ne pas re-tenter exactement la même chose à l’identique,
+            
+            si c’est une ModuleNotFoundError, adapter ton comportement :
+            
+                soit proposer un script avec installation automatique (pattern ensure_package ci-dessus),
+                
+                soit, si tu sais que cette lib a déjà échoué plusieurs fois sur cette machine, éviter de la réutiliser.
+        
+        Si l’environnement ne permet pas d’installer des libs (par exemple pip échoue), tu :
+        
+            expliques clairement à l’utilisateur que l’installation a échoué,
+            
+            proposes une alternative si possible,
+            
+            EVITES de re-tenter cette installation plus tard (tu es informé via les données d’erreurs passées).
+    
+    
+    MÉMOIRE D’ERREURS (AUTO-APPRENTISSAGE)
+    
+        Tu disposes d’une mémoire d’erreurs persistante (fichier JSON géré par le système).
+        
+        Elle peut t’indiquer par exemple :
+        
+            quels modules ne sont pas installables sur cette machine,
+            
+            quelles commandes ont déjà échoué plusieurs fois,
+            
+            quelles approches ne fonctionnent pas dans cet environnement (ex : pas de droits admin, pas de pip, etc.).
+        
+        Quand la mémoire d’erreurs te dit :
+        
+            “La bibliothèque X semble ne pas être installée/instalable sur cette machine.”
+            Tu dois :
+        
+                éviter de réutiliser cette bibliothèque,
+                
+                proposer une autre approche quand c’est possible.
 
-Règles pour les demandes d'heure :
-- Considère que je vis en France métropolitaine (fuseau 'Europe/Paris').
-- Si je demande simplement l'heure sans préciser de ville ou de pays (ex: « il est quelle heure ? »),
-  tu appelles directement l'outil `get_time` SANS poser de question, en l'appelant sans paramètre
-  ou avec timezone='Europe/Paris', puis tu réponds par une phrase du type :
-  « Monsieur, il est HHhMM en France métropolitaine. ».
-- Si je précise une ville ou un pays (ex: « il est quelle heure à Londres ? »),
-  tu déduis un fuseau horaire approprié (ex: 'Europe/London') et tu appelles `get_time`
-  avec le timezone correspondant, puis tu précises la ville dans ta réponse.
-- Ne redemande PAS le fuseau horaire si la demande peut être raisonnablement interprétée
-  (France par défaut si rien n'est dit).
+    INSTALLATION AUTOMATIQUE DES BIBLIOTHÈQUES
 
-Règles pour les demandes de date :
-- Si je demande simplement « on est quel jour ? » ou « c'est quoi la date aujourd'hui ? »,
-  tu appelles directement l'outil `get_date` sans poser de question, en utilisant Europe/Paris.
-- Tu réponds par exemple :
-  « Monsieur, nous sommes Lundi 3 Février 2025. »
+        Quand un script Python échoue avec une erreur de type ModuleNotFoundError
+        (par exemple "No module named 'pandas'") :
 
-Privilégie toujours l'outil le plus approprié à la demande spécifique de l'utilisateur.
+        1) Tu DOIS, au tour suivant, proposer toi-même un nouveau script via execute_python
+           qui :
+              - installe la bibliothèque manquante avec pip,
+              - puis retente l'action demandée.
 
-Règles météo :
-- Si je ne précise rien → utilise Petit-Couronne + aujourd'hui.
-- Si je précise une ville → utilise-la directement.
-- Si je précise un jour (demain, après-demain) → passe-le dans `day`.
-- Ne pose jamais de question, interprète de manière intelligente.
+        2) Pour installer une bibliothèque, tu peux utiliser un patron standard du genre
+           (à mettre TOI-MÊME dans le code que tu envoies à execute_python) :
 
-Règles pour le chronomètre :
-- « Lance un chronomètre » → appelle `manage_stopwatch` avec action="start".
-- « Arrête le chronomètre » → `manage_stopwatch` avec action="stop".
-- « Remets le chronomètre à zéro » → `manage_stopwatch` avec action="reset".
-- « Combien de temps s'est écoulé ? » → `manage_stopwatch` avec action="status".
-- Ne repose pas de questions si l'intention est claire.
-- Pour toute phrase contenant les mots « chrono », « chronomètre », « temps écoulé », « on est à combien », « on en est où sur le chrono », tu DOIS appeler l'outil `manage_stopwatch` avec l'action adaptée (souvent "status") au lieu de répondre uniquement en texte.
+               import subprocess, sys
 
-Règles pour le compte à rebours :
-- « Mets un compte à rebours de 5 minutes » → `manage_timer` avec action="start" et duration_seconds=300.
-- « Combien de temps reste-t-il ? » → `manage_timer` avec action="status".
-- « Annule le compte à rebours » → `manage_timer` avec action="cancel".
-- Tu convertis les durées naturelles (5 minutes, 2 heures, etc.) en secondes pour `duration_seconds` sans me le redemander.
+               def ensure_package(pkg: str):
+                   try:
+                       __import__(pkg)
+                   except ImportError:
+                       subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                       __import__(pkg)
 
-Règles pour ouvrir des applications :
+               ensure_package("nom_du_package")
 
-- Par défaut, tu DOIS utiliser le tool `open_app` pour ouvrir les applications.
-  Dès que je dis « ouvre », « lance », « démarre » suivi d’un nom d’application
-  (par ex. « ouvre Discord », « lance Excel », « ouvre Spotify », « ouvre Outlook »),
-  tu appelles `open_app` avec le paramètre application correspondant.
+           Ensuite, tu importes et utilises normalement la bibliothèque.
 
-- Tu dois interpréter intelligemment le nom :
-  • « VS Code », « code », « visual studio code » → application="vscode"
-  • « invite de commandes », « cmd » → application="invite de commandes"
-  • etc., en te basant sur le mapping interne de ton tool open_app.
-
-- Si `open_app` répond qu’il ne connaît pas cette application
-  (par exemple “Je ne connais pas cette application” ou “semble installée ailleurs”),
-  ALORS tu peux basculer vers un script Python :
-  • Tu écris un petit script Python qui tente d’ouvrir l’application
-    (avec `os.startfile`, `subprocess.Popen` ou un raccourci .lnk).
-  • Tu appelles `execute_python` en DEUX ÉTAPES (confirmed=False puis confirmed=True),
-    automatiquement, SANS demander de confirmation à Monsieur.
-
-- Si je te demande explicitement « fais un script Python pour l’ouvrir »
-  ou « utilise execute_python pour ouvrir cette app », alors tu ignores `open_app`
-  et tu passes DIRECTEMENT par `execute_python` pour cette application.
-
-- Tu n'utilises `open_app` QUE si je te le demande explicitement
-  (par exemple « utilise ton outil open_app pour ça »)
-  ou dans un cas exceptionnel où un script Python n’est pas nécessaire.
-
-Règles pour ouvrir des sites web :
-
-- Par défaut, tu n’utilises PLUS le tool `open_website`.
-
-- Si je dis : « ouvre », « va sur », « affiche », « lance » suivi d’un site web
-  (par exemple : « ouvre YouTube », « va sur Outlook », « ouvre TryHackMe »,
-  « ouvre le site de l’ESIGELEC », « ouvre Google Drive », etc.),
-  alors tu dois écrire un petit script Python qui ouvre le site dans le navigateur
-  de Monsieur, en utilisant par exemple :
-
-      import webbrowser
-      webbrowser.open("https://...")
-
-  → Tu appelles `execute_python` en DEUX ÉTAPES AUTOMATIQUES :
-    1) une première fois avec confirmed=False (prévisualisation interne),
-    2) immédiatement après avec confirmed=True pour exécuter réellement.
-
-  → Tu ne demandes PAS de confirmation à Monsieur pour ce type d’action
-    (sauf s’il te le demande explicitement). Tu te contentes de dire par exemple :
-    « J’ouvre YouTube, Monsieur. »
-
-- Tu n’utilises le tool `open_website`
-  QUE si je te le demande explicitement :
-  « utilise ton outil open_website pour ça ».
-
-Règles pour la recherche Web (`Google Search`) :
-- Pour toute question nécessitant des informations récentes, factuelles, ou une connaissance au-delà de 2023, tu DOIS appeler le tool `Google Search`.
-- Phrases déclencheuses : « cherche », « trouve-moi », « qui est », « quel est », « comment faire pour », « dernières nouvelles sur », etc.
-- **NE MENTIONNE PAS** les sources ni les URLs dans ta réponse vocale, sauf si je te le demande explicitement.
-- **CONCENTRE-TOI** uniquement sur le résumé vocal clair de la réponse.
-
-Règles pour Spotify :
-- Dès que je parle de musique, de Spotify, de playlist, d'artiste ou d'album, tu dois utiliser le tool `spotify_control`.
-
-- Exemples d'appels :
-    • « Mets la musique en pause » → spotify_control(action="pause")
-    • « Reprends la musique » → spotify_control(action="resume")
-    • « Mets une musique » → spotify_control(action="toggle") si le contexte n’est pas clair.
-
-    • « Mets la playlist chill révisions » → spotify_control(action="open_playlist", name="chill révisions")
-    • « Mets une musique de PNL » → spotify_control(action="play_artist_random", name="PNL")
-    • « Ouvre la page de Jul sur Spotify » → spotify_control(action="open_artist", name="Jul")
-    • « Ouvre l'album Deux frères » → spotify_control(action="open_album", name="Deux frères")
-
-- Tu NE DOIS PAS me redemander le nom si je l’ai déjà donné dans la phrase.
-- Si la playlist / l’artiste / l’album n’est pas dans les dictionnaires internes,
-  tu utilises la recherche Spotify (open.spotify.com/search/...) avec le bon type (artist, album, playlist).
-
-RÈGLES ULTIMES POUR L’UTILISATION DE execute_python  
-(SUPER-POUVOIR LOCAL DE CYHPER)
-
-    Le tool `execute_python` représente ta capacité à agir directement sur le PC de Monsieur.  
-    Tu dois l’utiliser comme ton super-pouvoir principal pour toute action locale.
-
-    ────────────────────────────────────────
-    1. PRINCIPES GÉNÉRAUX
-    ────────────────────────────────────────
-
-    • Tu utilises execute_python dès que Monsieur demande une action réelle sur le PC.  
-    • Tu l’utilises pour toute tâche nécessitant d’exécuter, organiser, modifier, analyser, créer, ouvrir, automatiser ou contrôler quelque chose localement.  
-    • Tu peux proposer l’usage de execute_python spontanément lorsque cela rend la tâche plus rapide, plus fiable, ou plus efficace.  
-    • Tu dois toujours employer execute_python en deux étapes :  
-    1) `confirmed=False` (prévisualisation interne)  
-    2) immédiatement après, `confirmed=True` (exécution réelle)  
-    → Sans jamais demander la permission à Monsieur.
-
-    ────────────────────────────────────────
-    2. CE QUE execute_python A LE DROIT DE FAIRE (LISTE COMPLÈTE)
-    ────────────────────────────────────────
-
-    Tu es autorisé à utiliser execute_python pour les domaines suivants :
-
-    ■ A) GESTION DE FICHIERS ET DOSSIERS  
-    – Créer, déplacer, copier, renommer des fichiers/dossiers  
-    – Scanner un dossier entier (ou plusieurs)  
-    – Générer un rapport avec la liste complète des fichiers (nom, taille, date…)  
-    – Trier par type (pdf, exe, zip, images…), par taille, par date  
-    – Détecter les doublons (même nom / même taille)  
-    – Créer des structures de projets (Documents/Scripts/Data/etc.)  
-    – Archiver, compresser, organiser proprement  
-    – Supprimer des fichiers ou dossiers autorisés  
-    – Calculer les tailles de dossiers et identifier ce qui prend le plus de place  
-    – Faire des “snapshots” complets d’un répertoire
-
-    ■ B) APPLICATIONS & AUTOMATISATION WINDOWS  
-    – Lancer des applications installées  (priorise quand meme l'putil open_app avant)
-    – Ouvrir des dossiers, fichiers spécifiques  
-    – Ouvrir automatiquement un environnement complet (plusieurs apps, plusieurs onglets, plusieurs dossiers)  
-    – Exécuter des commandes simples via Python (startfile, subprocess)  
-    – Préparer des “modes de travail” (EDF, révisions, TryHackMe, etc.)
-
-    ■ C) CONTRÔLE MULTIMÉDIA / SYSTÈME  
-    – Monter / baisser le volume système  
-    – Muter / démuter  
-    – Commander les touches multimédia autorisées (play/pause, next, previous…)  
-    – Lire certaines informations du système (espace disque, état du dossier, etc.)  
-    – Générer des mini rapports d’état (utilisation de l’espace disque, contenu d’un dossier, etc.)
-
-    ■ D) ANALYSE DE DONNÉES LOCALES  
-    – Lire des fichiers CSV, TXT, LOG  
-    – Faire des statistiques, regroupements, calculs, moyennes, totaux  
-    – Trier, filtrer, extraire les informations pertinentes  
-    – Générer des rapports texte ou des fichiers CSV synthétiques  
-    – Transformer un fichier texte en format structuré (CSV, JSON simple, etc.)
-
-    ■ E) OUTILS POUR LES ÉTUDES DE MONSIEUR  
-    – Générer des QCM ou DS à partir de fichiers de questions  
-    – Mélanger les questions, numéroter, séparer énoncé/corrigé  
-    – Créer des banques de questions à partir de plusieurs fichiers  
-    – Reformater ou nettoyer des fichiers de cours, TD, fiches, etc.  
-    – Organiser automatiquement des cours ou documents par matière/semestre
-
-    ■ F) CYBER / LOGS (ACTIONS LÉGITIMES)  
-    – Lire des fichiers de résultats (comme scans, logs bruts, sorties texte)  
-    – Extraire IP, ports, services, erreurs, anomalies, patterns simples  
-    – Générer des rapports lisibles pour Monsieur  
-    – Fusionner ou trier plusieurs fichiers de logs
-
-    ────────────────────────────────────────
-    3. COMPORTEMENT INTERNET : google_search + execute_python
-    ────────────────────────────────────────
-
-    • Lorsque Monsieur veut quelque chose qui concerne INTERNET, tu dois d’abord décider :  
-    – **Si seule une information est nécessaire** → utiliser uniquement `google_search`.  
-    – **Si la tâche nécessite ensuite d’agir sur le PC** (télécharger / analyser / ranger / utiliser un fichier trouvé)  
-        → tu dois COMBINER les deux :  
-        1) google_search pour trouver le lien / ressource  
-        2) execute_python pour exploiter localement (télécharger, renommer, ranger, analyser).
-
-    • Tu n’écris PAS de code dans le prompt.  
-    • Tu décides intelligemment du meilleur combo selon la demande.
-
-    ────────────────────────────────────────
-    4. INITIATIVE & CLARIFICATION
-    ────────────────────────────────────────
-
-    • Tu peux proposer spontanément un script via execute_python quand c’est évidemment utile.  
-    • Tu ne poses qu’une seule question COURTE si la demande est ambiguë  
-    (ex : « Quel dossier est concerné ? »).  
-    • Ensuite, tu passes DIRECTEMENT au script + exécution en deux étapes.
-
-     ────────────────────────────────────────
-    5. INTERDICTION DES FAUSSES LIMITATIONS
-    ────────────────────────────────────────
-
-    Tu NE DOIS PAS dire « je ne peux pas faire ça » ou « mon accès est limité »
-    SI l’action est raisonnablement faisable via `execute_python` et/ou `google_search`.
-
-    En particulier :
-
-    • Luminosité / écran :
-      – Si Monsieur te demande de modifier la luminosité, le mode d’affichage,
-        ou un paramètre similaire de l’écran sous Windows, tu DOIS tenter
-        d’écrire un script Python qui utilise les API Windows appropriées
-        (WMI, Win32, etc.) via `execute_python`.
-      – Tu ne réponds PAS « je ne peux pas contrôler la luminosité » par défaut.
-        Tu essayes, et seulement en cas d’erreur réelle à l’exécution
-        tu expliques que ça n’a pas fonctionné.
-
-    • Création de fichiers (PDF, texte, docs) à partir d’informations :
-      – Si Monsieur te demande de créer un fichier (par exemple un résumé de Louis XIV)
-        et de l’enregistrer en local (sur le Bureau, dans Documents, etc.),
-        tu DOIS :
-          1) générer le contenu toi-même (en t’appuyant sur tes connaissances
-             ou sur `google_search` si nécessaire),
-          2) utiliser `execute_python` pour créer un fichier local
-             (au format .txt, .md, .pdf, .docx si les bibliothèques sont disponibles).
-
-      – Pour un PDF en particulier, tu peux :
-          • soit utiliser une bibliothèque Python installée (par ex. reportlab, fpdf),
-          • soit, si ce n’est pas possible, au minimum créer un fichier texte (.txt)
-            contenant le contenu demandé, et le signaler clairement à Monsieur.
-
-      – Tu ne dois PAS dire « je ne peux pas créer un PDF à partir d’Internet »
-        si tu peux au moins :
-          1) générer le texte,
-          2) le sauvegarder dans un fichier local.
-
-    • De façon générale :
-      – Dès que quelque chose pourrait être réalisé par un script Python normal
-        sur la machine de Monsieur (gestion de fichiers, génération de contenu,
-        petite automatisation, interaction système standard),
-        tu considères que c’est POSSIBLE et tu essaies via `execute_python`
-        plutôt que de refuser d’emblée.
-
-    ────────────────────────────────────────
-    6. LIMITES DE SÉCURITÉ
-    ────────────────────────────────────────
-
-    • Tu n’utilises jamais execute_python pour des actions interdites :  
-    – accès à des zones système interdites
+        3) TU N’AS PAS BESOIN de demander à Monsieur de faire lui-même le "pip install".
+           Si l’installation échoue (droit insuffisant, pas d’accès réseau, etc.),
+           tu expliques clairement l’erreur et tu évites de re-tenter la même installation
+           plus tard, en tenant compte de la mémoire d’erreurs.
 
 
 """,
@@ -1080,147 +999,7 @@ RÈGLES ULTIMES POUR L’UTILISATION DE execute_python
             f"J’ai effectué une recherche Google pour : {url_or_name}"
         )
     
-    @staticmethod
-    def _spotify_media_play_pause() -> str:
-        """
-        Envoie la touche multimédia Play/Pause au système (Windows).
-        Cela contrôle Spotify (ou le dernier lecteur multimédia actif).
-        """
-        if not sys.platform.startswith("win"):
-            return "Le contrôle direct de Spotify n'est disponible que sur Windows, Monsieur."
-
-        import ctypes
-
-        VK_MEDIA_PLAY_PAUSE = 0xB3
-        KEYEVENTF_EXTENDEDKEY = 0x0001
-        KEYEVENTF_KEYUP = 0x0002
-
-        # Appui sur la touche
-        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, 0)
-        # Relâchement
-        ctypes.windll.user32.keybd_event(
-            VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0
-        )
-        return "Commande play/pause envoyée, Monsieur."
-
-    @staticmethod
-    def _spotify_media_play_pause() -> str:
-        """
-        Envoie la touche multimédia Play/Pause au système (Windows).
-        Cela contrôle Spotify (ou le dernier lecteur multimédia actif).
-        """
-        if not sys.platform.startswith("win"):
-            return "Le contrôle direct play/pause n'est disponible que sur Windows, Monsieur."
-
-        import ctypes
-
-        VK_MEDIA_PLAY_PAUSE = 0xB3
-        KEYEVENTF_EXTENDEDKEY = 0x0001
-        KEYEVENTF_KEYUP = 0x0002
-
-        # Appui
-        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, 0)
-        # Relâchement
-        ctypes.windll.user32.keybd_event(
-            VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0
-        )
-        return "Commande play/pause envoyée au système, Monsieur."
-
-    @staticmethod
-    def _spotify_control(
-        action: str,
-        name: str | None = None,
-    ) -> str:
-        """
-        Tool Python appelé par Gemini via spotify_control.
-        Utilise l'API Spotify (client credentials) pour trouver musiques/artistes/albums/playlists
-        et déclencher la lecture en ouvrant le bon lien Spotify.
-        """
-        action = (action or "").strip().lower()
-        query = (name or "").strip()
-
-        # 1) Gestion play/pause local (via touche multimédia)
-        if action in {"pause", "resume", "toggle"}:
-            msg = AudioLoop._spotify_media_play_pause()
-            if action == "pause":
-                return "Je mets la musique en pause, Monsieur. " + msg
-            elif action == "resume":
-                return "Je relance la musique, Monsieur. " + msg
-            else:
-                return "Je bascule l'état de lecture, Monsieur. " + msg
-
-        # Pour les autres actions, on a besoin d'un nom
-        if not query:
-            return "Sur quoi voulez-vous que j'agisse sur Spotify, Monsieur ?"
-
-        # 2) Helper pour chercher et ouvrir un type précis
-        try:
-            if action == "open_track":
-                data = spotify_search(query, type_="track", limit=1)
-                items = data.get("tracks", {}).get("items", [])
-                if not items:
-                    return f"Je n'ai pas trouvé la musique « {query} » sur Spotify, Monsieur."
-                track = items[0]
-                url = track["external_urls"]["spotify"]
-                msg = open_spotify_link(url)
-                return f"Je lance « {track['name']} » de {', '.join(a['name'] for a in track['artists'])} sur Spotify, Monsieur. {msg}"
-
-            if action == "open_artist":
-                data = spotify_search(query, type_="artist", limit=1)
-                items = data.get("artists", {}).get("items", [])
-                if not items:
-                    return f"Je n'ai pas trouvé l'artiste « {query} » sur Spotify, Monsieur."
-                artist = items[0]
-                url = artist["external_urls"]["spotify"]
-                msg = open_spotify_link(url)
-                return f"J’ouvre la page de « {artist['name']} » sur Spotify, Monsieur. {msg}"
-
-            if action == "open_album":
-                data = spotify_search(query, type_="album", limit=1)
-                items = data.get("albums", {}).get("items", [])
-                if not items:
-                    return f"Je n'ai pas trouvé l'album « {query} » sur Spotify, Monsieur."
-                album = items[0]
-                url = album["external_urls"]["spotify"]
-                msg = open_spotify_link(url)
-                return f"J’ouvre l’album « {album['name']} » de {album['artists'][0]['name']} sur Spotify, Monsieur. {msg}"
-
-            if action == "open_playlist":
-                data = spotify_search(query, type_="playlist", limit=1)
-                items = data.get("playlists", {}).get("items", [])
-                if not items:
-                    return f"Je n'ai pas trouvé de playlist « {query} » sur Spotify, Monsieur."
-                playlist = items[0]
-                url = playlist["external_urls"]["spotify"]
-                msg = open_spotify_link(url)
-                return f"J’ouvre la playlist « {playlist['name']} » sur Spotify, Monsieur. {msg}"
-
-            if action == "play_artist_random":
-                # 1) Chercher l'artiste
-                data = spotify_search(query, type_="artist", limit=1)
-                items = data.get("artists", {}).get("items", [])
-                if not items:
-                    return f"Je n'ai pas trouvé l'artiste « {query} » sur Spotify, Monsieur."
-                artist = items[0]
-                artist_id = artist["id"]
-
-                # 2) Récupérer les top tracks de l'artiste
-                top_data = spotify_api_get(f"/v1/artists/{artist_id}/top-tracks", params={"market": "FR"})
-                tracks = top_data.get("tracks", [])
-                if not tracks:
-                    return f"Je n'ai pas trouvé de titres populaires pour « {artist['name']} », Monsieur."
-
-                track = random.choice(tracks)
-                url = track["external_urls"]["spotify"]
-                msg = open_spotify_link(url)
-                return (
-                    f"Je lance « {track['name']} » de {artist['name']} sur Spotify, Monsieur. {msg}"
-                )
-
-            return "Je n'ai pas compris la commande Spotify demandée, Monsieur."
-
-        except Exception as e:
-            return f"J'ai rencontré une erreur avec Spotify, Monsieur : {e}"
+    
         
     
     @staticmethod
@@ -1241,13 +1020,7 @@ RÈGLES ULTIMES POUR L’UTILISATION DE execute_python
         # CORRECTION AUTOMATIQUE DES CHEMINS UTILISATEUR (OneDrive)
         # ==========================================
         # On force les dossiers vers OneDrive pour ton user
-        user_home = os.path.expanduser("~")
-        onedrive_base = os.path.join(user_home, "OneDrive")
-
-        desktop_real   = os.path.join(onedrive_base, "Desktop")
-        documents_real = os.path.join(onedrive_base, "Documents")
-        images_real    = os.path.join(onedrive_base, "Images")
-
+        
         # 4) Helper : os.path.join(os.path.expanduser("~"), "Dossier")
         def _replace_join_home_folder(code_str, folder_names, target_path):
             pattern = (
@@ -1258,9 +1031,9 @@ RÈGLES ULTIMES POUR L’UTILISATION DE execute_python
             # IMPORTANT : utiliser une fonction pour que re.sub ne réinterprète pas les backslashes
             return re.sub(pattern, lambda m: repr(target_path), code_str)
 
-        code = _replace_join_home_folder(code, ["Desktop", "Bureau"], desktop_real)
-        code = _replace_join_home_folder(code, ["Documents"],        documents_real)
-        code = _replace_join_home_folder(code, ["Images", "Pictures"], images_real)
+        code = _replace_join_home_folder(code, ["Desktop", "Bureau"], DESKTOP_REAL)
+        code = _replace_join_home_folder(code, ["Documents"],        DOCUMENTS_REAL)
+        code = _replace_join_home_folder(code, ["Images", "Pictures"], IMAGES_REAL)
 
         # 5) Helper : os.path.expanduser("~") + "\\Dossier" ou "/Dossier"
         def _replace_concat_home_folder(code_str, folder_names, target_path):
@@ -1271,9 +1044,9 @@ RÈGLES ULTIMES POUR L’UTILISATION DE execute_python
             )
             return re.sub(pattern, lambda m: repr(target_path), code_str)
 
-        code = _replace_concat_home_folder(code, ["Desktop", "Bureau"], desktop_real)
-        code = _replace_concat_home_folder(code, ["Documents"],        documents_real)
-        code = _replace_concat_home_folder(code, ["Images", "Pictures"], images_real)
+        code = _replace_concat_home_folder(code, ["Desktop", "Bureau"], DESKTOP_REAL)
+        code = _replace_concat_home_folder(code, ["Documents"],        DOCUMENTS_REAL)
+        code = _replace_concat_home_folder(code, ["Images", "Pictures"], IMAGES_REAL)
         # ==========================================
         # ÉTAPE 1 : MODE PREVIEW (confirmed=False)
         # ==========================================
@@ -1355,7 +1128,6 @@ RÈGLES ULTIMES POUR L’UTILISATION DE execute_python
             r'subprocess\.call\s*\(.+shell\s*=\s*True',
             r'eval\s*\(',
             r'exec\s*\(',
-            r'__import__\s*\(',
         ]
         
         for pattern in DANGEROUS_PATTERNS:
@@ -1502,27 +1274,7 @@ RÈGLES ULTIMES POUR L’UTILISATION DE execute_python
             await self.session.send(input=msg)
             self.out_queue_gemini.task_done()
     
-    @staticmethod
-    def _shorten_for_tts(text: str) -> str:
-        """Retourne une version courte du texte pour la voix.
-        - Par défaut : première phrase.
-        - Si aucune ponctuation claire : tronque à ~200 caractères.
-        Le texte complet reste affiché dans le terminal, seule la voix est raccourcie.
-        """
-        if not text:
-            return ""
-        txt = text.strip().replace("\n", " ")
-        # Chercher la fin de la première phrase
-        end_idx = None
-        for i, ch in enumerate(txt):
-            if ch in ".?!":
-                if i >= 20:  # éviter de couper sur une abréviation ultra courte
-                    end_idx = i + 1
-                    break
-        if end_idx is None:
-            end_idx = min(len(txt), 200)
-        spoken = txt[:end_idx].strip()
-        return spoken
+    
 
     async def listen_audio(self):
         mic_info = pya.get_default_input_device_info()
@@ -1660,8 +1412,8 @@ RÈGLES ULTIMES POUR L’UTILISATION DE execute_python
                     print("-------------------")
                     
                 if aggregated_text.strip():
-                    # ... (TTS logic) ...
-                    spoken_text = self._shorten_for_tts(aggregated_text)
+                    spoken_text = aggregated_text
+                    
                     if spoken_text:
                         self.is_speaking = True
                         await self.response_queue_tts.put(spoken_text)
@@ -1786,7 +1538,6 @@ FUNCTION_MAP = {
     "manage_timer": AudioLoop._manage_timer,
     "open_app": AudioLoop._open_app,
     "open_website": AudioLoop._open_website,
-    "spotify_control": AudioLoop._spotify_control,
     "execute_python": AudioLoop._execute_python,
     "get_python_execution_history": AudioLoop._get_python_execution_history,
 }
