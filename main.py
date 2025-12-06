@@ -307,11 +307,194 @@ class AudioLoop:
                 "required": ["code"],
             },
         }
+        
+        file_manager = {
+            "name": "file_manager",
+            "description": (
+                "Gère toutes les manipulations de fichiers et de dossiers : créer, déplacer, copier, "
+                "supprimer, renommer, lister, ouvrir, scanner des répertoires et des fichiers, calculer les tailles, archiver et désarchiver."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "L'action à effectuer : 'create_dir', 'delete', 'copy', 'move', 'list_files', 'calculate_size', 'find_duplicates'.",
+                        "enum": ["create_dir", "delete", "copy", "move", "rename", "list_files", "calculate_size", "find_duplicates", "archive", "unarchive"],
+                    },
+                    "source_path": {
+                        "type": "string",
+                        "description": "Chemin du fichier ou dossier source (obligatoire pour copy/move/delete/list/calculate)."
+                    },
+                    "destination_path": {
+                        "type": "string",
+                        "description": "Chemin de destination (obligatoire pour copy/move/rename). Si l'action est 'rename', c'est le nouveau nom du fichier/dossier."
+                    }
+                },
+                "required": ["action", "source_path"],
+            },
+        }
+        
+        window_manager = {
+            "name": "window_manager",
+            "description": "Gère les fenêtres ouvertes : maximiser, réduire, fermer, mettre au premier plan (focus), lister les fenêtres, trouver la fenêtre active.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["minimize", "maximize", "restore", "close", "focus", "list", "active"],
+                        "description": "Action à effectuer sur la fenêtre."
+                    },
+                    "target_window": {
+                        "type": "string",
+                        "description": "Nom (ou partie du nom) de la fenêtre visée. Obligatoire sauf pour 'list' et 'active'."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+
+        system_control = {
+            "name": "system_control",
+            "description": "Contrôle les paramètres matériels du PC (Volume, Luminosité) et le presse-papier.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "feature": {
+                        "type": "string",
+                        "enum": ["volume", "mute", "brightness", "clipboard_get", "clipboard_set"],
+                        "description": "Paramètre à modifier."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Valeur cible (ex: '50', '+10', '-20', ou texte pour le presse-papier). Laisser vide pour lire la valeur actuelle."
+                    }
+                },
+                "required": ["feature"]
+            }
+        }
+
+        process_manager = {
+            "name": "process_manager",
+            "description": "Gère les processus système et l'état du PC (CPU/RAM). Permet de lister les applis gourmandes ou de tuer un programme bloqué.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["system_info", "list", "kill"],
+                        "description": "Action : info système, lister processus, tuer processus."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Nom du processus à tuer (ex: 'chrome', 'notepad'). Obligatoire pour 'kill'."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+        
+        power_control = {
+            "name": "power_control",
+            "description": "Contrôle l'alimentation du PC : mettre en veille, verrouiller, redémarrer ou éteindre.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["sleep", "lock", "shutdown", "restart", "abort"],
+                        "description": "Action d'alimentation."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Forcer la fermeture des applications (DANGER de perte de données).",
+                        "default": False
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+
+        system_optimize = {
+            "name": "system_optimize",
+            "description": "Outils de nettoyage système : vider les fichiers temporaires ou tenter de libérer de la RAM.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["clean_temp", "clean_ram"],
+                        "description": "Action d'optimisation."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+        
+        network_manager = {
+            "name": "network_manager",
+            "description": "Gère les connexions réseaux : Wi-Fi (lister, connecter, déconnecter), Bluetooth (statut, paramètres) et Mode Avion.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "list_networks", "connect_wifi", "disconnect_wifi", "wifi_status", 
+                            "airplane_mode", 
+                            "bluetooth_status", "bluetooth_settings", "connect_bluetooth"
+                        ],
+                        "description": "Action réseau à effectuer."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Nom (SSID) du réseau Wi-Fi pour la connexion."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+
+        memory_manager = {
+            "name": "memory_manager",
+            "description": (
+                "Accède à la mémoire longue durée (Cerveau) de Cypher. "
+                "Utilise cet outil pour stocker (remember), récupérer (recall) ou oublier (forget) des informations. "
+                "Tu DOIS classer l'information dans l'une des catégories suivantes : "
+                "'profil_utilisateur' (infos sur Monsieur), 'gouts_et_preferences', 'projets_actifs', "
+                "'environnement_systeme' (config PC), 'entourage', 'base_de_connaissances' (faits appris), 'journal_evenements'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["remember", "recall", "forget", "list_categories"],
+                        "description": "Action à effectuer."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "La sphère cognitive concernée (ex: 'projets_actifs', 'profil_utilisateur')."
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Le sujet précis ou la clé de l'information (ex: 'deadline_cypher', 'couleur_preferee')."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "L'information à stocker (obligatoire pour 'remember'). Sois précis et complet."
+                    }
+                },
+                "required": ["action", "category"]
+            }
+        }
 
 
         tools = [
             {"function_declarations": [
                 open_app,
+                file_manager,
                 execute_python,
                 get_time,
                 get_date,
@@ -319,13 +502,36 @@ class AudioLoop:
                 manage_stopwatch,
                 manage_timer,
                 open_website,
+                window_manager,
+                system_control,
+                process_manager,
+                power_control,
+                system_optimize,
+                network_manager,
+                memory_manager,
             ]},
             google_search_tool
         ]
 
+        # --- CHARGEMENT DU CERVEAU AU DÉMARRAGE ---
+        memory_content = ""
+        
+        # 🟢 CORRECTION : Chemin relatif au fichier script (juste à côté de main.py)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        mem_path = os.path.join(script_dir, "cypher_memory_cortex.json") 
+        
+        if os.path.exists(mem_path):
+            try:
+                with open(mem_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    memory_str = json.dumps(data, ensure_ascii=False, indent=2)
+                    memory_content = f"\n\n[MEMOIRE LONGUE DURÉE - CONTEXTE PERMANENT] :\n{memory_str}\nUtilise ces informations pour personnaliser tes réponses."
+            except:
+                print(">>> [WARNING] Impossible de lire la mémoire au démarrage.")
+
         self.config = {
             "response_modalities": ["TEXT"],
-            "system_instruction": """
+            "system_instruction": f"""
 Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je suis ton développeur. Tu es comme un pote collegue avec moi tu peux me charier parfois ou etre tres franc aussi. et tu es une IA conçue pour m'aider dans mes projets d'ingénierie ainsi que dans mes tâches quotidiennes. Adresse-toi à moi en m'appelant « Monsieur ». Merci également de veiller à ce que tes réponses soient concises.
     
     Règles pour les demandes d'heure :
@@ -346,7 +552,6 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     - Tu réponds par exemple :
       « Monsieur, nous sommes Lundi 3 Février 2025. »
     
-    Privilégie toujours l'outil le plus approprié à la demande spécifique de l'utilisateur.
     
     Règles météo :
     - Si je ne précise rien → utilise Petit-Couronne + aujourd'hui.
@@ -413,240 +618,767 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
       QUE si tu as une erreur avec execute_python.
       
     Règles pour la recherche Web (`Google Search`) :
-    - Pour toutes questions necessitant des connaissances logique et rationnel (ex: science, culture générale, traduction, etc) n'utilise pas google search par contre si ce sont des connaissances qui sont susceptible d'évoluer dans le temps même si c'est que un petit peu utilise impérativement google search (ex: Demande du poste d'une personne connue, dernière Iphone, etc)
-    - En gros utilise google search dans la majorité des choses que je te demande 
-    - Hésite pas à combiner google search avec la plus part des tools que tu utilise pour avoir un résultat le satisfaisant
+    - Si la réponse repose sur des faits récents ou changeants (personnes, postes, produits, versions, prix, actualité, lois, examens, docs officiels, etc.) → tu DOIS appeler google_search avant de répondre.
+    - Si la question est purement conceptuelle ou intemporelle (maths, physique fondamentale, chimie générale, anatomie de base, logique, programmation générique) → tu peux répondre sans google_search, sauf si tu veux vérifier un détail précis.
+    - Tu peux combiner google_search avec les autres tools (file_manager, execute_python, etc.) si ça améliore la précision de ce que tu fais.
     - **NE MENTIONNE PAS** les sources ni les URLs dans ta réponse vocale, sauf si je te le demande explicitement.
     - **CONCENTRE-TOI** uniquement sur le résumé vocal clair de la réponse.
     
+    Règle pour file_manager :
+    - Utilise cette outil en priorité pour :
+        - Créer, déplacer, copier-coller, supprimer, renommer des fichiers/dossiers
+        - Scanner un dossier entier (ou plusieurs)
+        - Générer un rapport avec la liste complète des fichiers
+        - Détecter les doublons (même nom / même taille)
+        - Créer des structures de projets (Documents/Scripts/Data/etc.)
+        - Archiver, compresser, organiser proprement
+        - Calculer les tailles de dossiers et identifier ce qui prend le plus de place
+        - Ouvrir des dossiers, fichiers spécifiques
     
-    RÈGLES ULTIMES POUR L’UTILISATION DE execute_python  
-    (SUPER-POUVOIR LOCAL DE CYHPER)
-    
-        Le tool `execute_python` représente ta capacité à agir directement sur le PC de Monsieur.  
-        Tu dois l’utiliser comme ton super-pouvoir principal pour toute action locale.
-    
-        ────────────────────────────────────────
-        1. PRINCIPES GÉNÉRAUX
-        ────────────────────────────────────────
-    
-        • Tu utilises execute_python dès que Monsieur demande une action réelle sur le PC.  
-        • Tu l’utilises pour toute tâche nécessitant d’exécuter, organiser, modifier, analyser, créer, ouvrir, automatiser ou contrôler quelque chose localement.  
-        • Tu peux proposer l’usage de execute_python spontanément lorsque cela rend la tâche plus rapide, plus fiable, ou plus efficace.  
-        • Tu dois toujours employer execute_python en deux étapes :  
-        1) `confirmed=False` (prévisualisation interne)  
-        2) immédiatement après, `confirmed=True` (exécution réelle)  
-        → Sans jamais demander la permission à Monsieur.
-        • Pour les contenu textuels que tu me propose je veux toujours qu'il soit dans un format tres beau visuellement avec des titres, sous titres, listes a puces, etc.
-    
-        ────────────────────────────────────────
-        2. CE QUE execute_python A LE DROIT DE FAIRE (LISTE COMPLÈTE)
-        ────────────────────────────────────────
-    
-        Tu es autorisé à utiliser execute_python pour les domaines suivants :
-    
-        ■ A) GESTION DE FICHIERS ET DOSSIERS  
-        – Créer, déplacer, copier, renommer des fichiers/dossiers  
-        – Scanner un dossier entier (ou plusieurs)  
-        – Générer un rapport avec la liste complète des fichiers (nom, taille, date…)  
-        – Trier par type (pdf, exe, zip, images…), par taille, par date  
-        – Détecter les doublons (même nom / même taille)  
-        – Créer des structures de projets (Documents/Scripts/Data/etc.)  
-        – Archiver, compresser, organiser proprement  
-        – Supprimer des fichiers ou dossiers autorisés  
-        – Calculer les tailles de dossiers et identifier ce qui prend le plus de place  
-        – Faire des “snapshots” complets d’un répertoire
-    
-        ■ B) APPLICATIONS & AUTOMATISATION WINDOWS  
-        – Lancer des applications installées  (priorise l'outil open_app avant)
-        – Ouvrir des dossiers, fichiers spécifiques  
-        – Ouvrir automatiquement un environnement complet (plusieurs apps, plusieurs onglets, plusieurs dossiers)  
-        – Exécuter des commandes simples via Python (startfile, subprocess)  
-        – Préparer des “modes de travail” (EDF, révisions, TryHackMe, etc.)
-    
-        ■ C) CONTRÔLE MULTIMÉDIA / SYSTÈME  
-        – Monter / baisser le volume système  
-        – Muter / démuter 
-        - Monter / baisser la luminosité
-        – Commander les touches multimédia autorisées (play/pause, next, previous…)  
-        – Lire certaines informations du système (espace disque, état du dossier, etc.)  
-        – Générer des mini rapports d’état (utilisation de l’espace disque, contenu d’un dossier, etc.)
-    
-        ■ D) ANALYSE DE DONNÉES LOCALES  
-        – Lire des fichiers CSV, TXT, LOG  
-        – Faire des statistiques, regroupements, calculs, moyennes, totaux  
-        – Trier, filtrer, extraire les informations pertinentes  
-        – Générer des rapports texte ou des fichiers CSV synthétiques  
-        – Transformer un fichier texte en format structuré (CSV, JSON simple, etc.)
-    
-        ■ E) OUTILS POUR LES ÉTUDES DE MONSIEUR  
-        – Générer des QCM ou DS à partir de fichiers de questions  
-        - Rédiger des comptes rendus
-        – Mélanger les questions, numéroter, séparer énoncé/corrigé  
-        – Créer des banques de questions à partir de plusieurs fichiers  
-        – Reformater ou nettoyer des fichiers de cours, TD, fiches, etc.  
-        – Organiser automatiquement des cours ou documents par matière/semestre
-    
-        ■ F) CYBER / LOGS (ACTIONS LÉGITIMES)  
-        – Lire des fichiers de résultats (comme scans, logs bruts, sorties texte)  
-        – Extraire IP, ports, services, erreurs, anomalies, patterns simples  
-        – Générer des rapports lisibles pour Monsieur  
-        – Fusionner ou trier plusieurs fichiers de logs
-    
-        ────────────────────────────────────────
-        3. COMPORTEMENT INTERNET : google_search + execute_python
-        ────────────────────────────────────────
-    
-        • Lorsque Monsieur veut quelque chose qui concerne INTERNET, tu dois d’abord décider :  
-        – **Si seule une information est nécessaire** → utiliser uniquement `google_search`.  
-        – **Si la tâche nécessite ensuite d’agir sur le PC** (télécharger / analyser / ranger / utiliser un fichier trouvé)  
-            → tu dois COMBINER les deux :  
-            1) google_search pour trouver le lien / ressource  
-            2) execute_python pour exploiter localement (télécharger, renommer, ranger, analyser).
-    
-        • Tu n’écris PAS de code dans le prompt.
-        • Tu décides intelligemment du meilleur combo selon la demande.
-    
-        ────────────────────────────────────────
-        4. INITIATIVE & CLARIFICATION
-        ────────────────────────────────────────
-    
-        • Tu peux proposer spontanément un script via execute_python quand c’est évidemment utile.  
-        • Tu ne poses qu’une seule question COURTE si la demande est ambiguë  
-        (ex : « Quel dossier est concerné ? »).  
-        • Ensuite, tu passes DIRECTEMENT au script + exécution en deux étapes.
-    
-         ────────────────────────────────────────
-        5. INTERDICTION DES FAUSSES LIMITATIONS
-        ────────────────────────────────────────
-    
-        Tu NE DOIS PAS dire « je ne peux pas faire ça » ou « mon accès est limité »
-        SI l’action est raisonnablement faisable via `execute_python` et/ou `google_search`.
-    
-        En particulier :
-    
-        • Luminosité / écran :
-          – Si Monsieur te demande de modifier la luminosité, le mode d’affichage,
-            ou un paramètre similaire de l’écran sous Windows, tu DOIS tenter
-            d’écrire un script Python qui utilise les API Windows appropriées
-            (WMI, Win32, etc.) via `execute_python`.
-          – Tu ne réponds PAS « je ne peux pas contrôler la luminosité » par défaut.
-            Tu essayes, et seulement en cas d’erreur réelle à l’exécution
-            tu expliques que ça n’a pas fonctionné.
-    
-        • Création de fichiers (PDF, texte, docs) à partir d’informations :
-          – Si Monsieur te demande de créer un fichier (par exemple un résumé de Louis XIV)
-            et de l’enregistrer en local (sur le Bureau, dans Documents, etc.),
-            tu DOIS :
-              1) générer le contenu toi-même (en t’appuyant sur tes connaissances
-                 ou sur `google_search` si nécessaire),
-              2) utiliser `execute_python` pour créer un fichier local
-                 (au format .txt, .md, .pdf, .docx si les bibliothèques sont disponibles).
-    
-          – Pour un PDF en particulier, tu peux :
-              • soit utiliser une bibliothèque Python installée (par ex. reportlab, fpdf),
-              • soit, si ce n’est pas possible, au minimum créer un fichier texte (.txt)
-                contenant le contenu demandé, et le signaler clairement à Monsieur.
-    
-          – Tu ne dois PAS dire « je ne peux pas créer un PDF à partir d’Internet »
-            si tu peux au moins :
-              1) générer le texte,
-              2) le sauvegarder dans un fichier local.
-    
-        • De façon générale :
-          – Dès que quelque chose pourrait être réalisé par un script Python normal
-            sur la machine de Monsieur (gestion de fichiers, génération de contenu,
-            petite automatisation, interaction système standard),
-            tu considères que c’est POSSIBLE et tu essaies via `execute_python`
-            plutôt que de refuser d’emblée.
-    
-        ────────────────────────────────────────
-        6. LIMITES DE SÉCURITÉ
-        ────────────────────────────────────────
-    
-        • Tu n’utilises jamais execute_python pour des actions interdites :  
-        – accès à des zones système interdites
-    
-    GESTION DES ERREURS
-    
-        Si un script execute_python renvoie un traceback (erreur Python), tu DOIS :
+    Règle pour window_manager :
+    - Utilise cette outil en priorité pour :
+        Gère les fenêtres ouvertes :
+        - Maximiser
+        - Réduire
+        - Fermer
+        - Mettre au premier plan (focus)
+        - Lister les fenêtres
+        - Trouver la fenêtre active
         
-            lire le message d’erreur dans le contexte,
-            
-            en tenir compte pour la suite : ne pas re-tenter exactement la même chose à l’identique,
-            
-            si c’est une ModuleNotFoundError, adapter ton comportement :
-            
-                soit proposer un script avec installation automatique (pattern ensure_package ci-dessus),
-                
-                soit, si tu sais que cette lib a déjà échoué plusieurs fois sur cette machine, éviter de la réutiliser.
+    Règle pour system_control :
+    - Utilise cette outil en priorité pour :
+        - Monter/Baisser le volume
+        - Monter/baisser la luminosité
+        - Gérer le presse papier
         
-        Si l’environnement ne permet pas d’installer des libs (par exemple pip échoue), tu :
-        
-            expliques clairement à l’utilisateur que l’installation a échoué,
-            
-            proposes une alternative si possible,
-            
-            EVITES de re-tenter cette installation plus tard (tu es informé via les données d’erreurs passées).
+    Règle pour process_manager :
+    - Utilise cette outil en priorité pour :
+        - Gère les processus système et l'état du PC (CPU/RAM) 
+        - Lister les applis gourmandes ou de tuer un programme bloqué.
     
+    Règle pour power_control :
+    - Utilise cette outil en priorité pour :
+        - Mettre en veille le pc
+        - Verrouiller le pc
+        - Redémarrer ou éteindre le pc
+        
+    Règle pour system_optimize :
+    - Utilise cette outil en priorité pour :
+        - Vider les fichiers temporaires ou tenter de libérer de la RAM.
+        
+    Règle pour network_manager :
+    - Utilise cette outil en priorité pour :
+        - Lister, se connecter ou se deconnecter au Wi-Fi
+        - Se connecter ou déconnecter au Bluetooth (statut, paramètres)
+        - Activer ou désactiver le Mode Avion.
     
-    MÉMOIRE D’ERREURS (AUTO-APPRENTISSAGE)
+    Règle pour execute_python :
+
+    • Tu utilises execute_python en cas de dernier recours dès que Monsieur demande une action réelle sur le PC.  
+    • Si aucun des autres outils proposé te permette d'accomplir la tâche demandé tu peux utiliser execute_python pour toute tâche nécessitant d’exécuter, organiser, modifier, analyser, créer, ouvrir, automatiser ou contrôler quelque chose localement.  
+    • Tu dois toujours employer execute_python en deux étapes :  
+    1) `confirmed=False` (prévisualisation interne)  
+    2) immédiatement après, `confirmed=True` (exécution réelle)  
+    → Sans jamais demander la permission à Monsieur.
+    • Pour les contenu textuels que tu me propose je veux toujours qu'il soit dans un format tres beau visuellement avec des titres, sous titres, listes a puces, etc.
+
+    =======================================================
+    RÈGLES D'AGENT EXÉCUTIF ET PRIORITÉ D'ACTION
+    =======================================================
     
-        Tu disposes d’une mémoire d’erreurs persistante (fichier JSON géré par le système).
+    1.  PRIORITÉ D'OUTIL (DU PLUS RAPIDE AU DERNIER RECOURS) :
         
-        Elle peut t’indiquer par exemple :
+        a.  TÂCHES SPÉCIFIQUES : Utilise les outils déjà proposé comme `get_time`, `get_date`, `get_weather`, `manage_timer`, `manage_stopwatch`, etc.
+        b.  LANCEMENT APPLI/SITE : Utilise `open_app` ou `open_website` (si l'application ou le site à lancer n'est pas répertorier utilise execute_python).
         
-            quels modules ne sont pas installables sur cette machine,
-            
-            quelles commandes ont déjà échoué plusieurs fois,
-            
-            quelles approches ne fonctionnent pas dans cet environnement (ex : pas de droits admin, pas de pip, etc.).
+        c.  CONTROLE PC : Utilise `file_manager` (Gestion Fichiers).
         
-        Quand la mémoire d’erreurs te dit :
+        d.  RECHERCHE : Utilise `Google Search` pour toute information factuelle non connue.
         
-            “La bibliothèque X semble ne pas être installée/instalable sur cette machine.”
-            Tu dois :
+        e.  DERNIER RECOURS/LOGIQUE : Utilise `execute_python` uniquement si les outils ci-dessus échouent ou si la tâche nécessite une logique de programmation complexe ou une librairie externe (fpdf, pandas, etc.).
+    
+    2.  RÈGLES D'EXÉCUTION AUTOMATIQUE :
         
-                éviter de réutiliser cette bibliothèque,
-                
-                proposer une autre approche quand c’est possible.
+        •   Tu ne demandes JAMAIS de confirmation verbale pour lancer une action (`open_app`, `open_website`, `file_manager`, `system_diagnostics`).
+        •   Pour les actions simples (`open_app`, `get_time`, etc.), tu ne réponds qu'avec le résultat final.
+        •   Pour `execute_python`, tu respectes le processus en deux étapes (confirmed=False/True) SANS demander de permission à Monsieur.
+    
+    3.  GESTION DE execute_python :
+        
+        •   Si un script est exécuté, tu dois raccourcir ta réponse vocale au strict minimum (statut d'exécution).
+    
+    4.  RÈGLES D'AUTONOMIE :
+        
+        •   Tu ne poses qu'une seule question COURTE si la demande est ambiguë avant d'agir.
+        •   IMPORTANT : Quand l'utilisateur te donne une information personnelle (âge, ville, goûts), tu DOIS IMMÉDIATEMENT appeler l'outil `memory_manager` avec l'action 'remember' pour la sauvegarder. NE DIS PAS que tu l'as fait si tu n'as pas appelé l'outil.
+    
 
-    INSTALLATION AUTOMATIQUE DES BIBLIOTHÈQUES
+DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUTILES. (SAUF SI JE TE LE DEMANDE EXPLICITEMENT).
 
-        Quand un script Python échoue avec une erreur de type ModuleNotFoundError
-        (par exemple "No module named 'pandas'") :
-
-        1) Tu DOIS, au tour suivant, proposer toi-même un nouveau script via execute_python
-           qui :
-              - installe la bibliothèque manquante avec pip,
-              - puis retente l'action demandée.
-
-        2) Pour installer une bibliothèque, tu peux utiliser un patron standard du genre
-           (à mettre TOI-MÊME dans le code que tu envoies à execute_python) :
-
-               import subprocess, sys
-
-               def ensure_package(pkg: str):
-                   try:
-                       __import__(pkg)
-                   except ImportError:
-                       subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-                       __import__(pkg)
-
-               ensure_package("nom_du_package")
-
-           Ensuite, tu importes et utilises normalement la bibliothèque.
-
-        3) TU N’AS PAS BESOIN de demander à Monsieur de faire lui-même le "pip install".
-           Si l’installation échoue (droit insuffisant, pas d’accès réseau, etc.),
-           tu expliques clairement l’erreur et tu évites de re-tenter la même installation
-           plus tard, en tenant compte de la mémoire d’erreurs.
-
+{memory_content}
 
 """,
             "tools": tools,
         }
+    
+    
+    @staticmethod
+    def _memory_manager(action: str, category: str, key: str | None = None, value: str | None = None) -> str:
+        """
+        Gère la MÉMOIRE LONGUE DURÉE.
+        """
+        import json
+        import os
+        from datetime import datetime
 
+        
+        script_dir = os.getcwd() 
+        MEMORY_FILE = os.path.join(script_dir, "cypher_memory_cortex.json")
+        
+        # 1. Chargement de la mémoire
+        if os.path.exists(MEMORY_FILE):
+            try:
+                with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
+                    memory = json.load(f)
+            except json.JSONDecodeError:
+                memory = {}
+        else:
+            memory = {}
+
+        action = action.lower()
+        
+        # Liste des catégories valides pour guider (mais on accepte les nouvelles)
+        VALID_CATEGORIES = [
+            "profil_utilisateur", "gouts_et_preferences", "projets_actifs", 
+            "environnement_systeme", "entourage", "base_de_connaissances", "journal_evenements"
+        ]
+
+        # --- ACTION : MÉMORISER (Remember) ---
+        if action == "remember":
+            if not key or not value:
+                return "Erreur : Pour mémoriser, il me faut un sujet (key) et une information (value)."
+            
+            # Normalisation
+            category_slug = category.lower().replace(" ", "_")
+            
+            if category_slug not in memory:
+                memory[category_slug] = {}
+            
+            # Ajout d'un timestamp pour savoir quand on a appris ça
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            memory_entry = {
+                "value": value,
+                "updated_at": timestamp
+            }
+            
+            memory[category_slug][key.lower()] = memory_entry
+            
+            # Sauvegarde atomique
+            with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(memory, f, indent=4, ensure_ascii=False)
+            
+            return f"🧠 Mémoire enregistrée dans [{category_slug}] : J'ai noté que '{key}' est '{value}'."
+
+        # --- ACTION : SE RAPPELER (Recall) ---
+        if action == "recall":
+            category_slug = category.lower().replace(" ", "_")
+            
+            # Si on veut tout savoir sur une catégorie
+            if not key:
+                if category_slug not in memory:
+                    return f"Je n'ai aucune information dans la catégorie '{category}'."
+                
+                content = []
+                for k, v in memory[category_slug].items():
+                    # On gère le format ancien (juste str) et nouveau (dict avec timestamp)
+                    val = v["value"] if isinstance(v, dict) and "value" in v else v
+                    content.append(f"- **{k.title()}** : {val}")
+                
+                return f"📂 **Contenu de la mémoire '{category}'** :\n" + "\n".join(content)
+
+            # Si on cherche une clé précise
+            key_lower = key.lower()
+            if category_slug in memory and key_lower in memory[category_slug]:
+                data = memory[category_slug][key_lower]
+                val = data["value"] if isinstance(data, dict) and "value" in data else data
+                return f"💡 **Souvenir retrouvé** ({category}) : {val}"
+            else:
+                return f"Je n'ai pas de mémoire précise pour '{key}' dans '{category}'."
+
+        # --- ACTION : OUBLIER (Forget) ---
+        if action == "forget":
+            category_slug = category.lower().replace(" ", "_")
+            if category_slug in memory:
+                if key:
+                    if key.lower() in memory[category_slug]:
+                        del memory[category_slug][key.lower()]
+                        save = True
+                    else:
+                        return f"Je ne connaissais pas '{key}' dans cette catégorie."
+                else:
+                    # Oublier toute la catégorie
+                    del memory[category_slug]
+                    save = True
+                
+                if save:
+                    with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(memory, f, indent=4, ensure_ascii=False)
+                    return f"🗑️ Mémoire effacée avec succès."
+            return "Rien à effacer."
+
+        # --- ACTION : LISTER LES CATÉGORIES (Map) ---
+        if action == "list_categories":
+            cats = list(memory.keys())
+            return f"🗂️ Catégories actuelles de mon cerveau : {', '.join(cats)}"
+
+        return "Action mémoire inconnue."
+
+    @staticmethod
+    def _power_control(action: str, force: bool = False) -> str:
+        """
+        Contrôle l'alimentation du PC : veille, redémarrage, arrêt, verrouillage.
+        """
+        import os
+        import subprocess
+        
+        action = action.lower()
+        
+        # Commande de base pour shutdown
+        # /s = shutdown, /r = restart, /l = logoff, /h = hibernate
+        # /t 0 = temps 0s, /f = force (si force=True)
+        
+        force_flag = "/f" if force else ""
+        
+        try:
+            if action == "sleep":
+                # La mise en veille se fait via rundll32
+                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+                return "Mise en veille du système..."
+            
+            elif action == "lock":
+                os.system("rundll32.exe user32.dll,LockWorkStation")
+                return "Session verrouillée."
+            
+            elif action == "shutdown":
+                os.system(f"shutdown /s /t 5 {force_flag}")
+                return "Arrêt du système dans 5 secondes."
+            
+            elif action == "restart":
+                os.system(f"shutdown /r /t 5 {force_flag}")
+                return "Redémarrage du système dans 5 secondes."
+                
+            elif action == "abort":
+                os.system("shutdown /a")
+                return "Annulation de l'arrêt/redémarrage planifié."
+                
+        except Exception as e:
+            return f"Erreur lors de l'action d'alimentation : {e}"
+            
+        return "Action d'alimentation inconnue."
+    
+    @staticmethod
+    def _system_optimize(action: str) -> str:
+        """
+        Outils d'optimisation : vider la RAM (via EmptyStandbyList si dispo, sinon garbage collector), vider les temp.
+        """
+        import gc
+        import os
+        import shutil
+        import tempfile
+        
+        action = action.lower()
+        
+        if action == "clean_ram":
+            # 1. Force le Garbage Collector de Python
+            gc.collect()
+            
+            # 2. Sous Windows, on ne peut pas vraiment "vider la RAM" sans droits admin et outils tiers.
+            # On peut suggérer de fermer les apps gourmandes via process_manager.
+            return "Garbage Collector Python exécuté. Pour libérer plus de RAM système, utilisez `process_manager` pour fermer les applications gourmandes."
+
+        if action == "clean_temp":
+            temp_dir = tempfile.gettempdir()
+            deleted_count = 0
+            total_size = 0
+            
+            try:
+                for root, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        try:
+                            file_path = os.path.join(root, file)
+                            size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            deleted_count += 1
+                            total_size += size
+                        except:
+                            pass # Fichier utilisé, on ignore
+            except Exception as e:
+                return f"Erreur lors du nettoyage : {e}"
+            
+            size_mb = total_size / (1024 * 1024)
+            return f"Nettoyage terminé. {deleted_count} fichiers temporaires supprimés (~{size_mb:.2f} MB libérés)."
+            
+        return "Action d'optimisation inconnue."
+
+    @staticmethod
+    def _network_manager(action: str, target: str | None = None) -> str:
+        """
+        Gère le Wi-Fi, le Bluetooth et le Mode Avion.
+        Utilise netsh pour le Wi-Fi et Powershell/Commandes pour le reste.
+        """
+        import subprocess
+        
+        action = action.lower()
+        
+        def run_command(args):
+            try:
+                # encoding='cp850' est souvent nécessaire pour la console Windows FR
+                result = subprocess.run(args, capture_output=True, text=True, encoding='cp850', shell=True)
+                return result.stdout.strip()
+            except Exception as e:
+                return str(e)
+
+        # --- WI-FI ---
+        if action == "list_networks":
+            output = run_command("netsh wlan show networks mode=bssid")
+            networks = []
+            for line in output.split('\n'):
+                if "SSID" in line and ":" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        networks.append(parts[1].strip())
+            unique_networks = list(set(networks))
+            return "Réseaux Wi-Fi visibles :\n" + "\n".join(unique_networks[:10])
+
+        if action == "wifi_status":
+            return f"État de l'interface Wi-Fi :\n{run_command('netsh wlan show interfaces')}"
+
+        if action == "disconnect_wifi":
+            run_command("netsh wlan disconnect")
+            return "Déconnexion du réseau Wi-Fi effectuée."
+
+        if action == "connect_wifi":
+            if not target:
+                return "Quel réseau Wi-Fi dois-je rejoindre ?"
+            output = run_command(f'netsh wlan connect name="{target}"')
+            if "réussie" in output or "successfully" in output:
+                return f"Tentative de connexion au réseau '{target}'..."
+            else:
+                return f"Erreur : {output}. (Le profil doit exister dans Windows)."
+
+        # --- MODE AVION ---
+        if action == "airplane_mode":
+            # Windows 10/11 ne permet pas de toggle le mode avion facilement par ligne de commande
+            # sans scripts PowerShell complexes ou droits admin. On ouvre la page dédiée.
+            subprocess.Popen("start ms-settings:network-airplanemode", shell=True)
+            return "J'ouvre les paramètres du Mode Avion (Windows restreint l'accès direct)."
+
+        # --- BLUETOOTH ---
+        if action == "bluetooth_status":
+            # Utilise PowerShell pour lister les périphériques Bluetooth connectés/appairés
+            ps_script = "Get-PnpDevice -Class Bluetooth | Where-Object {$_.Status -eq 'OK'} | Select-Object -ExpandProperty FriendlyName"
+            output = run_command(f'powershell -Command "{ps_script}"')
+            if output:
+                return f"Périphériques Bluetooth actifs/détectés :\n{output}"
+            return "Aucun périphérique Bluetooth actif détecté ou erreur de lecture."
+
+        if action == "bluetooth_settings" or action == "connect_bluetooth":
+            # La connexion Bluetooth spécifique en ligne de commande est très instable sur Windows.
+            # Le mieux est d'ouvrir la page d'appairage.
+            subprocess.Popen("start ms-settings:bluetooth", shell=True)
+            return "J'ouvre les paramètres Bluetooth pour gérer les connexions."
+
+        return f"Action réseau non reconnue : {action}"                                                                                      
+                                                                                              
+    @staticmethod
+    def _window_manager(action: str, target_window: str | None = None) -> str:
+        """
+        Gère les fenêtres Windows : minimiser, maximiser, fermer, lister, focus.
+        Utilise pygetwindow.
+        """
+        import pygetwindow as gw
+        
+        action = action.lower()
+
+        # Lister les fenêtres visibles
+        if action == "list":
+            titles = [w.title for w in gw.getAllWindows() if w.title.strip()]
+            return f"Fenêtres ouvertes :\n" + "\n".join(titles[:15])
+
+        # Récupérer la fenêtre active
+        if action == "active":
+            try:
+                win = gw.getActiveWindow()
+                if win:
+                    return f"La fenêtre active est : {win.title}"
+                return "Aucune fenêtre active détectée."
+            except:
+                return "Impossible de détecter la fenêtre active."
+
+        # Pour les actions suivantes, il faut une cible
+        if not target_window:
+            return "Quelle fenêtre dois-je cibler ?"
+
+        # Recherche floue de la fenêtre (ex: "Chrome" trouve "Google Chrome...")
+        target_window = target_window.lower()
+        windows = [w for w in gw.getAllWindows() if target_window in w.title.lower()]
+
+        if not windows:
+            return f"Je ne trouve aucune fenêtre contenant '{target_window}'."
+        
+        win = windows[0] # On prend la première correspondance
+
+        try:
+            if action == "minimize":
+                win.minimize()
+                return f"Fenêtre '{win.title}' réduite."
+            elif action == "maximize":
+                win.maximize()
+                return f"Fenêtre '{win.title}' maximisée."
+            elif action == "restore":
+                win.restore()
+                return f"Fenêtre '{win.title}' restaurée."
+            elif action == "close":
+                win.close()
+                return f"Fenêtre '{win.title}' fermée."
+            elif action == "focus" or action == "activate":
+                try:
+                    win.activate()
+                    return f"Je bascule sur '{win.title}'."
+                except:
+                    # Parfois Windows bloque le focus forcé, on tente de minimiser/restaurer
+                    win.minimize()
+                    win.restore()
+                    return f"Tentative de focus sur '{win.title}'."
+        except Exception as e:
+            return f"Erreur lors de l'action sur la fenêtre : {e}"
+        
+        return "Action de fenêtre inconnue." 
+
+    @staticmethod
+    def _system_control(feature: str, value: str | int | None = None) -> str:
+        """
+        Contrôle le volume, la luminosité, et le presse-papier.
+        Feature: volume, brightness, mute, clipboard_get, clipboard_set.
+        """
+        import screen_brightness_control as sbc
+        import pyperclip
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        import math
+
+        feature = feature.lower()
+
+        # --- PRESSE-PAPIER (Bonus) ---
+        if feature == "clipboard_get":
+            content = pyperclip.paste()
+            return f"Contenu du presse-papier : {content}" if content else "Le presse-papier est vide."
+        
+        if feature == "clipboard_set":
+            if not value: return "Aucun texte fourni pour le presse-papier."
+            pyperclip.copy(str(value))
+            return "Texte copié dans le presse-papier."
+
+        # --- LUMINOSITÉ ---
+        if feature == "brightness":
+            if value is None:
+                current = sbc.get_brightness()
+                return f"Luminosité actuelle : {current[0]}%." if current else "Impossible de lire la luminosité."
+            
+            try:
+                # Gérer "+10", "-10" ou "50"
+                val_str = str(value).strip()
+                if val_str.startswith("+") or val_str.startswith("-"):
+                    current = sbc.get_brightness()[0]
+                    new_val = current + int(val_str)
+                else:
+                    new_val = int(val_str)
+                
+                # Borner entre 0 et 100
+                new_val = max(0, min(100, new_val))
+                sbc.set_brightness(new_val)
+                return f"Luminosité réglée à {new_val}%."
+            except Exception as e:
+                return f"Erreur de luminosité : {e}"
+
+        # --- VOLUME (PyCaw) ---
+        if feature in ["volume", "mute"]:
+            try:
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                volume = cast(interface, POINTER(IAudioEndpointVolume))
+                
+                if feature == "mute":
+                    # Basculer le mute
+                    current_mute = volume.GetMute()
+                    volume.SetMute(not current_mute, None)
+                    return "Son coupé." if not current_mute else "Son réactivé."
+
+                if feature == "volume":
+                    # Convertir pourcentage en dB (échelle logarithmique approximative pour Windows)
+                    # Note: Pycaw utilise SetMasterVolumeLevelScalar pour le % (0.0 à 1.0)
+                    if value is None:
+                        current = round(volume.GetMasterVolumeLevelScalar() * 100)
+                        return f"Volume actuel : {current}%."
+
+                    val_str = str(value).strip()
+                    current_vol = volume.GetMasterVolumeLevelScalar() * 100
+                    
+                    if val_str.startswith("+") or val_str.startswith("-"):
+                        target = current_vol + int(val_str)
+                    else:
+                        target = int(val_str)
+                    
+                    target = max(0.0, min(100.0, target))
+                    volume.SetMasterVolumeLevelScalar(target / 100.0, None)
+                    return f"Volume réglé à {int(target)}%."
+
+            except Exception as e:
+                return f"Erreur de volume : {e}"
+
+        return "Fonctionnalité système inconnue."
+
+    @staticmethod
+    def _process_manager(action: str, target: str | None = None) -> str:
+        """
+        Gère les processus : lister (top CPU/RAM), tuer un processus, infos système.
+        Utilise psutil.
+        """
+        import psutil
+        import platform
+
+        action = action.lower()
+
+        # Infos Globales
+        if action == "system_info":
+            cpu = psutil.cpu_percent(interval=0.1)
+            ram = psutil.virtual_memory().percent
+            batt = psutil.sensors_battery()
+            batt_status = f"{batt.percent}%" if batt else "Secteur/Inconnu"
+            return (f"📊 État du Système :\n"
+                    f"- OS : {platform.system()} {platform.release()}\n"
+                    f"- CPU : {cpu}%\n"
+                    f"- RAM : {ram}%\n"
+                    f"- Batterie : {batt_status}")
+
+        # Lister les processus gourmands
+        if action == "list":
+            # Top 5 par utilisation mémoire
+            procs = []
+            for p in psutil.process_iter(['name', 'memory_percent']):
+                try:
+                    procs.append(p.info)
+                except:
+                    pass
+            # Trier et prendre le top 5
+            top_5 = sorted(procs, key=lambda x: x['memory_percent'] or 0, reverse=True)[:5]
+            
+            report = "🚀 Top 5 Processus (RAM) :\n"
+            for p in top_5:
+                report += f"- {p['name']} : {p['memory_percent']:.1f}%\n"
+            return report
+
+        # Tuer un processus
+        if action == "kill":
+            if not target:
+                return "Quel processus dois-je fermer ?"
+            
+            killed_count = 0
+            target = target.lower()
+            if not target.endswith(".exe"): 
+                target_exe = target + ".exe"
+            else:
+                target_exe = target
+
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    # Correspondance nom exact ou partiel
+                    if proc.info['name'].lower() == target_exe or target in proc.info['name'].lower():
+                        proc.kill()
+                        killed_count += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            if killed_count > 0:
+                return f"J'ai arrêté {killed_count} processus correspondant à '{target}'."
+            else:
+                return f"Je n'ai pas trouvé de processus nommé '{target}'."
+
+        return "Action de processus inconnue."                                                                                         
+                                                                                              
+    @staticmethod
+    def _get_folder_size(start_path='.'):
+        """Calcule récursivement la taille d'un dossier."""
+        import os
+        total_size = 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(start_path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if not os.path.islink(fp):
+                        total_size += os.path.getsize(fp)
+        except:
+             return -1
+        return total_size
+    
+    @staticmethod
+    def _format_bytes(bytes_size):
+        """Formate la taille en B, KB, MB, GB."""
+        if bytes_size < 1024:
+            return f"{bytes_size} B"
+        elif bytes_size < 1024**2:
+            return f"{bytes_size/1024:.2f} KB"
+        elif bytes_size < 1024**3:
+            return f"{bytes_size/1024**2:.2f} MB"
+        else:
+            return f"{bytes_size/1024**3:.2f} GB"
+    
+    @staticmethod
+    def _file_manager(action: str, source_path: str, destination_path: str | None = None) -> str:
+        """
+        Tool Python pour la gestion de fichiers/dossiers.
+        Utilise shutil pour les opérations complexes.
+        """
+        import os
+        import shutil
+        
+        action = action.lower()
+
+        # Remplacement du chemin OneDrive dans les paramètres entrants
+        # (Pour ne pas avoir à écrire la logique dans Gemini)
+        if "~" in source_path:
+             source_path = source_path.replace("~", os.path.expanduser("~")).replace("Desktop", DESKTOP_REAL.split(os.path.sep)[-1])
+        if destination_path and "~" in destination_path:
+             destination_path = destination_path.replace("~", os.path.expanduser("~")).replace("Desktop", DESKTOP_REAL.split(os.path.sep)[-1])
+
+        
+        # --- 1. Créer un Dossier/Structure ---
+        if action == "create_dir":
+            try:
+                os.makedirs(source_path, exist_ok=True)
+                return f"Le dossier/structure '{source_path}' a été créé avec succès."
+            except Exception as e:
+                return f"Erreur lors de la création de '{source_path}': {e}"
+        
+        # --- 2. Lister les Fichiers/Scanner ---
+        if action == "list_files":
+            try:
+                if not os.path.isdir(source_path):
+                    return f"Le chemin '{source_path}' n'est pas un répertoire."
+                
+                # Lister les 10 premiers fichiers/dossiers
+                items = os.listdir(source_path)
+                if not items:
+                    return f"Le répertoire '{source_path}' est vide."
+                
+                report = f"Contenu de '{source_path}' (Top 10) :\n" + "\n".join(items[:10])
+                return report
+            except Exception as e:
+                return f"Erreur lors de la lecture du répertoire '{source_path}': {e}"
+
+        # --- 3. Déplacer / Renommer ---
+        if action == "move" or action == "rename":
+            # Renommer est un cas de move où destination_path est le nouveau nom
+            if action == "rename" and destination_path:
+                destination_path = os.path.join(os.path.dirname(source_path), destination_path)
+            
+            if not destination_path:
+                return "Le chemin de destination est manquant pour l'action move/rename."
+
+            try:
+                shutil.move(source_path, destination_path)
+                return f"'{source_path}' a été déplacé/renommé vers '{destination_path}'."
+            except FileNotFoundError:
+                return f"Erreur: Fichier/Dossier source '{source_path}' non trouvé."
+            except Exception as e:
+                return f"Erreur lors du déplacement/renommage: {e}"
+
+        # --- 4. Copier ---
+        if action == "copy":
+            if not destination_path:
+                return "Le chemin de destination est manquant pour la copie."
+            try:
+                if os.path.isdir(source_path):
+                    shutil.copytree(source_path, destination_path)
+                else:
+                    shutil.copy2(source_path, destination_path) # copy2 preserve metadata
+                return f"'{source_path}' a été copié vers '{destination_path}'."
+            except FileNotFoundError:
+                return f"Erreur: Fichier/Dossier source '{source_path}' non trouvé."
+            except Exception as e:
+                return f"Erreur lors de la copie: {e}"
+
+        # --- 5. Supprimer ---
+        if action == "delete":
+            try:
+                if os.path.isdir(source_path):
+                    shutil.rmtree(source_path)
+                    return f"Dossier '{source_path}' et son contenu supprimés avec succès."
+                else:
+                    os.remove(source_path)
+                    return f"Fichier '{source_path}' supprimé avec succès."
+            except FileNotFoundError:
+                return f"Erreur: Fichier/Dossier '{source_path}' non trouvé."
+            except Exception as e:
+                return f"Erreur lors de la suppression: {e}"
+
+        # --- 6. Calculer la Taille ---
+        if action == "calculate_size":
+            try:
+                size_bytes = AudioLoop._get_folder_size(source_path)
+                if size_bytes == -1:
+                    return f"Erreur lors du calcul de la taille de '{source_path}'."
+                return f"La taille de '{source_path}' est : {AudioLoop._format_bytes(size_bytes)}."
+            except Exception as e:
+                return f"Erreur lors du calcul de la taille : {e}"
+
+        # --- 7. Détecter les Doublons (Simplifié) ---
+        if action == "find_duplicates":
+            return "Cette fonction est trop complexe pour un appel direct. Veuillez utiliser `execute_python` pour écrire un script d'analyse de fichiers si nécessaire."
+        
+        if action == "archive":
+            if not destination_path:
+                return "Le chemin de destination est manquant pour l'archivage."
+            try:
+                # shutil.make_archive(nom_archive_sans_extension, format, dossier_source)
+                # On utilise la destination comme nom de base, en la séparant du chemin.
+                base_name = os.path.basename(destination_path)
+                root_dir = os.path.dirname(source_path)
+                
+                # Créer le chemin pour la destination de l'archive (ex: C:\Users\archive.zip)
+                archive_path = shutil.make_archive(
+                    base_name=destination_path,
+                    format='zip',
+                    root_dir=root_dir,
+                    base_dir=os.path.basename(source_path) if os.path.isdir(source_path) else source_path
+                )
+                
+                return f"'{source_path}' a été archivé au format ZIP avec succès : {archive_path}"
+            except Exception as e:
+                return f"Erreur lors de l'archivage de '{source_path}': {e}"
+
+        # --- 8. Désarchiver / Décompresser ---
+        if action == "unarchive":
+            if not destination_path:
+                return "Le chemin de destination (où décompresser) est manquant."
+            
+            try:
+                # Utiliser shutil.unpack_archive (supporte zip, tar, gztar, etc.)
+                shutil.unpack_archive(
+                    filename=source_path,
+                    extract_dir=destination_path
+                )
+                return f"'{source_path}' a été décompressé avec succès dans '{destination_path}'."
+            except FileNotFoundError:
+                return f"Erreur: Le fichier d'archive '{source_path}' n'a pas été trouvé."
+            except shutil.ReadError:
+                return "Erreur: Le fichier d'archive est corrompu ou le format n'est pas supporté (doit être zip, tar, etc.)."
+            except Exception as e:
+                return f"Erreur lors de la désarchivage: {e}"
+
+        return f"Action de gestion de fichiers non prise en charge : {action}"                                                                                          
+                                                                                              
     @staticmethod
     def _get_time(timezone: str | None = None) -> str:
         """
@@ -1189,9 +1921,10 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
                         output = output[:500] + "\n... (sortie tronquée)"
                     
                     return (
-                        f"✅ CODE EXÉCUTÉ AVEC SUCCÈS (en {execution_time:.2f}s)\n\n"
-                        f"Sortie :\n{output}"
-                    )
+                    f"EXECUTION_FINALE_OK\n" # <-- MARQUEUR
+                    f"✅ CODE EXÉCUTÉ AVEC SUCCÈS (en {execution_time:.2f}s)\n\n"
+                    f"Sortie :\n{output}"
+                )
                 else:
                     return f"✅ CODE EXÉCUTÉ AVEC SUCCÈS (en {execution_time:.2f}s), Monsieur."
             else:
@@ -1201,6 +1934,7 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
                     error = error[:300] + "\n... (erreur tronquée)"
                 
                 return (
+                    f"EXECUTION_FINALE_ERREUR\n" # <-- MARQUEUR
                     f"❌ ERREUR LORS DE L'EXÉCUTION (après {execution_time:.2f}s)\n\n"
                     f"{error}"
                 )
@@ -1292,6 +2026,24 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
 
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
             await self.out_queue_gemini.put({"data": data, "mime_type": "audio/pcm"})
+
+    @staticmethod
+    def _shorten_for_tts(text: str) -> str:
+        """Retourne une version courte du texte pour la voix (première phrase ou troncation)."""
+        if not text:
+            return ""
+        txt = text.strip().replace("\n", " ")
+        # Chercher la fin de la première phrase
+        end_idx = None
+        for i, ch in enumerate(txt):
+            if ch in ".?!":
+                if i >= 20:  # Éviter de couper sur une abréviation ultra courte
+                    end_idx = i + 1
+                    break
+        if end_idx is None:
+            end_idx = min(len(txt), 150) # Tronquer à 150 caractères maximum si pas de point
+        spoken = txt[:end_idx].strip()
+        return spoken
 
     async def receive_text(self):
         """
@@ -1414,6 +2166,19 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
                 if aggregated_text.strip():
                     spoken_text = aggregated_text
                     
+                    if (spoken_text.startswith("EXECUTION_FINALE_OK") or
+                        spoken_text.startswith("EXECUTION_FINALE_ERREUR") or
+                        spoken_text.startswith("CODE_EN_ATTENTE_DE_CONFIRMATION")):
+                    
+                        # Cypher parle BEAUCOUP moins pour le Python
+                        if "ERREUR" in spoken_text:
+                            spoken_text = "Monsieur, une erreur est survenue lors de l'exécution."
+                        elif "CODE_EN_ATTENTE_DE_CONFIRMATION" in spoken_text:
+                            spoken_text = "Je prépare le code, Monsieur."
+                        else:
+                            spoken_text = "Le code est exécuté, Monsieur."
+
+
                     if spoken_text:
                         self.is_speaking = True
                         await self.response_queue_tts.put(spoken_text)
@@ -1540,6 +2305,14 @@ FUNCTION_MAP = {
     "open_website": AudioLoop._open_website,
     "execute_python": AudioLoop._execute_python,
     "get_python_execution_history": AudioLoop._get_python_execution_history,
+    "file_manager": AudioLoop._file_manager,
+    "window_manager": AudioLoop._window_manager,
+    "system_control": AudioLoop._system_control,
+    "process_manager": AudioLoop._process_manager,
+    "power_control": AudioLoop._power_control,
+    "system_optimize": AudioLoop._system_optimize,
+    "network_manager": AudioLoop._network_manager,
+    "memory_manager": AudioLoop._memory_manager,
 }
 
 
