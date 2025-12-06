@@ -31,6 +31,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
 PYTHON_EXECUTION_LOG = []   # Historique des exécutions
 
+
+
 USER_HOME = os.path.expanduser("~")
 ONEDRIVE_BASE = os.path.join(USER_HOME, "OneDrive")
 
@@ -490,6 +492,50 @@ class AudioLoop:
             }
         }
 
+        error_history_tool = {
+            "name": "error_history",
+            "description": "Permet de consulter les dernières erreurs système ou Python rencontrées par Cypher pour ne pas les reproduire.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Nom du module ou tool, ex: 'execute_python', 'file_manager'. Laisser vide pour tout.",
+                    }
+                },
+                "required": []
+            }
+        }
+
+        agenda_tool = {
+            "name": "manage_agenda",
+            "description": "Gère l'agenda personnel : ajouter, consulter ou supprimer des événements.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "list", "delete"],
+                        "description": "Action à effectuer."
+                    },
+                    "date_iso": {
+                        "type": "string",
+                        "description": "Date et heure de l'événement au format EXACT 'YYYY-MM-DD HH:MM'. Calcule-la toi-même par rapport à la date actuelle."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Description de l'événement."
+                    },
+                    "alarm": {
+                        "type": "boolean",
+                        "description": "Si True, Cypher parlera vocalement à l'heure dite.",
+                        "default": False
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+
 
         tools = [
             {"function_declarations": [
@@ -509,6 +555,8 @@ class AudioLoop:
                 system_optimize,
                 network_manager,
                 memory_manager,
+                error_history_tool,
+                agenda_tool,
             ]},
             google_search_tool
         ]
@@ -529,9 +577,15 @@ class AudioLoop:
             except:
                 print(">>> [WARNING] Impossible de lire la mémoire au démarrage.")
 
+
+        now = datetime.now()
+        current_context = f"NOUS SOMMES LE {now.strftime('%d/%m/%Y')} à {now.strftime('%H:%M')}."
+
         self.config = {
             "response_modalities": ["TEXT"],
             "system_instruction": f"""
+{current_context}
+
 Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je suis ton développeur. Tu es comme un pote collegue avec moi tu peux me charier parfois ou etre tres franc aussi. et tu es une IA conçue pour m'aider dans mes projets d'ingénierie ainsi que dans mes tâches quotidiennes. Adresse-toi à moi en m'appelant « Monsieur ». Merci également de veiller à ce que tes réponses soient concises.
     
     Règles pour les demandes d'heure :
@@ -682,6 +736,15 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     → Sans jamais demander la permission à Monsieur.
     • Pour les contenu textuels que tu me propose je veux toujours qu'il soit dans un format tres beau visuellement avec des titres, sous titres, listes a puces, etc.
 
+
+    Règle pour manage_agenda :
+    - Utilise cet outil dès que je parle de temps, de rendez-vous, de rappel, de planning ou d'emploi du temps.
+    - CALCUL OBLIGATOIRE : L'outil attend une `date_iso` au format strict 'YYYY-MM-DD HH:MM'. Tu DOIS calculer cette date toi-même en te basant sur la date et l'heure actuelles fournies dans le contexte ({current_context}).
+    - RAPPELS : Si je dis "Rappelle-moi de [faire X] dans [Y] minutes/heures", calcule l'heure future et appelle l'outil avec `action='add'`, la description et `alarm=True`.
+    - CONSULTATION : Si je demande "Qu'est-ce que j'ai de prévu ?", utilise `action='list'`.
+    - SUPPRESSION : Si je demande d'annuler quelque chose, utilise `action='delete'`.
+
+
     =======================================================
     RÈGLES D'AGENT EXÉCUTIF ET PRIORITÉ D'ACTION
     =======================================================
@@ -696,6 +759,10 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
         d.  RECHERCHE : Utilise `Google Search` pour toute information factuelle non connue.
         
         e.  DERNIER RECOURS/LOGIQUE : Utilise `execute_python` uniquement si les outils ci-dessus échouent ou si la tâche nécessite une logique de programmation complexe ou une librairie externe (fpdf, pandas, etc.).
+
+        f. AGENDA :
+       - Pour ajouter un événement, tu DOIS calculer la date future au format 'YYYY-MM-DD HH:MM' en te basant sur la date actuelle ({current_context}).
+       - Si je dis "Rappelle-moi de sortir les poubelles ce soir à 20h", tu calcules la date d'aujourd'hui + 20:00 et tu appelles manage_agenda avec alarm=True.
     
     2.  RÈGLES D'EXÉCUTION AUTOMATIQUE :
         
@@ -706,6 +773,7 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     3.  GESTION DE execute_python :
         
         •   Si un script est exécuté, tu dois raccourcir ta réponse vocale au strict minimum (statut d'exécution).
+        •   Si tu as besoin d'installer une lib pour un script python installe la sans me demander.
     
     4.  RÈGLES D'AUTONOMIE :
         
@@ -721,7 +789,182 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             "tools": tools,
         }
     
+
+    async def agenda_watcher(self):
+        """
+        Vérifie chaque minute si un événement de l'agenda avec alarme est arrivé.
+        """
+        import json
+        import os
+        from datetime import datetime
+
+        script_dir = os.getcwd()
+        AGENDA_FILE = os.path.join(script_dir, "cypher_agenda.json")
+
+        print(">>> [INFO] Agenda Watcher activé.")
+
+        while True:
+            try:
+                # Vérification toutes les 30 secondes
+                await asyncio.sleep(30)
+                
+                if not os.path.exists(AGENDA_FILE):
+                    continue
+
+                with open(AGENDA_FILE, 'r', encoding='utf-8') as f:
+                    agenda = json.load(f)
+
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                modified = False
+
+                for event in agenda:
+                    # Si l'heure correspond ET qu'il y a une alarme ET qu'elle n'a pas déjà sonné
+                    if event.get("alarm") and event["date"] == now_str and event.get("status") == "pending":
+                        
+                        # 🔔 DÉCLENCHEMENT DE L'ALARME
+                        print(f">>> [ALARM] {event['description']}")
+                        
+                        # Message vocal prioritaire
+                        alert_text = f"Monsieur ! Rappel agenda : {event['description']}."
+                        self.is_speaking = True
+                        await self.response_queue_tts.put(alert_text)
+                        await self.response_queue_tts.put(None)
+                        
+                        # Marquer comme "notified" pour ne pas répéter en boucle
+                        event["status"] = "notified"
+                        modified = True
+
+                # Sauvegarder si on a notifié quelqu'un
+                if modified:
+                    with open(AGENDA_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(agenda, f, indent=4, ensure_ascii=False)
+
+            except Exception as e:
+                print(f">>> [ERROR Agenda Watcher] : {e}")
+
+    @staticmethod
+    def _manage_agenda(action: str, date_iso: str | None = None, description: str | None = None, alarm: bool = False) -> str:
+        """
+        Gère l'agenda personnel (RDV, rappels).
+        Stockage dans cypher_agenda.json.
+        """
+        import json
+        import os
+        from datetime import datetime, timedelta
+
+        script_dir = os.getcwd()
+        AGENDA_FILE = os.path.join(script_dir, "cypher_agenda.json")
+
+        # Charger l'agenda
+        if os.path.exists(AGENDA_FILE):
+            try:
+                with open(AGENDA_FILE, 'r', encoding='utf-8') as f:
+                    agenda = json.load(f)
+            except:
+                agenda = []
+        else:
+            agenda = []
+
+        action = action.lower()
+
+        # --- AJOUTER UN ÉVÉNEMENT ---
+        if action == "add":
+            if not date_iso or not description:
+                return "Il me faut une date (ISO) et une description."
+            
+            event = {
+                "id": str(int(time.time())), # ID simple basé sur le timestamp
+                "date": date_iso, # Format attendu: YYYY-MM-DD HH:MM
+                "description": description,
+                "alarm": alarm,
+                "status": "pending"
+            }
+            agenda.append(event)
+            
+            # Trier par date
+            agenda.sort(key=lambda x: x["date"])
+            
+            with open(AGENDA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(agenda, f, indent=4, ensure_ascii=False)
+            
+            alarm_msg = "avec alarme sonore" if alarm else "sans alarme"
+            return f"📅 Événement ajouté : '{description}' le {date_iso} ({alarm_msg})."
+
+        # --- CONSULTER (LISTER) ---
+        if action == "list":
+            if not agenda:
+                return "L'agenda est vide, Monsieur."
+            
+            # Filtrage intelligent (si date_iso est fourni, on filtre autour, sinon tout le futur)
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            upcoming = [e for e in agenda if e["date"] >= now_str]
+            
+            if not upcoming:
+                return "Rien de prévu à l'avenir."
+            
+            # Si on demande "demain" ou une date précise, on peut filtrer ici,
+            # mais le plus simple est de lister les 10 prochains et laisser Gemini résumer.
+            report = "📅 Vos prochains événements :\n"
+            for e in upcoming[:10]:
+                alarm_icon = "🔔" if e.get("alarm") else ""
+                report += f"- [{e['date']}] {e['description']} {alarm_icon}\n"
+            
+            return report
+
+        # --- SUPPRIMER ---
+        if action == "delete":
+            # On cherche par description (fuzzy) ou date
+            if not description:
+                return "Quel événement dois-je supprimer ?"
+            
+            initial_len = len(agenda)
+            # On garde ceux qui ne contiennent PAS la description
+            agenda = [e for e in agenda if description.lower() not in e["description"].lower()]
+            
+            if len(agenda) < initial_len:
+                with open(AGENDA_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(agenda, f, indent=4, ensure_ascii=False)
+                return f"Événement contenant '{description}' supprimé."
+            else:
+                return f"Je n'ai pas trouvé d'événement correspondant à '{description}'."
+
+        return "Action agenda inconnue."
     
+    @staticmethod
+    def _error_history(source: str | None = None) -> str:
+        import os, json
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        error_file = os.path.join(script_dir, "cypher_memory_cortex.json")
+
+        if not os.path.exists(error_file):
+            return "Je n'ai encore enregistré aucune erreur importante, Monsieur."
+
+        with open(error_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if source:
+            s = source.lower()
+            entries = data.get(s, [])
+            if not entries:
+                return f"Je n'ai pas d'erreur enregistrée pour '{source}', Monsieur."
+            subset = entries[-5:]
+            rep = [f"Dernières erreurs pour {s} :"]
+        else:
+            # On prend les 5 dernières toutes sources confondues
+            rep = ["Dernières erreurs enregistrées (toutes sources) :"]
+            subset = []
+            for src, lst in data.items():
+                for e in lst[-3:]:
+                    e["_src"] = src
+                    subset.append(e)
+            subset = sorted(subset, key=lambda x: x["timestamp"])[-5:]
+
+        for e in subset:
+            src = e.get("_src", source or "?")
+            rep.append(f"- [{src}] {e['timestamp']} : {e['message']}")
+
+        return "\n".join(rep)
+
     @staticmethod
     def _memory_manager(action: str, category: str, key: str | None = None, value: str | None = None) -> str:
         """
@@ -1732,6 +1975,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         )
     
     
+    
         
     
     @staticmethod
@@ -1741,6 +1985,58 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         """
         # ⚠️ CRITIQUE : Déclarer les variables globales EN PREMIER
         global PENDING_PYTHON_CODE, PYTHON_EXECUTION_LOG
+
+        def _record_error(source: str, message: str, code_snippet: str | None = None):
+        
+            import os, json
+            from datetime import datetime
+            import hashlib
+
+            try:
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                error_file = os.path.join(script_dir, "cypher_memory_cortex.json")
+
+                # Charger l'existant
+                if os.path.exists(error_file):
+                    try:
+                        with open(error_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                    except json.JSONDecodeError:
+                        data = {}
+                else:
+                    data = {}
+
+                # Normalisation
+                source = source.lower()
+                if source not in data:
+                    data[source] = []
+
+                # On compress un peu l’info
+                msg = (message or "").strip()
+                if len(msg) > 400:
+                    msg = msg[:400] + "… (tronqué)"
+
+                # petit hash pour reconnaître les erreurs récurrentes
+                base = (source + "|" + msg).encode("utf-8", errors="ignore")
+                err_hash = hashlib.sha1(base).hexdigest()[:12]
+
+                entry = {
+                    "hash": err_hash,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "message": msg,
+                    "code_excerpt": (code_snippet[:400] + "…") if code_snippet else None,
+                }
+
+                # On évite de stocker 200 fois la même erreur : si même hash déjà présent on ne rajoute pas
+                if not any(e.get("hash") == err_hash for e in data[source]):
+                    data[source].append(entry)
+
+                with open(error_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+
+            except Exception:
+                # Surtout ne jamais faire planter Cypher à cause de la mémoire d'erreurs
+                pass
         
         import subprocess
         import tempfile
@@ -1932,9 +2228,19 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 error = result.stderr.strip()
                 if len(error) > 300:
                     error = error[:300] + "\n... (erreur tronquée)"
-                
+
+                # 🔴 Enregistrer dans la mémoire d'erreurs
+                try:
+                    _record_error(
+                        source="execute_python",
+                        message=error,
+                        code_snippet=code_to_execute
+                    )
+                except Exception:
+                    pass
+
                 return (
-                    f"EXECUTION_FINALE_ERREUR\n" # <-- MARQUEUR
+                    "EXECUTION_FINALE_ERREUR\n"
                     f"❌ ERREUR LORS DE L'EXÉCUTION (après {execution_time:.2f}s)\n\n"
                     f"{error}"
                 )
@@ -1944,10 +2250,18 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 os.unlink(temp_file)
             except:
                 pass
+
+            # 🔴 Log timeout
+            try:
+                _record_error(
+                    source="execute_python",
+                    message="Timeout (30s) lors de l'exécution du script.",
+                    code_snippet=code_to_execute
+                )
+            except Exception:
+                pass
+
             return "⏱️ TIMEOUT : Le code a dépassé la limite de 30 secondes, Monsieur."
-        
-        except Exception as e:
-            return f"❌ ERREUR INATTENDUE : {str(e)}, Monsieur."
 
 
     # === OUTIL SUPPLÉMENTAIRE : Voir l'historique des exécutions ===
@@ -2280,6 +2594,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 tg.create_task(self.tts())
                 tg.create_task(self.play_audio())
                 tg.create_task(self.timer_watcher())
+                tg.create_task(self.agenda_watcher())
 
                 # boucle principale simple (plus de send_text)
                 while True:
@@ -2313,6 +2628,8 @@ FUNCTION_MAP = {
     "system_optimize": AudioLoop._system_optimize,
     "network_manager": AudioLoop._network_manager,
     "memory_manager": AudioLoop._memory_manager,
+    "error_history_tool": AudioLoop._error_history,
+    "manage_agenda": AudioLoop._manage_agenda,
 }
 
 
