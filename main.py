@@ -536,6 +536,38 @@ class AudioLoop:
             }
         }
 
+        email_tool = {
+            "name": "email_manager",
+            "description": "Gère l'application Outlook locale : lire les mails non lus, chercher un mail, ou envoyer un e-mail.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read_recent", "search", "send"],
+                        "description": "Action : lire les nouveaux (read_recent), chercher (search), envoyer (send)."
+                    },
+                    "recipient": {
+                        "type": "string",
+                        "description": "Adresse email du destinataire (pour action 'send')."
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Objet de l'e-mail (pour action 'send')."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Contenu du message (pour action 'send')."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Mots-clés pour la recherche (sujet ou expéditeur)."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+
 
         tools = [
             {"function_declarations": [
@@ -557,6 +589,7 @@ class AudioLoop:
                 memory_manager,
                 error_history_tool,
                 agenda_tool,
+                email_tool,
             ]},
             google_search_tool
         ]
@@ -763,6 +796,11 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
         f. AGENDA :
        - Pour ajouter un événement, tu DOIS calculer la date future au format 'YYYY-MM-DD HH:MM' en te basant sur la date actuelle ({current_context}).
        - Si je dis "Rappelle-moi de sortir les poubelles ce soir à 20h", tu calcules la date d'aujourd'hui + 20:00 et tu appelles manage_agenda avec alarm=True.
+
+       g. GESTION EMAILS (Outlook) :
+       - Utilise `email_manager` pour lire, chercher ou envoyer des mails.
+       - Pour l'envoi, sois professionnel dans la rédaction du `body` et du `subject`.
+       - Si je demande "J'ai reçu des mails ?", utilise `action='read_recent'`.
     
     2.  RÈGLES D'EXÉCUTION AUTOMATIQUE :
         
@@ -789,6 +827,98 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             "tools": tools,
         }
     
+
+    @staticmethod
+    def _email_manager(action: str, recipient: str | None = None, subject: str | None = None, body: str | None = None, query: str | None = None) -> str:
+        """
+        Gère l'application locale Outlook (Lecture, Recherche, Envoi).
+        Nécessite qu'Outlook soit installé et configuré sur le PC.
+        """
+        import win32com.client
+        import pythoncom
+        
+        # Initialisation du contexte COM (nécessaire pour le multithreading)
+        pythoncom.CoInitialize()
+
+        try:
+            # Connexion à Outlook
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            # 6 = Inbox (Boîte de réception)
+            inbox = outlook.GetDefaultFolder(6)
+        except Exception as e:
+            return f"Erreur de connexion à Outlook. Est-il installé ? Erreur : {e}"
+
+        action = action.lower()
+
+        # --- LIRE LES NON-LUS ---
+        if action == "read_recent":
+            messages = inbox.Items
+            messages.Sort("[ReceivedTime]", True) # Plus récents d'abord
+            
+            unread_messages = []
+            count = 0
+            
+            # On scanne les 50 derniers pour trouver les non-lus
+            for message in messages:
+                if count >= 5: break # On s'arrête à 5 résumés
+                try:
+                    if message.UnRead:
+                        sender = message.SenderName
+                        subj = message.Subject
+                        # On nettoie un peu le corps
+                        preview = message.Body[:100].replace('\r', ' ').replace('\n', ' ')
+                        unread_messages.append(f"- De {sender} | Objet : {subj} | Aperçu : {preview}...")
+                        count += 1
+                    if count >= 50: break # Sécurité pour ne pas scanner 10k mails
+                except:
+                    continue
+            
+            if not unread_messages:
+                return "Vous n'avez aucun nouvel e-mail non lu dans les 50 derniers reçus."
+            
+            return "Voici vos derniers e-mails non lus :\n" + "\n".join(unread_messages)
+
+        # --- RECHERCHER ---
+        if action == "search":
+            if not query: return "Que dois-je chercher ?"
+            
+            messages = inbox.Items
+            messages.Sort("[ReceivedTime]", True)
+            
+            found_messages = []
+            count = 0
+            
+            # Recherche simple dans les 100 derniers mails
+            for message in messages:
+                try:
+                    if query.lower() in message.Subject.lower() or query.lower() in message.SenderName.lower():
+                        found_messages.append(f"- [{message.ReceivedTime}] De {message.SenderName} : {message.Subject}")
+                        count += 1
+                    if count >= 5: break
+                    if count >= 100: break
+                except: continue
+                
+            if not found_messages:
+                return f"Je n'ai rien trouvé pour '{query}' dans les 100 derniers e-mails."
+            return f"Résultats pour '{query}' :\n" + "\n".join(found_messages)
+
+        # --- ENVOYER ---
+        if action == "send":
+            if not recipient or not subject or not body:
+                return "Pour envoyer un mail, il me faut : destinataire, objet et corps du message."
+            
+            try:
+                # 0 = MailItem
+                mail = win32com.client.Dispatch("Outlook.Application").CreateItem(0)
+                mail.To = recipient
+                mail.Subject = subject
+                mail.Body = body
+                mail.Send()
+                return f"E-mail envoyé avec succès à {recipient}."
+            except Exception as e:
+                return f"Erreur lors de l'envoi : {e}"
+
+        return "Action Outlook inconnue."
 
     async def agenda_watcher(self):
         """
@@ -1903,7 +2033,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             "vscode": r"C:\Users\amarz\AppData\Local\Programs\Microsoft VS Code\Code.exe",
             "code": r"C:\Users\amarz\AppData\Local\Programs\Microsoft VS Code\Code.exe",
             "spotify": r"C:\Users\amarz\AppData\Roaming\Spotify\Spotify.exe",
-            "discord": r"C:\Users\amarz\AppData\Local\Discord\app-1.0.9214\Discord.exe",
+            "discord": r"C:\Users\amarz\AppData\Local\Discord\app-1.0.9217\Discord.exe",
             "steam": r"C:\Program Files (x86)\Steam\steam.exe",
             "invite de commandes": r"C:\Users\amarz\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\System Tools\Command Prompt.lnk",
             "powershell": r"C:\Users\amarz\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\System Tools\Command Prompt.lnk",
@@ -2134,9 +2264,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         
         # --- SÉCURITÉ : Blacklist de chemins interdits ---
         FORBIDDEN_PATHS = [
-            r"C:\Windows",
-            r"C:\Program Files",
-            r"C:\ProgramData",
             r"C:\System32",
             "/etc",
             "/sys",
@@ -2630,6 +2757,7 @@ FUNCTION_MAP = {
     "memory_manager": AudioLoop._memory_manager,
     "error_history_tool": AudioLoop._error_history,
     "manage_agenda": AudioLoop._manage_agenda,
+    "email_manager": AudioLoop._email_manager,
 }
 
 
