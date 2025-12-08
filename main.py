@@ -96,6 +96,36 @@ class AudioLoop:
         self.audio_stream = None
         self.is_speaking = False
         self.client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        import pvporcupine
+        self.porcupine = None
+        try:
+            keyword_path = os.getenv("PICOVOICE_KEYWORD_PATH")
+            access_key = os.getenv("PICOVOICE_ACCESS_KEY")
+            
+            # Vérification basique
+            if not access_key:
+                raise ValueError("La clé PICOVOICE_ACCESS_KEY est vide dans le .env")
+
+            if keyword_path and os.path.exists(keyword_path):
+                self.porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path])
+                print(f">>> [INIT] Wake Word 'Cypher' chargé depuis {keyword_path}")
+            else:
+                # Si pas de fichier PPN, on tente le mot par défaut pour tester la clé
+                print(f">>> [WARNING] Fichier .ppn introuvable à : {keyword_path}. Tentative avec 'porcupine' par défaut.")
+                self.porcupine = pvporcupine.create(access_key=access_key, keywords=['porcupine'])
+                print(">>> [INIT] Wake Word par défaut 'Porcupine' chargé.")
+                
+        except Exception as e:
+            # 🛑 STOP IMMÉDIAT pour voir l'erreur
+            print(f"\n>>> [ERREUR FATALE PICOVOICE] : {e}")
+            print(">>> Vérifiez votre clé API et le chemin du fichier .ppn dans le .env")
+            sys.exit(1)
+
+        # Variables d'état pour la conversation
+        self.conversation_active = False
+        self.last_interaction_time = 0
+        self.CONVERSATION_TIMEOUT = 15.0 # 15 secondes
 
         # Déclaration du tool "get_time" pour Gemini
         get_time = {
@@ -2452,21 +2482,54 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     
 
     async def listen_audio(self):
+        import struct  # <--- AJOUT IMPORTANT
+        
+        # On utilise les paramètres de Porcupine (souvent 512 frames)
+        frame_length = self.porcupine.frame_length
         mic_info = pya.get_default_input_device_info()
+        
+        # Remplacez votre ouverture de stream actuelle par celle-ci :
         self.audio_stream = await asyncio.to_thread(
-            pya.open, format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE,
-            input=True, input_device_index=mic_info["index"], frames_per_buffer=CHUNK_SIZE
+            pya.open, format=FORMAT, channels=CHANNELS, 
+            rate=self.porcupine.sample_rate,  # <--- Utilise le taux de Porcupine
+            input=True, input_device_index=mic_info["index"], 
+            frames_per_buffer=frame_length    # <--- Utilise la taille de Porcupine
         )
-        kwargs = {"exception_on_overflow": False}
-        print(">>> [INFO] Microphone is listening...")
+        
+        print(">>> [VEILLE] En attente du mot clé...")
         while True:
-            # 🔇 Si Cypher est en train de parler, on n'envoie rien à Gemini
+            # 1. Si Cypher parle, on met en pause l'écoute (anti-écho)
             if self.is_speaking:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.05)
+                # On repousse le timeout pour ne pas couper pendant qu'il parle
+                self.last_interaction_time = time.time()
                 continue
 
-            data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-            await self.out_queue_gemini.put({"data": data, "mime_type": "audio/pcm"})
+            # 2. Lecture du micro
+            pcm = await asyncio.to_thread(self.audio_stream.read, frame_length, exception_on_overflow=False)
+
+            # --- ÉTAT : CONVERSATION ACTIVE (Micro ouvert vers Gemini) ---
+            if self.conversation_active:
+                # Vérification du Timeout (15s)
+                if time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT:
+                    print(">>> [SLEEP] Silence prolongé -> Retour en veille.")
+                    self.conversation_active = False
+                    continue
+
+                # Envoi du son à Gemini
+                await self.out_queue_gemini.put({"data": pcm, "mime_type": "audio/pcm"})
+
+            # --- ÉTAT : VEILLE (Analyse Porcupine uniquement) ---
+            else:
+                # Porcupine a besoin d'un tuple de 'shorts', pas de bytes bruts
+                pcm_unpacked = struct.unpack_from("h" * frame_length, pcm)
+                keyword_index = self.porcupine.process(pcm_unpacked)
+
+                if keyword_index >= 0:
+                    print(">>> [WAKE] 'Cypher' détecté ! Je vous écoute.")
+                    self.conversation_active = True
+                    self.last_interaction_time = time.time()
+                    # (Optionnel : Vous pouvez ajouter ici un play_sound("bip.wav"))
 
     @staticmethod
     def _shorten_for_tts(text: str) -> str:
@@ -2621,9 +2684,21 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
 
                     if spoken_text:
+                        # --- MODIF 1 : LE KILL SWITCH (Avant de parler) ---
+                        text_lower = spoken_text.lower()
+                        # Si Gemini vous dit au revoir, on coupe la conversation juste après
+                        if "au revoir" in text_lower or "à bientôt" in text_lower or "bonne nuit" in text_lower:
+                            print(">>> [AUTO-SLEEP] Fin de conversation détectée.")
+                            self.conversation_active = False
+
+                        # (Votre code existant d'envoi au TTS)
                         self.is_speaking = True
                         await self.response_queue_tts.put(spoken_text)
                         await self.response_queue_tts.put(None)
+                        
+                        # --- MODIF 2 : RESET DU TIMER (Après avoir envoyé le texte) ---
+                        # On redonne 15s à l'utilisateur à partir de MAINTENANT
+                        self.last_interaction_time = time.time()
 
             except Exception as e:
                 # ... (gestion d'erreur) ...
