@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import time
 import random
 import requests
+import azure.cognitiveservices.speech as speechsdk
 
 
 
@@ -27,6 +28,10 @@ from dotenv import load_dotenv
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION") # ex: "francecentral"
+AZURE_VOICE_NAME = "fr-FR-HenriNeural" # Ou "fr-FR-HenriNeural" pour un homme
 
 PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
 PYTHON_EXECUTION_LOG = []   # Historique des exécutions
@@ -53,8 +58,8 @@ if not os.path.exists(IMAGES_REAL):
 
 if not GEMINI_API_KEY:
     sys.exit("Error: GEMINI_API_KEY not found. Please set it in your .env file.")
-if not ELEVENLABS_API_KEY:
-    sys.exit("Error: ELEVENLABS_API_KEY not found. Please check your .env file and ElevenLabs account.")
+if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+    sys.exit("Error: AZURE keys not found. Please set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file.")
 
 if sys.version_info < (3, 11, 0):
     import taskgroup, exceptiongroup
@@ -2551,213 +2556,185 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
     async def receive_text(self):
         """
-        Gère intégralement :
-        - les tool calls de Gemini
-        - les réponses normales
-        - les résultats de la recherche web
-        - l’envoi des réponses au TTS
-        - le verrouillage/déverrouillage du micro (is_speaking)
+        Version optimisée pour Azure : Découpe le flux en phrases complètes
+        pour réduire la latence sans casser l'intonation.
         """
+        # Buffer pour stocker les bouts de phrases en attendant la ponctuation
+        text_buffer = "" 
+
         while True:
             try:
-                # Si Cypher parle → on ne lit pas Gemini
                 if self.is_speaking:
                     await asyncio.sleep(0.1)
                     continue
 
-                # 💡 CORRECTION : Déclaration et initialisation du turn de conversation
                 turn = self.session.receive() 
 
-                aggregated_text = ""  # Texte final à envoyer au TTS
-                tool_responses = []   # Réponses à renvoyer au modèle si tool_call
-                web_search_urls = set() # Stockage des URLs de recherche web
+                tool_responses = []
+                web_search_urls = set()
 
                 async for chunk in turn:
-
-                    # ---------------------------------------------------------
-                    # 1) TOOL CALL (function calling avec FUNCTION_MAP)
-                    # ---------------------------------------------------------
+                    # --- 1. GESTION DES TOOLS (Inchangé) ---
                     if hasattr(chunk, "tool_call") and chunk.tool_call:
                         function_calls = chunk.tool_call.function_calls
                         if function_calls:
-                            print(">>> [DEBUG] Tool call détecté:", [fc.name for fc in function_calls])
-
-                        for fc in function_calls:
-                            fname = fc.name
-                            args = dict(fc.args or {})
-                            print(f">>> [DEBUG] Appel de fonction demandé: {fname}({args})")
-
-                            # Vérifier que la fonction existe dans FUNCTION_MAP
-                            if fname not in FUNCTION_MAP:
-                                print(f">>> [ERROR] Fonction '{fname}' non trouvée.")
-                                tool_responses.append({
-                                    "id": fc.id,
-                                    "name": fname,
-                                    "response": {"error": f"Function {fname} not implemented"}
-                                })
-                                continue
-
-                            try:
-                                # Appel de ton outil Python (bloquant → to_thread si tu veux)
-                                result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
-                                print(f">>> [DEBUG] Résultat de {fname}: {result}")
-
-                                tool_responses.append({
-                                    "id": fc.id,           # ⚠️ TRÈS IMPORTANT
-                                    "name": fname,
-                                    "response": {"result": result}
-                                })
-
-                            except Exception as e:
-                                print(f">>> [ERROR] Exception dans {fname}: {e}")
-                                tool_responses.append({
-                                    "id": fc.id,           # ⚠️ idem ici
-                                    "name": fname,
-                                    "response": {"error": str(e)}
-                                })
-
-                        # Si on a des réponses de tools, on les renvoie au modèle
+                            for fc in function_calls:
+                                fname = fc.name
+                                args = dict(fc.args or {})
+                                if fname not in FUNCTION_MAP:
+                                    tool_responses.append({
+                                        "id": fc.id,
+                                        "name": fname,
+                                        "response": {"error": f"Function {fname} not implemented"}
+                                    })
+                                    continue
+                                try:
+                                    result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
+                                    tool_responses.append({
+                                        "id": fc.id,
+                                        "name": fname,
+                                        "response": {"result": result}
+                                    })
+                                except Exception as e:
+                                    tool_responses.append({
+                                        "id": fc.id,
+                                        "name": fname,
+                                        "response": {"error": str(e)}
+                                    })
                         if tool_responses:
-                            print(">>> [DEBUG] Envoi des réponses de tools:", tool_responses)
-                            await self.session.send_tool_response(
-                                function_responses=tool_responses
-                            )
-
+                            await self.session.send_tool_response(function_responses=tool_responses)
                         continue
 
-                    # ---------------------------------------------------------
-                    # 2) RÉPONSES DU SERVEUR (Web Search Results, Code Execution)
-                    # ---------------------------------------------------------
+                    # --- 2. GESTION DU SERVEUR (Code execution / Web search) (Inchangé) ---
                     if hasattr(chunk, "server_content") and chunk.server_content:
-                        
-                        # --- Gestion des résultats de recherche web (Grounding) ---
                         if (hasattr(chunk.server_content, 'grounding_metadata') and
                                 chunk.server_content.grounding_metadata and
                                 chunk.server_content.grounding_metadata.grounding_chunks):
-                            
                             for grounding_chunk in chunk.server_content.grounding_metadata.grounding_chunks:
                                 if grounding_chunk.web and grounding_chunk.web.uri:
                                     web_search_urls.add(grounding_chunk.web.uri)
-                            
-                            print(f"\n>>> [DEBUG] Recherche Web - Sources trouvées: {len(web_search_urls)}")
-
-                        # --- Gestion du Code Execution (inchangé) ---
+                        
                         model_turn = chunk.server_content.model_turn
                         if model_turn:
                             for part in model_turn.parts:
                                 if part.code_execution_result is not None:
-                                    output = part.code_execution_result.output
-                                    print(">>> [DEBUG] Code execution output (ignoré pour TTS):", output)
+                                    # On peut logger le résultat du code ici si besoin
+                                    pass
 
-                    # ---------------------------------------------------------
-                    # 3) TEXTE NORMAL
-                    # ---------------------------------------------------------
+                    # --- 3. GESTION DU TEXTE (LE CHANGEMENT EST ICI) ---
                     if getattr(chunk, "text", None):
-                        print(chunk.text, end="", flush=True)
-                        aggregated_text += chunk.text
-
-                # ---------------------------------------------------------
-                # 4) FIN DU TOUR → envoyer tout au TTS
-                # ---------------------------------------------------------
-                
-                # --- Afficher les sources si elles existent ---
-                if web_search_urls:
-                    print("\n--- Sources Web ---")
-                    for i, url in enumerate(web_search_urls):
-                        print(f"Source {i+1}: {url}")
-                    print("-------------------")
-                    
-                if aggregated_text.strip():
-                    spoken_text = aggregated_text
-                    
-                    if (spoken_text.startswith("EXECUTION_FINALE_OK") or
-                        spoken_text.startswith("EXECUTION_FINALE_ERREUR") or
-                        spoken_text.startswith("CODE_EN_ATTENTE_DE_CONFIRMATION")):
-                    
-                        # Cypher parle BEAUCOUP moins pour le Python
-                        if "ERREUR" in spoken_text:
-                            spoken_text = "Monsieur, une erreur est survenue lors de l'exécution."
-                        elif "CODE_EN_ATTENTE_DE_CONFIRMATION" in spoken_text:
-                            spoken_text = "Je prépare le code, Monsieur."
-                        else:
-                            spoken_text = "Le code est exécuté, Monsieur."
-
-
-                    if spoken_text:
-                        # --- MODIF 1 : LE KILL SWITCH (Avant de parler) ---
-                        text_lower = spoken_text.lower()
-                        # Si Gemini vous dit au revoir, on coupe la conversation juste après
-                        if "au revoir" in text_lower or "à bientôt" in text_lower or "bonne nuit" in text_lower:
-                            print(">>> [AUTO-SLEEP] Fin de conversation détectée.")
-                            self.conversation_active = False
-
-                        # (Votre code existant d'envoi au TTS)
-                        self.is_speaking = True
-                        await self.response_queue_tts.put(spoken_text)
-                        await self.response_queue_tts.put(None)
+                        current_text = chunk.text
+                        print(current_text, end="", flush=True)
                         
-                        # --- MODIF 2 : RESET DU TIMER (Après avoir envoyé le texte) ---
-                        # On redonne 15s à l'utilisateur à partir de MAINTENANT
-                        self.last_interaction_time = time.time()
+                        # Ajout au buffer
+                        text_buffer += current_text
+                        
+                        # --- DÉTECTION DE FIN DE PHRASE ---
+                        # On cherche les ponctuations fortes : . ? ! ou retour à la ligne
+                        # On évite de couper sur "M." ou "Dr." (simplification ici)
+                        import re
+                        # Regex : Cherche une ponctuation (.?!) suivie d'un espace ou fin de ligne
+                        split_pattern = r'([.?!;])\s+'
+                        
+                        parts = re.split(split_pattern, text_buffer)
+                        
+                        # Si on a plus d'un élément, c'est qu'on a trouvé une séparation
+                        if len(parts) > 1:
+                            # On reconstitue les phrases complètes
+                            # parts ressemble à ["Bonjour", "!", "Comment ça va", "?", "Reste"]
+                            
+                            # On parcourt par paire (Phrase + Ponctuation)
+                            for i in range(0, len(parts) - 1, 2):
+                                # Si c'est le dernier élément et qu'il n'y a pas de ponctuation après, c'est le reste
+                                if i + 1 >= len(parts):
+                                    text_buffer = parts[i]
+                                    break
+                                
+                                sentence = parts[i] + parts[i+1] # Texte + Ponctuation
+                                
+                                # Envoi immédiat au TTS
+                                if sentence.strip():
+                                    self.is_speaking = True
+                                    await self.response_queue_tts.put(sentence.strip())
+                            
+                            # Le dernier morceau devient le nouveau buffer
+                            text_buffer = parts[-1]
+
+
+                # --- 4. FIN DU TOUR ---
+                # S'il reste du texte dans le buffer à la fin de la réponse de Gemini
+                if text_buffer.strip():
+                    # Cas spécial Kill Switch
+                    text_lower = text_buffer.lower()
+                    if "au revoir" in text_lower or "bonne nuit" in text_lower:
+                         self.conversation_active = False
+
+                    self.is_speaking = True
+                    await self.response_queue_tts.put(text_buffer.strip())
+                    text_buffer = "" # Reset du buffer
+                
+                # Signal de fin pour ce tour (optionnel selon ta logique TTS)
+                await self.response_queue_tts.put(None)
+                self.last_interaction_time = time.time()
 
             except Exception as e:
-                # ... (gestion d'erreur) ...
                 print(f"\n>>> [ERROR in receive_text]: {e}")
                 await asyncio.sleep(0.1)
 
     async def tts(self):
-        uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id=eleven_flash_v2_5&output_format=pcm_24000"
-        
+        """
+        Génère le TTS via Azure AI Speech.
+        CORRECTION : Gestion correcte du signal de fin + libération du micro.
+        """
+        # --- CONFIG AZURE ---
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
+        speech_config.speech_synthesis_voice_name = AZURE_VOICE_NAME
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
+        )
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+    
+        print(f">>> [INIT] Azure TTS prêt ({AZURE_VOICE_NAME})")
+    
         while True:
             full_text = await self.response_queue_tts.get()
+            
+            # --- GESTION DU SIGNAL DE FIN ---
             if full_text is None:
-                # Juste marquer le travail fait pour ce tour, on ne change pas is_speaking ici
+                # ✅ CORRECTION : On transmet le signal de fin AU PLAYER
+                await self.audio_in_queue_player.put(None)
                 self.response_queue_tts.task_done()
-                continue
-
+                continue  # ⚠️ On ne libère PAS is_speaking ici (le player le fait)
+    
             try:
-                async with websockets.connect(uri) as websocket:
-                    await websocket.send(json.dumps({
-                        "text": " ",
-                        "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
-                        "xi_api_key": ELEVENLABS_API_KEY,
-                    }))
-
-                    async def listen():
-                        while True:
-                            try:
-                                message = await websocket.recv()
-                                data = json.loads(message)
-                                if data.get("audio"):
-                                    await self.audio_in_queue_player.put(base64.b64decode(data["audio"]))
-                                elif data.get("isFinal"):
-                                    break
-                            except websockets.exceptions.ConnectionClosed:
-                                break
-                            except Exception as e:
-                                print(f">>> [ERROR] in listen: {e}")
-                                break
-
-                    listen_task = asyncio.create_task(listen())
-                    await websocket.send(json.dumps({"text": full_text, "try_trigger_generation": True}))
-                    await websocket.send(json.dumps({"text": ""}))
-                    await listen_task
-
-                    # 🔁 Attendre que TOUS les chunks audio aient été lus par play_audio
-                    await self.audio_in_queue_player.join()
-
-                    # Marquer le texte comme traité
-                    self.response_queue_tts.task_done()
-
-                    # 🔓 Maintenant seulement, on considère que Cypher a fini de parler
-                    self.is_speaking = False
-
+                # --- GÉNÉRATION AZURE ---
+                def _generate_audio_blocking():
+                    return synthesizer.speak_text_async(full_text).get()
+    
+                result = await asyncio.to_thread(_generate_audio_blocking)
+    
+                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    audio_data = result.audio_data
+                    if audio_data:
+                        # ✅ Envoi du chunk audio au player
+                        await self.audio_in_queue_player.put(audio_data)
+                
+                elif result.reason == speechsdk.ResultReason.Canceled:
+                    print(f">>> [ERREUR AZURE] : {result.cancellation_details.reason}")
+    
             except Exception as e:
-                print(f">>> [ERROR] TTS error: {e}")
-                self.is_speaking = False  # ← DÉVERROUILLER même en cas d'erreur
-                await asyncio.sleep(2)
+                print(f">>> [EXCEPTION TTS] : {e}")
+            
+            finally:
+                self.response_queue_tts.task_done()
+                # ⚠️ ON NE TOUCHE PLUS À self.is_speaking ICI !
+
 
     async def play_audio(self):
+        """
+        Joue l'audio et libère le micro (is_speaking = False) UNIQUEMENT quand tout est fini.
+        ✅ VERSION CORRIGÉE
+        """
         try:
             stream = await asyncio.to_thread(
                 pya.open, format=FORMAT, channels=CHANNELS,
@@ -2767,17 +2744,31 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         except Exception as e:
             print(f">>> [FATAL ERROR] Could not open PyAudio stream: {e}")
             return
-
+    
         while True:
             try:
+                # On récupère le paquet audio (ou le signal de fin)
                 bytestream = await self.audio_in_queue_player.get()
+                
+                # --- SIGNAL DE FIN REÇU ---
+                if bytestream is None:
+                    # ✅ C'EST ICI qu'on libère le micro car on est sûr que tout le son d'avant est joué
+                    self.is_speaking = False
+                    print(">>> [INFO] ✅ Micro libéré (is_speaking = False)")
+                    self.audio_in_queue_player.task_done()
+                    continue
+    
+                # --- LECTURE AUDIO ---
                 if bytestream:
-                    # --- DIAGNOSTIC ---
-                    print(f">>> [DEBUG] Playing audio chunk of size: {len(bytestream)} bytes")
+                    # On joue le son (c'est bloquant le temps de la lecture, donc parfait)
                     await asyncio.to_thread(stream.write, bytestream)
+                
                 self.audio_in_queue_player.task_done()
+                
             except Exception as e:
                 print(f">>> [ERROR] Error in audio playback loop: {e}")
+                # Sécurité : en cas d'erreur, on rend la parole
+                self.is_speaking = False
 
     
 
