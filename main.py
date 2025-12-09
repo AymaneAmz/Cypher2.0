@@ -18,6 +18,10 @@ import time
 import random
 import requests
 import azure.cognitiveservices.speech as speechsdk
+import queue
+import threading
+from gui import CypherGUI
+import collections
 
 
 
@@ -92,7 +96,8 @@ pya = pyaudio.PyAudio()
 
 
 class AudioLoop:
-    def __init__(self, video_mode=DEFAULT_MODE):
+    def __init__(self, gui_queue, video_mode=DEFAULT_MODE):
+        self.gui_queue = gui_queue
         self.video_mode = video_mode
         self.out_queue_gemini = None
         self.response_queue_tts = None
@@ -603,6 +608,39 @@ class AudioLoop:
             }
         }
 
+        document_manager = {
+            "name": "document_manager",
+            "description": (
+                "Système RAG pour lire et interroger des documents locaux (PDF, Obsidian, Cours). "
+                "Utilise 'index' pour apprendre un dossier entier, 'search' pour poser une question sur le contenu, "
+                "et 'summary' pour résumer un fichier unique. "
+                "C'est l'outil ULTIME pour répondre aux questions sur les cours, notes ou fichiers de l'utilisateur."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["index", "search", "reset", "summary"],
+                        "description": "Action : apprendre (index), chercher (search), résumer un fichier (summary), tout oublier (reset)."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "La question posée ou le sujet recherché (pour 'search')."
+                    },
+                    "source_folder": {
+                        "type": "string",
+                        "description": "Le chemin du dossier à scanner (pour 'index')."
+                    },
+                    "source_file": {
+                        "type": "string",
+                        "description": "Chemin complet du fichier à résumer (pour 'summary')."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+
 
         tools = [
             {"function_declarations": [
@@ -625,6 +663,7 @@ class AudioLoop:
                 error_history_tool,
                 agenda_tool,
                 email_tool,
+                document_manager,
             ]},
             google_search_tool
         ]
@@ -812,6 +851,38 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     - CONSULTATION : Si je demande "Qu'est-ce que j'ai de prévu ?", utilise `action='list'`.
     - SUPPRESSION : Si je demande d'annuler quelque chose, utilise `action='delete'`.
 
+    Règle pour l'INTELLIGENCE DOCUMENTAIRE (RAG / document_manager) :
+
+        DÉCLENCHEURS AUTOMATIQUES :
+        - Dès que je pose une question sur :
+          • Mes cours (ex: "C'est quoi le théorème de Thévenin ?")
+          • Mes notes Obsidian (ex: "Rappelle-moi mes notes sur le projet X")
+          • Mes documents locaux (ex: "Qu'est-ce qui est dit dans mon PDF de maths ?")
+          • Mes fiches de révision (ex: "Résume-moi le chapitre 3")
+          
+        WORKFLOW OBLIGATOIRE :
+        1. PREMIÈRE FOIS sur un dossier :
+           - Propose : "Je ne connais pas encore ce dossier. Voulez-vous que je l'analyse ?"
+           - Si oui → `document_manager(action='index', source_folder='...')`
+           
+        2. DOSSIER DÉJÀ INDEXÉ :
+           - Utilise TOUJOURS `document_manager(action='search', query='...')` AVANT de répondre
+           - Utilise le résultat pour formuler une réponse précise et sourcée
+           - Mentionne les fichiers sources utilisés (ex: "D'après votre cours_maths.pdf...")
+        
+        3. RÉINITIALISATION :
+           - Si je dis "oublie mes documents" → `document_manager(action='reset')`
+        
+        EXEMPLE DE BON USAGE :
+        Moi: "C'est quoi la loi d'Ohm ?"
+        Toi: [Appelle document_manager search avec query="loi d'Ohm"]
+             → Réponds avec le contenu extrait : "D'après votre cours_elec.pdf, la loi d'Ohm..."
+        
+        IMPORTANT : 
+        - Ne réponds JAMAIS de mémoire si le document existe
+        - Cherche TOUJOURS dans les docs indexés avant de répondre
+        - Si rien trouvé, dis : "Je n'ai pas trouvé cette info dans vos documents indexés."
+
 
     =======================================================
     RÈGLES D'AGENT EXÉCUTIF ET PRIORITÉ D'ACTION
@@ -862,6 +933,195 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             "tools": tools,
         }
     
+
+    @staticmethod
+    def _document_manager(action: str, query: str | None = None, source_folder: str | None = None, source_file: str | None = None ) -> str:
+        """
+        Système RAG (Chat with Data) : Indexe et interroge vos documents locaux (PDF, MD, DOCX, TXT).
+        Action: 'index' (scanner un dossier) ou 'search' (poser une question).
+        """
+        import os
+        import fitz  # PyMuPDF
+        import docx
+        import chromadb
+        from chromadb.utils import embedding_functions
+
+        # Chemin de la base de données vectorielle (mémoire documentaire)
+        script_dir = os.getcwd()
+        DB_PATH = os.path.join(script_dir, "cypher_rag_db")
+        
+        # Initialisation de ChromaDB (Persistant sur le disque)
+        client = chromadb.PersistentClient(path=DB_PATH)
+        
+        # Fonction d'embedding par défaut (utilise un modèle léger local)
+        # Note: Au premier lancement, ça téléchargera un petit modèle (~80MB)
+        emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        
+        # Création/Récupération de la collection
+        collection = client.get_or_create_collection(name="cypher_knowledge", embedding_function=emb_fn)
+
+        action = action.lower()
+
+        # --- 1. INDEXATION (APPRENDRE) ---
+        if action == "index":
+            if not source_folder:
+                return "Quel dossier dois-je lire et apprendre ?"
+            
+            # Correction chemin OneDrive si tilde
+            if "~" in source_folder:
+                source_folder = os.path.expanduser(source_folder)
+            
+            if not os.path.exists(source_folder):
+                return f"Le dossier '{source_folder}' n'existe pas."
+
+            print(f">>> [RAG] Indexation en cours de : {source_folder} ...")
+            
+            files_processed = 0
+            chunks_added = 0
+            
+            # Formats supportés
+            supported_ext = ['.pdf', '.md', '.txt', '.docx', '.py']
+
+            for root, dirs, files in os.walk(source_folder):
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in supported_ext:
+                        filepath = os.path.join(root, file)
+                        text_content = ""
+                        
+                        try:
+                            # Extraction du texte selon le format
+                            if ext == '.pdf':
+                                try:
+                                    with fitz.open(filepath) as doc:
+                                        for page in doc:
+                                            text_content += page.get_text() + "\n"
+                                except fitz.fitz.FileDataError:
+                                    print(f"   -> PDF corrompu : {file}")
+                                    continue
+                                except Exception as e:
+                                    print(f"   -> Erreur PDF {file}: {e}")
+                                    continue
+                            elif ext == '.docx':
+                                doc = docx.Document(filepath)
+                                text_content = "\n".join([p.text for p in doc.paragraphs])
+                            else: # MD, TXT, PY
+                                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                                    text_content = f.read()
+                            
+                            if not text_content.strip(): continue
+
+                            # Découpage en chunks (morceaux) de 1000 caractères
+                            # Pour éviter de saturer le contexte
+                            chunk_size = 1000
+                            chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
+                            
+                            # Préparation pour ChromaDB
+                            ids = [f"{file}_{i}" for i in range(len(chunks))]
+                            metadatas = [{"source": file, "path": filepath} for _ in chunks]
+                            
+                            # Ajout à la base (Upsert = met à jour si existe déjà)
+                            collection.upsert(
+                                documents=chunks,
+                                ids=ids,
+                                metadatas=metadatas
+                            )
+                            
+                            files_processed += 1
+                            chunks_added += len(chunks)
+                            print(f"   -> Lu : {file} ({len(chunks)} fragments)")
+                            
+                        except Exception as e:
+                            print(f"   -> Erreur sur {file}: {e}")
+                            continue
+
+            return f"Indexation terminée ! J'ai lu {files_processed} fichiers et mémorisé {chunks_added} fragments de connaissances."
+
+        # --- 2. RECHERCHE (RÉPONDRE) ---
+        if action == "search":
+            if not query: return "Quelle est votre question sur les documents ?"
+            
+            # On cherche les 5 morceaux les plus pertinents sémantiquement
+            results = collection.query(
+                query_texts=[query],
+                n_results=5
+            )
+            
+            if not results['documents'][0]:
+                return "Je n'ai trouvé aucune information pertinente dans vos documents indexés."
+            
+            # Construction du contexte pour Gemini
+            context_text = "Voici les informations extraites de vos documents :\n\n"
+            for i, doc in enumerate(results['documents'][0]):
+                source = results['metadatas'][0][i]['source']
+                context_text += f"--- Source : {source} ---\n{doc}\n\n"
+            
+            return context_text
+
+        # --- 3. RESET (OUBLIER) ---
+        if action == "reset":
+            client.delete_collection("cypher_knowledge")
+            return "J'ai effacé toute ma base de connaissances documentaires."
+    
+
+        if action == "summary":
+            if not source_file:
+                return "Quel fichier dois-je résumer, Monsieur ?"
+
+            # Expansion du chemin si besoin (~, etc.)
+            if "~" in source_file:
+                source_file = os.path.expanduser(source_file)
+
+            if not os.path.exists(source_file):
+                return f"Le fichier '{source_file}' n'existe pas, Monsieur."
+
+            ext = os.path.splitext(source_file)[1].lower()
+            text_content = ""
+
+            try:
+                if ext == ".pdf":
+                    try:
+                        with fitz.open(source_file) as doc:
+                            for page in doc:
+                                text_content += page.get_text() + "\n"
+                    except Exception as e:
+                        return f"Impossible de lire le PDF, Monsieur : {e}"
+
+                elif ext == ".docx":
+                    try:
+                        d = docx.Document(source_file)
+                        text_content = "\n".join([p.text for p in d.paragraphs])
+                    except Exception as e:
+                        return f"Impossible de lire le document Word, Monsieur : {e}"
+
+                elif ext in [".md", ".txt", ".py"]:
+                    with open(source_file, "r", encoding="utf-8", errors="ignore") as f:
+                        text_content = f.read()
+
+                else:
+                    return f"Je ne sais pas encore résumer les fichiers de type '{ext}', Monsieur."
+
+                if not text_content.strip():
+                    return "Le fichier est vide ou illisible, Monsieur."
+
+                # On limite la taille renvoyée pour ne pas exploser le contexte de Gemini
+                max_chars = 4000
+                snippet = text_content[:max_chars]
+                if len(text_content) > max_chars:
+                    snippet += "\n\n[Texte tronqué pour le résumé, Monsieur.]"
+
+                # L'idée : tu renvoies le texte brut, et Gemini se charge de faire un beau résumé
+                return (
+                    f"Voici le contenu brut extrait de '{os.path.basename(source_file)}', "
+                    f"prêt à être résumé :\n\n{snippet}"
+                )
+
+            except Exception as e:
+                return f"Erreur lors de la lecture du fichier, Monsieur : {e}"
+
+        return "Action RAG inconnue."
+        
+        
 
     @staticmethod
     def _email_manager(action: str, recipient: str | None = None, subject: str | None = None, body: str | None = None, query: str | None = None) -> str:
@@ -2487,54 +2747,68 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     
 
     async def listen_audio(self):
-        import struct  # <--- AJOUT IMPORTANT
+        import struct
+        from collections import deque # Pour la mémoire tampon
         
-        # On utilise les paramètres de Porcupine (souvent 512 frames)
         frame_length = self.porcupine.frame_length
         mic_info = pya.get_default_input_device_info()
         
-        # Remplacez votre ouverture de stream actuelle par celle-ci :
         self.audio_stream = await asyncio.to_thread(
             pya.open, format=FORMAT, channels=CHANNELS, 
-            rate=self.porcupine.sample_rate,  # <--- Utilise le taux de Porcupine
+            rate=self.porcupine.sample_rate,
             input=True, input_device_index=mic_info["index"], 
-            frames_per_buffer=frame_length    # <--- Utilise la taille de Porcupine
+            frames_per_buffer=frame_length
         )
         
+        # --- BUFFER AUDIO (1 seconde de mémoire) ---
+        # 16000 Hz / 512 frames ~= 31 frames par seconde
+        # On garde les 30 dernières frames pour ne rien rater du début de la phrase
+        audio_buffer = deque(maxlen=30)
+        
         print(">>> [VEILLE] En attente du mot clé...")
+        
         while True:
-            # 1. Si Cypher parle, on met en pause l'écoute (anti-écho)
             if self.is_speaking:
                 await asyncio.sleep(0.05)
-                # On repousse le timeout pour ne pas couper pendant qu'il parle
                 self.last_interaction_time = time.time()
+                # On vide le buffer pendant qu'il parle pour ne pas envoyer de vieux sons
+                audio_buffer.clear()
                 continue
 
-            # 2. Lecture du micro
+            # Lecture du micro
             pcm = await asyncio.to_thread(self.audio_stream.read, frame_length, exception_on_overflow=False)
+            
+            # On enregistre TOUT dans le buffer temporaire
+            audio_buffer.append(pcm)
 
-            # --- ÉTAT : CONVERSATION ACTIVE (Micro ouvert vers Gemini) ---
+            # --- CAS 1 : CONVERSATION ACTIVE ---
             if self.conversation_active:
-                # Vérification du Timeout (15s)
                 if time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT:
                     print(">>> [SLEEP] Silence prolongé -> Retour en veille.")
+                    self.gui_queue.put(("STATUS", "idle"))
                     self.conversation_active = False
+                    audio_buffer.clear() # Nettoyage
                     continue
 
-                # Envoi du son à Gemini
+                # Envoi direct à Gemini
                 await self.out_queue_gemini.put({"data": pcm, "mime_type": "audio/pcm"})
 
-            # --- ÉTAT : VEILLE (Analyse Porcupine uniquement) ---
+            # --- CAS 2 : VEILLE (Detection) ---
             else:
-                # Porcupine a besoin d'un tuple de 'shorts', pas de bytes bruts
                 pcm_unpacked = struct.unpack_from("h" * frame_length, pcm)
                 keyword_index = self.porcupine.process(pcm_unpacked)
 
                 if keyword_index >= 0:
-                    print(">>> [WAKE] 'Cypher' détecté ! Je vous écoute.")
+                    print(">>> [WAKE] 'Cypher' détecté ! (One-Shot activé)")
+                    self.gui_queue.put(("STATUS", "listening"))
                     self.conversation_active = True
                     self.last_interaction_time = time.time()
-                    # (Optionnel : Vous pouvez ajouter ici un play_sound("bip.wav"))
+                    
+                    # 🚀 MAGIE : On envoie tout ce qu'on a entendu juste avant (le "Hey Cypher...")
+                    # Cela permet à Gemini d'avoir le début de la phrase si tu as parlé vite
+                    while len(audio_buffer) > 0:
+                        buffered_pcm = audio_buffer.popleft()
+                        await self.out_queue_gemini.put({"data": buffered_pcm, "mime_type": "audio/pcm"})
 
     @staticmethod
     def _shorten_for_tts(text: str) -> str:
@@ -2670,6 +2944,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                          self.conversation_active = False
 
                     self.is_speaking = True
+                    self.gui_queue.put(("ASSISTANT_TEXT", text_buffer.strip()))
                     await self.response_queue_tts.put(text_buffer.strip())
                     text_buffer = "" # Reset du buffer
                 
@@ -2754,6 +3029,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 if bytestream is None:
                     # ✅ C'EST ICI qu'on libère le micro car on est sûr que tout le son d'avant est joué
                     self.is_speaking = False
+                    self.gui_queue.put(("STATUS", "listening"))
                     print(">>> [INFO] ✅ Micro libéré (is_speaking = False)")
                     self.audio_in_queue_player.task_done()
                     continue
@@ -2761,6 +3037,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 # --- LECTURE AUDIO ---
                 if bytestream:
                     # On joue le son (c'est bloquant le temps de la lecture, donc parfait)
+                    self.gui_queue.put(("STATUS", "speaking"))
                     await asyncio.to_thread(stream.write, bytestream)
                 
                 self.audio_in_queue_player.task_done()
@@ -2824,21 +3101,61 @@ FUNCTION_MAP = {
     "error_history_tool": AudioLoop._error_history,
     "manage_agenda": AudioLoop._manage_agenda,
     "email_manager": AudioLoop._email_manager,
+    "document_manager": AudioLoop._document_manager,
 }
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode", type=str, default=DEFAULT_MODE,
-        help="pixels to stream from", choices=["none"]
-    )
-    args = parser.parse_args()
-    main_loop = AudioLoop(video_mode=args.mode)
+def run_backend(gui_queue):
+    """
+    Cette fonction crée une boucle asyncio isolée pour Cypher
+    afin qu'il puisse tourner en même temps que le GUI.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # On initialise Cypher avec la queue de communication
+    # (On force le mode vidéo à "none" ou DEFAULT_MODE si défini plus haut)
+    mode = "none" 
+    if 'DEFAULT_MODE' in globals():
+        mode = DEFAULT_MODE
+        
+    main_loop = AudioLoop(gui_queue=gui_queue, video_mode=mode)
+    
     try:
-        asyncio.run(main_loop.run())
+        loop.run_until_complete(main_loop.run())
     except KeyboardInterrupt:
         pass
     finally:
-        pya.terminate()
-        print(">>> [INFO] Application terminated.")
+        # Nettoyage propre quand le thread s'arrête
+        loop.close()
+        # Si pyaudio est global, on peut le fermer ici si besoin, 
+        # mais le daemon thread s'arrêtera brutalement à la fermeture du GUI, ce qui est OK.
+
+# --- LANCEMENT PRINCIPAL ---
+if __name__ == "__main__":
+    import queue
+    import threading
+    from gui import CypherGUI # Assure-toi que gui.py est bien dans le même dossier
+
+    print(">>> [INIT] Lancement de l'interface graphique...")
+
+    # 1. Création du canal de communication (Le Tuyau)
+    gui_queue = queue.Queue()
+    
+    # 2. Lancement de Cypher (Backend) dans un thread parallèle
+    # daemon=True signifie que si tu fermes la fenêtre, Cypher s'éteint aussi.
+    backend_thread = threading.Thread(target=run_backend, args=(gui_queue,), daemon=True)
+    backend_thread.start()
+    
+    # 3. Lancement du GUI (C'est lui qui prend le contrôle du thread principal)
+    try:
+        app = CypherGUI(data_queue=gui_queue)
+        app.mainloop()
+    except Exception as e:
+        print(f">>> [CRASH GUI] : {e}")
+    finally:
+        # Nettoyage final
+        try:
+            pya.terminate()
+        except:
+            pass
+        print(">>> [INFO] Application fermée.")
