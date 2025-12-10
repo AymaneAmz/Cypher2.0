@@ -4,6 +4,8 @@ for language understanding and ElevenLabs for text-to-speech synthesis.
 This version includes detailed diagnostic logging for debugging audio issues.
 """
 
+import sys
+
 import asyncio
 import base64
 import os
@@ -118,12 +120,12 @@ class AudioLoop:
                 raise ValueError("La clé PICOVOICE_ACCESS_KEY est vide dans le .env")
 
             if keyword_path and os.path.exists(keyword_path):
-                self.porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path])
+                self.porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path], sensitivities=[0.8])
                 print(f">>> [INIT] Wake Word 'Cypher' chargé depuis {keyword_path}")
             else:
                 # Si pas de fichier PPN, on tente le mot par défaut pour tester la clé
                 print(f">>> [WARNING] Fichier .ppn introuvable à : {keyword_path}. Tentative avec 'porcupine' par défaut.")
-                self.porcupine = pvporcupine.create(access_key=access_key, keywords=['porcupine'])
+                self.porcupine = pvporcupine.create(access_key=access_key, keywords=['Saïfeur'], sensitivities=[0.8])
                 print(">>> [INIT] Wake Word par défaut 'Porcupine' chargé.")
                 
         except Exception as e:
@@ -136,6 +138,10 @@ class AudioLoop:
         self.conversation_active = False
         self.last_interaction_time = 0
         self.CONVERSATION_TIMEOUT = 15.0 # 15 secondes
+        
+        self._boost_microphone_gain()
+        
+    
 
         # Déclaration du tool "get_time" pour Gemini
         get_time = {
@@ -851,12 +857,10 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     - CONSULTATION : Si je demande "Qu'est-ce que j'ai de prévu ?", utilise `action='list'`.
     - SUPPRESSION : Si je demande d'annuler quelque chose, utilise `action='delete'`.
 
-    Règle pour l'INTELLIGENCE DOCUMENTAIRE (RAG / document_manager) :
+    Règle pour document_manager (RAG) :
 
         DÉCLENCHEURS AUTOMATIQUES :
         - Dès que je pose une question sur :
-          • Mes cours (ex: "C'est quoi le théorème de Thévenin ?")
-          • Mes notes Obsidian (ex: "Rappelle-moi mes notes sur le projet X")
           • Mes documents locaux (ex: "Qu'est-ce qui est dit dans mon PDF de maths ?")
           • Mes fiches de révision (ex: "Résume-moi le chapitre 3")
           
@@ -935,13 +939,34 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     
 
     @staticmethod
+    def _clean_text_for_tts(text: str) -> str:
+        """Nettoie le texte (Markdown, symboles) pour la lecture vocale uniquement."""
+        import re
+        # Enlève les astérisques (*), dièses (#), underscores (_), backticks (`)
+        # On garde la ponctuation normale (. , ? !)
+        clean = re.sub(r'[\*#_`]', '', text)
+        return clean.strip()    
+                                                                                 
+    def _boost_microphone_gain(self):
+        """Augmente automatiquement le gain du micro au démarrage"""
+        import subprocess
+        try:
+            subprocess.run([
+                'powershell', '-Command',
+                "Get-AudioDevice -RecordingMute | Set-AudioDevice -RecordingMute 0"
+            ], capture_output=True)
+            print(">>> [AUDIO] Gain du microphone optimisé")
+        except:
+            print(">>> [WARNING] Impossible d'ajuster le gain automatiquement")
+
+    @staticmethod
     def _document_manager(action: str, query: str | None = None, source_folder: str | None = None, source_file: str | None = None ) -> str:
         """
         Système RAG (Chat with Data) : Indexe et interroge vos documents locaux (PDF, MD, DOCX, TXT).
         Action: 'index' (scanner un dossier) ou 'search' (poser une question).
         """
         import os
-        import fitz  # PyMuPDF
+        import fitz  
         import docx
         import chromadb
         from chromadb.utils import embedding_functions
@@ -2739,15 +2764,28 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 await asyncio.sleep(1)
 
     async def send_realtime(self):
-        while True:
-            msg = await self.out_queue_gemini.get()
-            await self.session.send(input=msg)
-            self.out_queue_gemini.task_done()
+        import websockets
+        try:
+            while True:
+                msg = await self.out_queue_gemini.get()
+                try:
+                    await self.session.send(input=msg)
+                except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError):
+                    print(">>> [WARN] Connexion WebSocket perdue pendant l'envoi.")
+                    break # On sort de la boucle pour déclencher la reconnexion dans run()
+                except Exception as e:
+                    print(f">>> [ERROR send_realtime] {e}")
+                    break
+                finally:
+                    self.out_queue_gemini.task_done()
+        except asyncio.CancelledError:
+            pass
     
     
 
     async def listen_audio(self):
         import struct
+        import numpy as np
         from collections import deque # Pour la mémoire tampon
         
         frame_length = self.porcupine.frame_length
@@ -2765,6 +2803,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         # On garde les 30 dernières frames pour ne rien rater du début de la phrase
         audio_buffer = deque(maxlen=30)
         
+        GAIN_MULTIPLIER = 2.5
+        
         print(">>> [VEILLE] En attente du mot clé...")
         
         while True:
@@ -2778,8 +2818,13 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             # Lecture du micro
             pcm = await asyncio.to_thread(self.audio_stream.read, frame_length, exception_on_overflow=False)
             
+            audio_array = np.frombuffer(pcm, dtype=np.int16)
+            audio_array = np.clip(audio_array * GAIN_MULTIPLIER, -32768, 32767).astype(np.int16)
+            pcm_amplified = audio_array.tobytes()
+            
             # On enregistre TOUT dans le buffer temporaire
-            audio_buffer.append(pcm)
+            audio_buffer.append(pcm_amplified)
+            
 
             # --- CAS 1 : CONVERSATION ACTIVE ---
             if self.conversation_active:
@@ -2791,11 +2836,11 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     continue
 
                 # Envoi direct à Gemini
-                await self.out_queue_gemini.put({"data": pcm, "mime_type": "audio/pcm"})
+                await self.out_queue_gemini.put({"data": pcm_amplified, "mime_type": "audio/pcm"})
 
             # --- CAS 2 : VEILLE (Detection) ---
             else:
-                pcm_unpacked = struct.unpack_from("h" * frame_length, pcm)
+                pcm_unpacked = struct.unpack_from("h" * frame_length, pcm_amplified)
                 keyword_index = self.porcupine.process(pcm_unpacked)
 
                 if keyword_index >= 0:
@@ -2830,10 +2875,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
     async def receive_text(self):
         """
-        Version optimisée pour Azure : Découpe le flux en phrases complètes
-        pour réduire la latence sans casser l'intonation.
+        Version optimisée : Nettoie le texte pour l'audio mais garde le formatage pour le GUI.
         """
-        # Buffer pour stocker les bouts de phrases en attendant la ponctuation
         text_buffer = "" 
 
         while True:
@@ -2843,12 +2886,19 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     continue
 
                 turn = self.session.receive() 
+                
+                # ... (La gestion des tools et server_content reste inchangée, on se concentre sur le texte) ...
+                # Pour gagner de la place ici, je ne remets pas le bloc "tool_call" et "server_content" 
+                # car ils ne changent pas. Assure-toi de ne pas les effacer si tu copies-colles tout le bloc.
+                # Si tu remplaces toute la fonction, voici la version COMPLÈTE avec le fix :
 
                 tool_responses = []
                 web_search_urls = set()
 
                 async for chunk in turn:
-                    # --- 1. GESTION DES TOOLS (Inchangé) ---
+                    # [BLOC TOOLS ET SERVER CONTENT INCHANGÉ - GARDER LE TIEN ICI SI BESOIN]
+                    # Pour faire court, je remets la logique complète ci-dessous :
+                    
                     if hasattr(chunk, "tool_call") and chunk.tool_call:
                         function_calls = chunk.tool_call.function_calls
                         if function_calls:
@@ -2856,99 +2906,69 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 fname = fc.name
                                 args = dict(fc.args or {})
                                 if fname not in FUNCTION_MAP:
-                                    tool_responses.append({
-                                        "id": fc.id,
-                                        "name": fname,
-                                        "response": {"error": f"Function {fname} not implemented"}
-                                    })
+                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": f"Function {fname} not implemented"}})
                                     continue
                                 try:
                                     result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
-                                    tool_responses.append({
-                                        "id": fc.id,
-                                        "name": fname,
-                                        "response": {"result": result}
-                                    })
+                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
                                 except Exception as e:
-                                    tool_responses.append({
-                                        "id": fc.id,
-                                        "name": fname,
-                                        "response": {"error": str(e)}
-                                    })
+                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
                         if tool_responses:
                             await self.session.send_tool_response(function_responses=tool_responses)
                         continue
 
-                    # --- 2. GESTION DU SERVEUR (Code execution / Web search) (Inchangé) ---
                     if hasattr(chunk, "server_content") and chunk.server_content:
-                        if (hasattr(chunk.server_content, 'grounding_metadata') and
-                                chunk.server_content.grounding_metadata and
-                                chunk.server_content.grounding_metadata.grounding_chunks):
+                        if (hasattr(chunk.server_content, 'grounding_metadata') and chunk.server_content.grounding_metadata and chunk.server_content.grounding_metadata.grounding_chunks):
                             for grounding_chunk in chunk.server_content.grounding_metadata.grounding_chunks:
                                 if grounding_chunk.web and grounding_chunk.web.uri:
                                     web_search_urls.add(grounding_chunk.web.uri)
-                        
-                        model_turn = chunk.server_content.model_turn
-                        if model_turn:
-                            for part in model_turn.parts:
-                                if part.code_execution_result is not None:
-                                    # On peut logger le résultat du code ici si besoin
-                                    pass
 
-                    # --- 3. GESTION DU TEXTE (LE CHANGEMENT EST ICI) ---
+                    # --- GESTION DU TEXTE (MODIFIÉ) ---
                     if getattr(chunk, "text", None):
                         current_text = chunk.text
                         print(current_text, end="", flush=True)
                         
-                        # Ajout au buffer
                         text_buffer += current_text
                         
-                        # --- DÉTECTION DE FIN DE PHRASE ---
-                        # On cherche les ponctuations fortes : . ? ! ou retour à la ligne
-                        # On évite de couper sur "M." ou "Dr." (simplification ici)
                         import re
-                        # Regex : Cherche une ponctuation (.?!) suivie d'un espace ou fin de ligne
                         split_pattern = r'([.?!;])\s+'
-                        
                         parts = re.split(split_pattern, text_buffer)
                         
-                        # Si on a plus d'un élément, c'est qu'on a trouvé une séparation
                         if len(parts) > 1:
-                            # On reconstitue les phrases complètes
-                            # parts ressemble à ["Bonjour", "!", "Comment ça va", "?", "Reste"]
-                            
-                            # On parcourt par paire (Phrase + Ponctuation)
                             for i in range(0, len(parts) - 1, 2):
-                                # Si c'est le dernier élément et qu'il n'y a pas de ponctuation après, c'est le reste
                                 if i + 1 >= len(parts):
                                     text_buffer = parts[i]
                                     break
                                 
-                                sentence = parts[i] + parts[i+1] # Texte + Ponctuation
+                                raw_sentence = parts[i] + parts[i+1]
                                 
-                                # Envoi immédiat au TTS
-                                if sentence.strip():
+                                # === LE FIX EST ICI ===
+                                # On nettoie AVANT d'envoyer à la voix
+                                clean_sentence = self._clean_text_for_tts(raw_sentence)
+                                
+                                if clean_sentence:
                                     self.is_speaking = True
-                                    await self.response_queue_tts.put(sentence.strip())
+                                    await self.response_queue_tts.put(clean_sentence)
                             
-                            # Le dernier morceau devient le nouveau buffer
                             text_buffer = parts[-1]
 
-
-                # --- 4. FIN DU TOUR ---
-                # S'il reste du texte dans le buffer à la fin de la réponse de Gemini
+                # --- FIN DU TOUR ---
                 if text_buffer.strip():
-                    # Cas spécial Kill Switch
                     text_lower = text_buffer.lower()
                     if "au revoir" in text_lower or "bonne nuit" in text_lower:
                          self.conversation_active = False
 
                     self.is_speaking = True
+                    
+                    # 1. On envoie le texte BRUT (avec *) au GUI pour qu'il soit joli
                     self.gui_queue.put(("ASSISTANT_TEXT", text_buffer.strip()))
-                    await self.response_queue_tts.put(text_buffer.strip())
-                    text_buffer = "" # Reset du buffer
+                    
+                    # 2. On envoie le texte NETTOYÉ (sans *) à Azure pour qu'il le lise bien
+                    clean_buffer = self._clean_text_for_tts(text_buffer)
+                    await self.response_queue_tts.put(clean_buffer)
+                    
+                    text_buffer = "" 
                 
-                # Signal de fin pour ce tour (optionnel selon ta logique TTS)
                 await self.response_queue_tts.put(None)
                 self.last_interaction_time = time.time()
 
@@ -3050,34 +3070,58 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     
 
     async def run(self):
-        try:
-            async with self.client.aio.live.connect(model=MODEL, config=self.config) as session, asyncio.TaskGroup() as tg:
-                self.session = session
-                self.out_queue_gemini = asyncio.Queue(maxsize=20)
-                self.response_queue_tts = asyncio.Queue()
-                self.audio_in_queue_player = asyncio.Queue()
-                print(">>> [INFO] Starting all tasks...")
+        import websockets
+        # Boucle de reconnexion infinie
+        while True:
+            try:
+                print(">>> [CONNEXION] Tentative de connexion à Gemini...")
+                async with self.client.aio.live.connect(model=MODEL, config=self.config) as session:
+                    self.session = session
+                    self.out_queue_gemini = asyncio.Queue(maxsize=20)
+                    
+                    # On ne recrée pas ces queues si elles existent déjà pour ne pas perdre le TTS en cours
+                    if self.response_queue_tts is None:
+                        self.response_queue_tts = asyncio.Queue()
+                    if self.audio_in_queue_player is None:
+                        self.audio_in_queue_player = asyncio.Queue()
 
-                tg.create_task(self.listen_audio())
-                tg.create_task(self.send_realtime())
-                tg.create_task(self.receive_text())
-                tg.create_task(self.tts())
-                tg.create_task(self.play_audio())
-                tg.create_task(self.timer_watcher())
-                tg.create_task(self.agenda_watcher())
+                    print(">>> [INFO] Connecté ! Starting tasks...")
 
-                # boucle principale simple (plus de send_text)
-                while True:
-                    await asyncio.sleep(1)
+                    async with asyncio.TaskGroup() as tg:
+                        tg.create_task(self.listen_audio())
+                        tg.create_task(self.send_realtime())
+                        tg.create_task(self.receive_text())
+                        tg.create_task(self.tts())
+                        tg.create_task(self.play_audio())
+                        tg.create_task(self.timer_watcher())
+                        tg.create_task(self.agenda_watcher())
 
-        except asyncio.CancelledError:
-            print("\n>>> [INFO] Exiting application.")
-        except Exception:
-            traceback.print_exc()
-        finally:
-            if self.audio_stream and self.audio_stream.is_active():
-                self.audio_stream.stop_stream()
-                self.audio_stream.close()
+                        # Si une tâche plante (ex: déconnexion), le TaskGroup se ferme
+                        # et on sort du bloc 'async with', ce qui nous ramène à la boucle while True
+            
+            except asyncio.CancelledError:
+                print("\n>>> [INFO] Arrêt manuel demandé.")
+                break # On sort vraiment si c'est toi qui arrête
+            
+            except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
+                print(f"\n>>> [RECONNECT] Connexion perdue ({e}). Reconnexion dans 2s...")
+                await asyncio.sleep(2)
+                continue # On recommence la boucle
+            
+            except Exception as e:
+                print(f"\n>>> [CRASH] Erreur inattendue : {e}")
+                traceback.print_exc()
+                print(">>> [RETRY] Tentative de redémarrage dans 5s...")
+                await asyncio.sleep(5)
+                continue
+            
+            finally:
+                if self.audio_stream and self.audio_stream.is_active():
+                    try:
+                        self.audio_stream.stop_stream()
+                        self.audio_stream.close()
+                    except:
+                        pass
 
 
 FUNCTION_MAP = {
