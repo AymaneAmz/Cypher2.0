@@ -24,6 +24,7 @@ import queue
 import threading
 from gui import CypherGUI
 import collections
+import pygame
 
 
 
@@ -42,7 +43,11 @@ AZURE_VOICE_NAME = "fr-FR-HenriNeural" # Ou "fr-FR-HenriNeural" pour un homme
 PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
 PYTHON_EXECUTION_LOG = []   # Historique des exécutions
 
+WAKE_WORD_SENSITIVITY = 0.8
+WAKE_MIN_VOLUME = 0
 
+TTS_RATE = "+15%"
+TTS_PITCH = "default"
 
 USER_HOME = os.path.expanduser("~")
 ONEDRIVE_BASE = os.path.join(USER_HOME, "OneDrive")
@@ -88,7 +93,7 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
 # --- API Configuration ---
-MODEL = "gemini-live-2.5-flash-preview"
+MODEL = "gemini-2.0-flash-exp"
 DEFAULT_MODE = "none"
 VOICE_ID = 'bts16wA7hWMfnlEIHuRo'
 
@@ -107,7 +112,12 @@ class AudioLoop:
         self.session = None
         self.audio_stream = None
         self.is_speaking = False
+        self.is_busy = False
         self.client = genai.Client(api_key=GEMINI_API_KEY)
+
+        pygame.mixer.init() # On allume le moteur audio
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.wake_sound_path = os.path.join(script_dir, "wake.mp3")
         
         import pvporcupine
         self.porcupine = None
@@ -120,13 +130,18 @@ class AudioLoop:
                 raise ValueError("La clé PICOVOICE_ACCESS_KEY est vide dans le .env")
 
             if keyword_path and os.path.exists(keyword_path):
-                self.porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path], sensitivities=[0.8])
-                print(f">>> [INIT] Wake Word 'Cypher' chargé depuis {keyword_path}")
+                self.porcupine = pvporcupine.create(
+                    access_key=access_key, 
+                    keyword_paths=[keyword_path], 
+                    sensitivities=[WAKE_WORD_SENSITIVITY] # <--- Utilise la constante
+                )
+                print(f">>> [INIT] Wake Word chargé (Sensibilité : {WAKE_WORD_SENSITIVITY})")
             else:
-                # Si pas de fichier PPN, on tente le mot par défaut pour tester la clé
-                print(f">>> [WARNING] Fichier .ppn introuvable à : {keyword_path}. Tentative avec 'porcupine' par défaut.")
-                self.porcupine = pvporcupine.create(access_key=access_key, keywords=['Saïfeur'], sensitivities=[0.8])
-                print(">>> [INIT] Wake Word par défaut 'Porcupine' chargé.")
+                self.porcupine = pvporcupine.create(
+                    access_key=access_key, 
+                    keywords=['porcupine'], 
+                    sensitivities=[WAKE_WORD_SENSITIVITY] # <--- Ici aussi
+                )
                 
         except Exception as e:
             # 🛑 STOP IMMÉDIAT pour voir l'erreur
@@ -937,7 +952,23 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             "tools": tools,
         }
     
-
+                                                                                              
+    def _generate_ssml(self, text: str) -> str:
+        """Emballe le texte dans du SSML pour contrôler la vitesse et le ton."""
+        # On échappe les caractères spéciaux XML au cas où
+        safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        
+        ssml = f"""
+        <speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='fr-FR'>
+            <voice name='{AZURE_VOICE_NAME}'>
+                <prosody rate='{TTS_RATE}' pitch='{TTS_PITCH}'>
+                    {safe_text}
+                </prosody>
+            </voice>
+        </speak>
+        """
+        return ssml                                                                                          
+                                                                                              
     @staticmethod
     def _clean_text_for_tts(text: str) -> str:
         """Nettoie le texte (Markdown, symboles) pour la lecture vocale uniquement."""
@@ -2762,6 +2793,25 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             except Exception as e:
                 print(f">>> [ERROR in timer_watcher]: {e}")
                 await asyncio.sleep(1)
+                
+    def _interrupt_playback(self):
+        """KILL SWITCH : Coupe la parole instantanément."""
+        if self.is_speaking:
+            print(">>> [INTERRUPTION] Silence demandé !")
+            
+            # 1. On vide la file d'attente du TTS (ce qui reste à générer)
+            while not self.response_queue_tts.empty():
+                try: self.response_queue_tts.get_nowait()
+                except queue.Empty: break
+            
+            # 2. On vide la file d'attente du Player (ce qui reste à jouer)
+            while not self.audio_in_queue_player.empty():
+                try: self.audio_in_queue_player.get_nowait()
+                except queue.Empty: break
+            
+            # 3. On force l'état silencieux
+            self.is_speaking = False
+            self.gui_queue.put(("STATUS", "interrupted"))
 
     async def send_realtime(self):
         import websockets
@@ -2786,7 +2836,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     async def listen_audio(self):
         import struct
         import numpy as np
-        from collections import deque # Pour la mémoire tampon
+        from collections import deque
+        import winsound # Pour le BIP de réveil
         
         frame_length = self.porcupine.frame_length
         mic_info = pya.get_default_input_device_info()
@@ -2798,62 +2849,104 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             frames_per_buffer=frame_length
         )
         
-        # --- BUFFER AUDIO (1 seconde de mémoire) ---
-        # 16000 Hz / 512 frames ~= 31 frames par seconde
-        # On garde les 30 dernières frames pour ne rien rater du début de la phrase
         audio_buffer = deque(maxlen=30)
         
-        GAIN_MULTIPLIER = 2.5
+        # Ce gain sera à remettre à 1.0 quand tu auras le Jabra
+        GAIN_MULTIPLIER = 2.5 
         
-        print(">>> [VEILLE] En attente du mot clé...")
+        print(f">>> [VEILLE] En écoute... (Seuil volume: {WAKE_MIN_VOLUME})")
         
         while True:
-            if self.is_speaking:
-                await asyncio.sleep(0.05)
-                self.last_interaction_time = time.time()
-                # On vide le buffer pendant qu'il parle pour ne pas envoyer de vieux sons
-                audio_buffer.clear()
+            try:
+                pcm = await asyncio.to_thread(self.audio_stream.read, frame_length, exception_on_overflow=False)
+            except:
                 continue
-
-            # Lecture du micro
-            pcm = await asyncio.to_thread(self.audio_stream.read, frame_length, exception_on_overflow=False)
             
+            # Traitement Audio
             audio_array = np.frombuffer(pcm, dtype=np.int16)
+            
+            # --- MESURE DU VOLUME (RMS) ---
+            # On calcule la puissance du signal actuel
+            volume_level = np.abs(audio_array).mean()
+            
+            # Amplification
             audio_array = np.clip(audio_array * GAIN_MULTIPLIER, -32768, 32767).astype(np.int16)
             pcm_amplified = audio_array.tobytes()
             
-            # On enregistre TOUT dans le buffer temporaire
             audio_buffer.append(pcm_amplified)
-            
 
-            # --- CAS 1 : CONVERSATION ACTIVE ---
-            if self.conversation_active:
-                if time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT:
-                    print(">>> [SLEEP] Silence prolongé -> Retour en veille.")
-                    self.gui_queue.put(("STATUS", "idle"))
-                    self.conversation_active = False
-                    audio_buffer.clear() # Nettoyage
-                    continue
-
-                # Envoi direct à Gemini
-                await self.out_queue_gemini.put({"data": pcm_amplified, "mime_type": "audio/pcm"})
-
-            # --- CAS 2 : VEILLE (Detection) ---
-            else:
+            # --- CAS 1 : CYPHER PARLE (BARGE-IN) ---
+            if self.is_speaking:
                 pcm_unpacked = struct.unpack_from("h" * frame_length, pcm_amplified)
                 keyword_index = self.porcupine.process(pcm_unpacked)
-
+                
                 if keyword_index >= 0:
-                    print(">>> [WAKE] 'Cypher' détecté ! (One-Shot activé)")
+                    # FILTRE ANTI-FAUX POSITIF : 
+                    # Si le volume est trop faible, c'est sûrement un bruit parasite, on ignore.
+                    if volume_level < WAKE_MIN_VOLUME:
+                        # print(f">>> [IGNORE] Faux positif détecté (Volume trop faible : {volume_level:.0f})")
+                        continue
+
+                    print(">>> [INTERRUPTION] Silence demandé !")
+                    self._interrupt_playback()
+                    self.conversation_active = True
+                    self.last_interaction_time = time.time()
+                    
+                    while len(audio_buffer) > 0:
+                        buffered = audio_buffer.popleft()
+                        await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
+                continue
+
+            # --- CAS 2 : MODE CONVERSATION ---
+            if self.conversation_active:
+                # MODIFICATION 1 : On ajoute "and not self.is_busy"
+                # Si on est occupé (is_busy), on ne timeout pas, même si silence > 15s.
+                if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy:
+                    print(">>> [SLEEP] Silence prolongé.")
+                    self.gui_queue.put(("STATUS", "idle"))
+                    self.conversation_active = False
+                    audio_buffer.clear()
+                    continue
+
+                # MODIFICATION 2 : Si on est occupé, on n'envoie PAS de son à Gemini 
+                # (pour éviter de le perturber pendant qu'il réfléchit/exécute)
+                if self.is_busy:
+                    continue
+
+                await self.out_queue_gemini.put({"data": pcm_amplified, "mime_type": "audio/pcm"})
+
+            # --- CAS 3 : VEILLE (ATTENTE MOT CLÉ) ---
+            else:
+                pcm_unpacked = struct.unpack_from("h" * frame_length, pcm_amplified)
+                if self.porcupine.process(pcm_unpacked) >= 0:
+                    
+                    # --- FILTRE ANTI-FAUX POSITIF (Le plus important) ---
+                    if volume_level < WAKE_MIN_VOLUME:
+                        print(f">>> [IGNORE] Faux positif rejeté (Vol: {volume_level:.0f} < {WAKE_MIN_VOLUME})")
+                        continue
+                    
+                    print(f">>> [WAKE] 'Cypher' validé ! (Volume: {volume_level:.0f})")
+                    
+                    # --- JOUER SON MP3 ---
+                    if os.path.exists(self.wake_sound_path):
+                        try:
+                            pygame.mixer.music.load(self.wake_sound_path)
+                            pygame.mixer.music.play()
+                        except Exception as e:
+                            print(f">>> [ERREUR SON] : {e}")
+                    else:
+                        # Fallback si le fichier n'est pas trouvé
+                        winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                    
+                    
+                    
                     self.gui_queue.put(("STATUS", "listening"))
                     self.conversation_active = True
                     self.last_interaction_time = time.time()
                     
-                    # 🚀 MAGIE : On envoie tout ce qu'on a entendu juste avant (le "Hey Cypher...")
-                    # Cela permet à Gemini d'avoir le début de la phrase si tu as parlé vite
                     while len(audio_buffer) > 0:
-                        buffered_pcm = audio_buffer.popleft()
-                        await self.out_queue_gemini.put({"data": buffered_pcm, "mime_type": "audio/pcm"})
+                        buffered = audio_buffer.popleft()
+                        await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
 
     @staticmethod
     def _shorten_for_tts(text: str) -> str:
@@ -2900,21 +2993,37 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     # Pour faire court, je remets la logique complète ci-dessous :
                     
                     if hasattr(chunk, "tool_call") and chunk.tool_call:
+                        # 🔒 ON VERROUILLE : Cypher commence à travailler
+                        self.is_busy = True
+                        
                         function_calls = chunk.tool_call.function_calls
                         if function_calls:
+                            tool_responses = []
                             for fc in function_calls:
                                 fname = fc.name
                                 args = dict(fc.args or {})
+                                
+                                # Petit feedback visuel pour dire qu'il bosse
+                                if fname in ["execute_python", "document_manager", "google_search"]:
+                                    self.gui_queue.put(("STATUS", "processing"))
+                                
                                 if fname not in FUNCTION_MAP:
                                     tool_responses.append({"id": fc.id, "name": fname, "response": {"error": f"Function {fname} not implemented"}})
                                     continue
                                 try:
+                                    # Exécution de l'outil
                                     result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
                                     tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
                                 except Exception as e:
                                     tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
-                        if tool_responses:
-                            await self.session.send_tool_response(function_responses=tool_responses)
+                            
+                            # Envoi des résultats à Gemini
+                            if tool_responses:
+                                await self.session.send_tool_response(function_responses=tool_responses)
+                            
+                            # 🔓 ON DEVERROUILLE : Cypher a fini ce tool
+                            self.is_busy = False
+                            self.last_interaction_time = time.time() # On remet le chrono à zéro
                         continue
 
                     if hasattr(chunk, "server_content") and chunk.server_content:
@@ -2978,51 +3087,54 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
     async def tts(self):
         """
-        Génère le TTS via Azure AI Speech.
-        CORRECTION : Gestion correcte du signal de fin + libération du micro.
+        Génère le TTS via Azure AI Speech avec SSML (Style & Vitesse).
         """
         # --- CONFIG AZURE ---
         speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-        speech_config.speech_synthesis_voice_name = AZURE_VOICE_NAME
+        # Note: Avec SSML, la voix est définie dans le XML, mais on garde la config de base propre
         speech_config.set_speech_synthesis_output_format(
             speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
         )
         synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
     
-        print(f">>> [INIT] Azure TTS prêt ({AZURE_VOICE_NAME})")
+        print(f">>> [INIT] Azure TTS (SSML) prêt ({AZURE_VOICE_NAME} | Vitesse: {TTS_RATE})")
     
         while True:
             full_text = await self.response_queue_tts.get()
             
-            # --- GESTION DU SIGNAL DE FIN ---
+            # --- SIGNAL DE FIN ---
             if full_text is None:
-                # ✅ CORRECTION : On transmet le signal de fin AU PLAYER
                 await self.audio_in_queue_player.put(None)
                 self.response_queue_tts.task_done()
-                continue  # ⚠️ On ne libère PAS is_speaking ici (le player le fait)
+                continue
     
             try:
-                # --- GÉNÉRATION AZURE ---
+                # 1. On transforme le texte brut en SSML (XML avec réglages)
+                ssml_text = self._generate_ssml(full_text)
+
+                # 2. On génère l'audio via SSML
                 def _generate_audio_blocking():
-                    return synthesizer.speak_text_async(full_text).get()
+                    return synthesizer.speak_ssml_async(ssml_text).get()
     
                 result = await asyncio.to_thread(_generate_audio_blocking)
     
                 if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                     audio_data = result.audio_data
                     if audio_data:
-                        # ✅ Envoi du chunk audio au player
                         await self.audio_in_queue_player.put(audio_data)
                 
                 elif result.reason == speechsdk.ResultReason.Canceled:
-                    print(f">>> [ERREUR AZURE] : {result.cancellation_details.reason}")
+                    cancellation_details = result.cancellation_details
+                    print(f">>> [ERREUR AZURE] : {cancellation_details.reason}")
+                    if cancellation_details.reason == speechsdk.CancellationReason.Error:
+                        print(f"Code erreur: {cancellation_details.error_code}")
+                        print(f"Détails: {cancellation_details.error_details}")
     
             except Exception as e:
                 print(f">>> [EXCEPTION TTS] : {e}")
             
             finally:
                 self.response_queue_tts.task_done()
-                # ⚠️ ON NE TOUCHE PLUS À self.is_speaking ICI !
 
 
     async def play_audio(self):
