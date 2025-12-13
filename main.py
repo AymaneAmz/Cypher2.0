@@ -25,6 +25,8 @@ import threading
 from gui import CypherGUI
 import collections
 import pygame
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
 
 
 
@@ -131,7 +133,13 @@ LOADING_PHRASES = {
     "system_optimize": [
         "Nettoyage du système en cours...",
         "Optimisation de la mémoire..."
-    ]
+    ],
+    "deep_research": [
+        "Je lance une recherche approfondie, analyse de plusieurs sources en cours...",
+        "Je compile un rapport détaillé basé sur plusieurs sites web...",
+        "Je croise les informations de différentes sources, un instant...",
+        "Investigation approfondie en cours..."
+    ],
 }
 
 
@@ -939,7 +947,15 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
         IMPORTANT : 
         - Ne réponds JAMAIS de mémoire si le document existe
         - Cherche TOUJOURS dans les docs indexés avant de répondre
-        - Si rien trouvé, dis : "Je n'ai pas trouvé cette info dans vos documents indexés."
+        - Si rien trouvé, dis : "Je n'ai pas trouvé cette info dans vos documents indexés.
+
+    
+    Règle pour les recherches approfondies :
+    - Pour les sujets complexes, utilise `google_search` EN SÉRIE (5-7 fois) :
+    1. Vue d'ensemble générale
+    2-3. Détails techniques/spécifiques
+    4-5. Applications/cas d'usage
+    - Compile ensuite un rapport structuré avec citations.
 
 
     =======================================================
@@ -990,8 +1006,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 """,
             "tools": tools,
         }
-    
-                                                                                              
+
+
     def _generate_ssml(self, text: str) -> str:
         """Emballe le texte dans du SSML pour contrôler la vitesse et le ton."""
         # On échappe les caractères spéciaux XML au cas où
@@ -1109,7 +1125,10 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             # Découpage en chunks (morceaux) de 1000 caractères
                             # Pour éviter de saturer le contexte
                             chunk_size = 1000
-                            chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
+                            overlap = 100 # On garde 100 char du chunk précédent
+                            chunks = []
+                            for i in range(0, len(text_content), chunk_size - overlap):
+                                chunks.append(text_content[i:i+chunk_size])
                             
                             # Préparation pour ChromaDB
                             ids = [f"{file}_{i}" for i in range(len(chunks))]
@@ -2704,7 +2723,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 ['python', temp_file],
                 capture_output=True,
                 text=True,
-                timeout=30,  # Timeout de 30 secondes
+                timeout=90,  # Timeout de 30 secondes
                 encoding='utf-8',
                 errors='replace'
             )
@@ -3219,51 +3238,128 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
     async def play_audio(self):
         """
-        Joue l'audio et libère le micro (is_speaking = False) UNIQUEMENT quand tout est fini.
-        ✅ VERSION CORRIGÉE
+        Joue l'audio avec gestion du timeout correcte.
+        ✅ VERSION CORRIGÉE : Reset du timer quand Cypher finit de parler
         """
+        stream = None
+        
         try:
             stream = await asyncio.to_thread(
-                pya.open, format=FORMAT, channels=CHANNELS,
-                rate=RECEIVE_SAMPLE_RATE, output=True
+                pya.open, 
+                format=FORMAT, 
+                channels=CHANNELS,
+                rate=RECEIVE_SAMPLE_RATE, 
+                output=True,
+                frames_per_buffer=CHUNK_SIZE
             )
             print(">>> [INFO] Audio output stream is open.")
         except Exception as e:
             print(f">>> [FATAL ERROR] Could not open PyAudio stream: {e}")
             return
-    
+
         while True:
             try:
-                # On récupère le paquet audio (ou le signal de fin)
+                # Récupère le paquet audio (ou signal de fin)
                 bytestream = await self.audio_in_queue_player.get()
                 
                 # --- SIGNAL DE FIN REÇU ---
                 if bytestream is None:
-                    # ✅ C'EST ICI qu'on libère le micro
+                    # ✅ LIBÉRATION DU MICRO
                     self.is_speaking = False
                     
-                    # CORRECTION : On vérifie l'état de la conversation avant de décider du statut
+                    # 🔥 FIX CRITIQUE : RESET DU TIMER ICI
+                    self.last_interaction_time = time.time()
+                    
                     if self.conversation_active:
-                        self.gui_queue.put(("STATUS", "listening")) # On continue la discute
+                        self.gui_queue.put(("STATUS", "listening"))
                     else:
-                        self.gui_queue.put(("STATUS", "idle"))      # C'était un "Au revoir", on passe en veille visuelle
+                        self.gui_queue.put(("STATUS", "idle"))
                         
                     print(f">>> [INFO] ✅ Micro libéré (active={self.conversation_active})")
                     self.audio_in_queue_player.task_done()
                     continue
-    
-                # --- LECTURE AUDIO ---
+
+                # --- LECTURE AUDIO AVEC PROTECTION ---
                 if bytestream:
-                    # On joue le son (c'est bloquant le temps de la lecture, donc parfait)
-                    self.gui_queue.put(("STATUS", "speaking"))
-                    await asyncio.to_thread(stream.write, bytestream)
+                    try:
+                        # Vérifier que le stream est toujours ouvert
+                        if stream and stream.is_active():
+                            self.gui_queue.put(("STATUS", "speaking"))
+                            await asyncio.to_thread(stream.write, bytestream)
+                        else:
+                            # Stream fermé, on le réouvre
+                            print(">>> [WARNING] Stream audio fermé, réouverture...")
+                            if stream:
+                                try:
+                                    stream.close()
+                                except:
+                                    pass
+                            
+                            stream = await asyncio.to_thread(
+                                pya.open, 
+                                format=FORMAT, 
+                                channels=CHANNELS,
+                                rate=RECEIVE_SAMPLE_RATE, 
+                                output=True,
+                                frames_per_buffer=CHUNK_SIZE
+                            )
+                            
+                            # Réessayer la lecture
+                            await asyncio.to_thread(stream.write, bytestream)
+                    
+                    except OSError as e:
+                        # Gestion spécifique des erreurs PyAudio
+                        if e.errno in [-9999, -9988, -9981]:
+                            print(f">>> [ERROR AUDIO] Erreur PyAudio {e.errno}, tentative de récupération...")
+                            
+                            # Fermer et rouvrir le stream
+                            if stream:
+                                try:
+                                    stream.stop_stream()
+                                    stream.close()
+                                except:
+                                    pass
+                            
+                            # Attendre un peu
+                            await asyncio.sleep(0.5)
+                            
+                            # Réouvrir
+                            try:
+                                stream = await asyncio.to_thread(
+                                    pya.open, 
+                                    format=FORMAT, 
+                                    channels=CHANNELS,
+                                    rate=RECEIVE_SAMPLE_RATE, 
+                                    output=True,
+                                    frames_per_buffer=CHUNK_SIZE
+                                )
+                                print(">>> [INFO] Stream audio récupéré.")
+                            except Exception as e2:
+                                print(f">>> [FATAL] Impossible de récupérer le stream : {e2}")
+                                self.is_speaking = False
+                                break
+                        else:
+                            raise  # Autre erreur, on propage
                 
                 self.audio_in_queue_player.task_done()
                 
+            except asyncio.CancelledError:
+                print(">>> [INFO] play_audio task cancelled")
+                break
             except Exception as e:
                 print(f">>> [ERROR] Error in audio playback loop: {e}")
-                # Sécurité : en cas d'erreur, on rend la parole
                 self.is_speaking = False
+                await asyncio.sleep(0.5)
+        
+        # NETTOYAGE PROPRE
+        if stream:
+            try:
+                if stream.is_active():
+                    stream.stop_stream()
+                stream.close()
+                print(">>> [INFO] Audio stream closed cleanly.")
+            except:
+                pass
 
     
 
