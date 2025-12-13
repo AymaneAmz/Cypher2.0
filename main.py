@@ -102,6 +102,39 @@ VOICE_ID = 'bts16wA7hWMfnlEIHuRo'
 pya = pyaudio.PyAudio()
 
 
+LOADING_PHRASES = {
+    "document_manager": [
+        "Je consulte vos documents, un instant...",
+        "Analyse de la base de connaissances en cours...",
+        "Je vérifie dans vos fichiers indexés...",
+        "Voyons ce que disent vos documents..."
+    ],
+    "google_search": [
+        "Je vérifie ça sur le web...",
+        "Recherche d'informations en cours...",
+        "Je regarde ce qui se dit à ce sujet sur Internet..."
+    ],
+    "execute_python": [
+        "J'écris le script, un instant...",
+        "Je m'occupe de ça techniquement...",
+        "Exécution du code en cours...",
+        "Traitement informatique lancé..."
+    ],
+    "file_manager": [
+        "Accès au système de fichiers...",
+        "Je gère les fichiers..."
+    ],
+    "email_manager": [
+        "Connexion à Outlook...",
+        "Je vérifie vos e-mails..."
+    ],
+    "system_optimize": [
+        "Nettoyage du système en cours...",
+        "Optimisation de la mémoire..."
+    ]
+}
+
+
 class AudioLoop:
     def __init__(self, gui_queue, video_mode=DEFAULT_MODE):
         self.gui_queue = gui_queue
@@ -713,6 +746,12 @@ class AudioLoop:
             "response_modalities": ["TEXT"],
             "system_instruction": f"""
 {current_context}
+
+⚠️ CONFIGURATION SYSTÈME CRITIQUE :
+Le dossier "Documents" réel de l'utilisateur est : {DOCUMENTS_REAL}
+Le dossier "Bureau" réel de l'utilisateur est : {DESKTOP_REAL}
+Le dossier "Images" réel de l'utilisateur est : {IMAGES_REAL}
+Si tu dois écrire un script Python ou chercher un fichier, utilise TOUJOURS ces chemins absolus au lieu des chemins par défaut de Windows.
 
 Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je suis ton développeur. Tu es comme un pote collegue avec moi tu peux me charier parfois ou etre tres franc aussi. et tu es une IA conçue pour m'aider dans mes projets d'ingénierie ainsi que dans mes tâches quotidiennes. Adresse-toi à moi en m'appelant « Monsieur ». Merci également de veiller à ce que tes réponses soient concises.
     
@@ -1962,20 +2001,44 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     def _file_manager(action: str, source_path: str, destination_path: str | None = None) -> str:
         """
         Tool Python pour la gestion de fichiers/dossiers.
-        Utilise shutil pour les opérations complexes.
+        Gère intelligemment la redirection vers OneDrive.
         """
         import os
         import shutil
         
+        # --- CORRECTIF ONEDRIVE : Redirection automatique des chemins ---
+        def _resolve_path(p):
+            if not p: return p
+            # 1. Gestion du tilde ~ et normalisation
+            p = os.path.expanduser(p)
+            p = os.path.normpath(p)
+            
+            # 2. Détection des raccourcis simples
+            p_lower = p.lower().strip(os.path.sep)
+            if p_lower in ["documents", "doc", "mes documents"]: return DOCUMENTS_REAL
+            if p_lower in ["desktop", "bureau"]: return DESKTOP_REAL
+            if p_lower in ["images", "pictures", "photos"]: return IMAGES_REAL
+            
+            # 3. Redirection des chemins standards Windows vers les chemins réels (OneDrive)
+            # On construit le chemin "théorique" C:\Users\User\Documents
+            std_docs = os.path.normpath(os.path.join(USER_HOME, "Documents"))
+            std_desk = os.path.normpath(os.path.join(USER_HOME, "Desktop"))
+            
+            # Si le chemin demandé commence par le faux chemin standard, on remplace par le vrai
+            if p.startswith(std_docs) and DOCUMENTS_REAL not in p:
+                return p.replace(std_docs, DOCUMENTS_REAL)
+            
+            if p.startswith(std_desk) and DESKTOP_REAL not in p:
+                return p.replace(std_desk, DESKTOP_REAL)
+                
+            return p
+
+        # Application de la correction
+        source_path = _resolve_path(source_path)
+        if destination_path:
+            destination_path = _resolve_path(destination_path)
+            
         action = action.lower()
-
-        # Remplacement du chemin OneDrive dans les paramètres entrants
-        # (Pour ne pas avoir à écrire la logique dans Gemini)
-        if "~" in source_path:
-             source_path = source_path.replace("~", os.path.expanduser("~")).replace("Desktop", DESKTOP_REAL.split(os.path.sep)[-1])
-        if destination_path and "~" in destination_path:
-             destination_path = destination_path.replace("~", os.path.expanduser("~")).replace("Desktop", DESKTOP_REAL.split(os.path.sep)[-1])
-
         
         # --- 1. Créer un Dossier/Structure ---
         if action == "create_dir":
@@ -1989,119 +2052,100 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         if action == "list_files":
             try:
                 if not os.path.isdir(source_path):
-                    return f"Le chemin '{source_path}' n'est pas un répertoire."
+                    return f"Erreur : '{source_path}' n'est pas un dossier valide ou n'existe pas."
                 
-                # Lister les 10 premiers fichiers/dossiers
+                # Lister les fichiers
                 items = os.listdir(source_path)
                 if not items:
                     return f"Le répertoire '{source_path}' est vide."
                 
-                report = f"Contenu de '{source_path}' (Top 10) :\n" + "\n".join(items[:10])
+                # On sépare dossiers et fichiers pour plus de clarté
+                dirs = [d for d in items if os.path.isdir(os.path.join(source_path, d))]
+                files = [f for f in items if os.path.isfile(os.path.join(source_path, f))]
+                
+                # On limite l'affichage pour ne pas saturer la réponse
+                report = f"📂 Contenu de '{source_path}' :\n"
+                if dirs:
+                    report += "📁 DOSSIERS :\n" + "\n".join([f"  - {d}" for d in dirs[:15]])
+                    if len(dirs) > 15: report += "\n  ... (et autres dossiers)"
+                    report += "\n"
+                if files:
+                    report += "\n📄 FICHIERS :\n" + "\n".join([f"  - {f}" for f in files[:15]])
+                    if len(files) > 15: report += "\n  ... (et autres fichiers)"
+                
                 return report
             except Exception as e:
                 return f"Erreur lors de la lecture du répertoire '{source_path}': {e}"
 
         # --- 3. Déplacer / Renommer ---
         if action == "move" or action == "rename":
-            # Renommer est un cas de move où destination_path est le nouveau nom
             if action == "rename" and destination_path:
                 destination_path = os.path.join(os.path.dirname(source_path), destination_path)
             
             if not destination_path:
-                return "Le chemin de destination est manquant pour l'action move/rename."
+                return "Le chemin de destination est manquant."
 
             try:
                 shutil.move(source_path, destination_path)
                 return f"'{source_path}' a été déplacé/renommé vers '{destination_path}'."
-            except FileNotFoundError:
-                return f"Erreur: Fichier/Dossier source '{source_path}' non trouvé."
             except Exception as e:
-                return f"Erreur lors du déplacement/renommage: {e}"
+                return f"Erreur : {e}"
 
         # --- 4. Copier ---
         if action == "copy":
             if not destination_path:
-                return "Le chemin de destination est manquant pour la copie."
+                return "Le chemin de destination est manquant."
             try:
                 if os.path.isdir(source_path):
                     shutil.copytree(source_path, destination_path)
                 else:
-                    shutil.copy2(source_path, destination_path) # copy2 preserve metadata
-                return f"'{source_path}' a été copié vers '{destination_path}'."
-            except FileNotFoundError:
-                return f"Erreur: Fichier/Dossier source '{source_path}' non trouvé."
+                    shutil.copy2(source_path, destination_path)
+                return f"Copié vers '{destination_path}'."
             except Exception as e:
-                return f"Erreur lors de la copie: {e}"
+                return f"Erreur copie : {e}"
 
         # --- 5. Supprimer ---
         if action == "delete":
             try:
                 if os.path.isdir(source_path):
                     shutil.rmtree(source_path)
-                    return f"Dossier '{source_path}' et son contenu supprimés avec succès."
+                    return f"Dossier '{source_path}' supprimé."
                 else:
                     os.remove(source_path)
-                    return f"Fichier '{source_path}' supprimé avec succès."
-            except FileNotFoundError:
-                return f"Erreur: Fichier/Dossier '{source_path}' non trouvé."
+                    return f"Fichier '{source_path}' supprimé."
             except Exception as e:
-                return f"Erreur lors de la suppression: {e}"
+                return f"Erreur suppression : {e}"
 
         # --- 6. Calculer la Taille ---
         if action == "calculate_size":
             try:
                 size_bytes = AudioLoop._get_folder_size(source_path)
-                if size_bytes == -1:
-                    return f"Erreur lors du calcul de la taille de '{source_path}'."
-                return f"La taille de '{source_path}' est : {AudioLoop._format_bytes(size_bytes)}."
-            except Exception as e:
-                return f"Erreur lors du calcul de la taille : {e}"
+                if size_bytes == -1: return "Erreur calcul taille."
+                return f"Taille : {AudioLoop._format_bytes(size_bytes)}."
+            except Exception as e: return f"Erreur : {e}"
 
-        # --- 7. Détecter les Doublons (Simplifié) ---
-        if action == "find_duplicates":
-            return "Cette fonction est trop complexe pour un appel direct. Veuillez utiliser `execute_python` pour écrire un script d'analyse de fichiers si nécessaire."
-        
+        # --- 7. Archivage ---
         if action == "archive":
-            if not destination_path:
-                return "Le chemin de destination est manquant pour l'archivage."
+            if not destination_path: return "Destination manquante."
             try:
-                # shutil.make_archive(nom_archive_sans_extension, format, dossier_source)
-                # On utilise la destination comme nom de base, en la séparant du chemin.
                 base_name = os.path.basename(destination_path)
                 root_dir = os.path.dirname(source_path)
-                
-                # Créer le chemin pour la destination de l'archive (ex: C:\Users\archive.zip)
                 archive_path = shutil.make_archive(
-                    base_name=destination_path,
-                    format='zip',
-                    root_dir=root_dir,
+                    base_name=destination_path, format='zip', root_dir=root_dir,
                     base_dir=os.path.basename(source_path) if os.path.isdir(source_path) else source_path
                 )
-                
-                return f"'{source_path}' a été archivé au format ZIP avec succès : {archive_path}"
-            except Exception as e:
-                return f"Erreur lors de l'archivage de '{source_path}': {e}"
+                return f"Archivé dans : {archive_path}"
+            except Exception as e: return f"Erreur archivage : {e}"
 
-        # --- 8. Désarchiver / Décompresser ---
+        # --- 8. Désarchivage ---
         if action == "unarchive":
-            if not destination_path:
-                return "Le chemin de destination (où décompresser) est manquant."
-            
+            if not destination_path: return "Destination manquante."
             try:
-                # Utiliser shutil.unpack_archive (supporte zip, tar, gztar, etc.)
-                shutil.unpack_archive(
-                    filename=source_path,
-                    extract_dir=destination_path
-                )
-                return f"'{source_path}' a été décompressé avec succès dans '{destination_path}'."
-            except FileNotFoundError:
-                return f"Erreur: Le fichier d'archive '{source_path}' n'a pas été trouvé."
-            except shutil.ReadError:
-                return "Erreur: Le fichier d'archive est corrompu ou le format n'est pas supporté (doit être zip, tar, etc.)."
-            except Exception as e:
-                return f"Erreur lors de la désarchivage: {e}"
+                shutil.unpack_archive(filename=source_path, extract_dir=destination_path)
+                return f"Décompressé dans '{destination_path}'."
+            except Exception as e: return f"Erreur décompression : {e}"
 
-        return f"Action de gestion de fichiers non prise en charge : {action}"                                                                                          
+        return f"Action inconnue : {action}"                                                                                       
                                                                                               
     @staticmethod
     def _get_time(timezone: str | None = None) -> str:
@@ -2822,7 +2866,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     await self.session.send(input=msg)
                 except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError):
                     print(">>> [WARN] Connexion WebSocket perdue pendant l'envoi.")
-                    break # On sort de la boucle pour déclencher la reconnexion dans run()
+                    # ON LÈVE UNE ERREUR POUR FORCER LE REDÉMARRAGE IMMÉDIAT DU TASKGROUP
+                    raise ConnectionResetError("WebSocket coupé")
                 except Exception as e:
                     print(f">>> [ERROR send_realtime] {e}")
                     break
@@ -2899,8 +2944,10 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
             # --- CAS 2 : MODE CONVERSATION ---
             if self.conversation_active:
-                # MODIFICATION 1 : On ajoute "and not self.is_busy"
-                # Si on est occupé (is_busy), on ne timeout pas, même si silence > 15s.
+
+                if volume_level > 200: 
+                    self.last_interaction_time = time.time()
+
                 if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy:
                     print(">>> [SLEEP] Silence prolongé.")
                     self.gui_queue.put(("STATUS", "idle"))
@@ -3003,9 +3050,30 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 fname = fc.name
                                 args = dict(fc.args or {})
                                 
-                                # Petit feedback visuel pour dire qu'il bosse
-                                if fname in ["execute_python", "document_manager", "google_search"]:
+                                # 1. FEEDBACK VISUEL
+                                if fname in ["execute_python", "document_manager", "google_search", "file_manager"]:
                                     self.gui_queue.put(("STATUS", "processing"))
+
+                                # 2. FEEDBACK AUDIO (NOUVEAU !!)
+                                # On vérifie si on a des phrases pour cet outil
+                                if fname in LOADING_PHRASES:
+                                    # On choisit une phrase au hasard
+                                    phrase = random.choice(LOADING_PHRASES[fname])
+                                    
+                                    # On l'ajoute à la file TTS immédiatement
+                                    self.is_speaking = True # Active l'animation de l'orbe
+                                    await self.response_queue_tts.put(phrase)
+                                
+                                # 3. EXECUTION DE L'OUTIL (Reste inchangé)
+                                if fname not in FUNCTION_MAP:
+                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": f"Function {fname} not implemented"}})
+                                    continue
+                                try:
+                                    # Exécution de l'outil
+                                    result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
+                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
+                                except Exception as e:
+                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
                                 
                                 if fname not in FUNCTION_MAP:
                                     tool_responses.append({"id": fc.id, "name": fname, "response": {"error": f"Function {fname} not implemented"}})
@@ -3064,8 +3132,14 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 # --- FIN DU TOUR ---
                 if text_buffer.strip():
                     text_lower = text_buffer.lower()
-                    if "au revoir" in text_lower or "bonne nuit" in text_lower:
+                    
+                    # LISTE DES MOTS QUI DÉCLENCHENT LA VEILLE
+                    stop_words = ["au revoir", "bonne nuit", "à plus", "a plus", "bye", "à bientôt", "a bientot"]
+                    
+                    if any(word in text_lower for word in stop_words):
                          self.conversation_active = False
+                         # Optionnel : Forcer le statut GUI en 'idle' tout de suite
+                         self.gui_queue.put(("STATUS", "idle"))
 
                     self.is_speaking = True
                     
@@ -3082,8 +3156,14 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 self.last_interaction_time = time.time()
 
             except Exception as e:
+                # Si c'est une erreur 1011 ou une déconnexion, on provoque une erreur pour relancer run()
+                if "1011" in str(e) or "unavailable" in str(e).lower():
+                    print("\n>>> [WARN] Session expirée. Redémarrage immédiat...")
+                    raise ConnectionResetError("Session expirée")
+                
                 print(f"\n>>> [ERROR in receive_text]: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1) # On attend un peu plus longtemps pour éviter le spam violent
+                break # Par sécurité, on sort de la boucle pour relancer une connexion propre
 
     async def tts(self):
         """
@@ -3159,10 +3239,16 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 
                 # --- SIGNAL DE FIN REÇU ---
                 if bytestream is None:
-                    # ✅ C'EST ICI qu'on libère le micro car on est sûr que tout le son d'avant est joué
+                    # ✅ C'EST ICI qu'on libère le micro
                     self.is_speaking = False
-                    self.gui_queue.put(("STATUS", "listening"))
-                    print(">>> [INFO] ✅ Micro libéré (is_speaking = False)")
+                    
+                    # CORRECTION : On vérifie l'état de la conversation avant de décider du statut
+                    if self.conversation_active:
+                        self.gui_queue.put(("STATUS", "listening")) # On continue la discute
+                    else:
+                        self.gui_queue.put(("STATUS", "idle"))      # C'était un "Au revoir", on passe en veille visuelle
+                        
+                    print(f">>> [INFO] ✅ Micro libéré (active={self.conversation_active})")
                     self.audio_in_queue_player.task_done()
                     continue
     
