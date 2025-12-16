@@ -65,9 +65,6 @@ class CypherGUI(ctk.CTk):
         self._update_stats_loop()
         self.check_queue()
         
-        # Message d'initialisation
-        self.after(1000, lambda: self.add_assistant_message("Hello, I am JARVIS. JARVIS backend is offline. Some features may be limited. How can I assist you today sir?"))
-
     def check_queue(self):
         try:
             while True:

@@ -23,18 +23,17 @@ import azure.cognitiveservices.speech as speechsdk
 import queue
 import threading
 from gui import CypherGUI
-import collections
 import pygame
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
 
-
-
-from google import genai
 from dotenv import load_dotenv
 
 # --- Load Environment Variables ---
 load_dotenv()
+
+from expert_coder import expert_coder_tool, EXPERT_CODER_TOOL_DECLARATION, expert_stats, get_expert
+from google import genai
+
+
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -139,6 +138,12 @@ LOADING_PHRASES = {
         "Je compile un rapport détaillé basé sur plusieurs sites web...",
         "Je croise les informations de différentes sources, un instant...",
         "Investigation approfondie en cours..."
+    ],
+    "expert_coder": [
+        "J'appelle mon module expert en développement, un instant...",
+        "Je demande à l'architecte logiciel de générer ce code...",
+        "Conception du programme en cours avec le modèle haute précision...",
+        "Je rédige un code propre et optimisé, patientez..."
     ],
 }
 
@@ -415,24 +420,29 @@ class AudioLoop:
         file_manager = {
             "name": "file_manager",
             "description": (
-                "Gère toutes les manipulations de fichiers et de dossiers : créer, déplacer, copier, "
-                "supprimer, renommer, lister, ouvrir, scanner des répertoires et des fichiers, calculer les tailles, archiver et désarchiver."
+                "Gère toutes les manipulations de fichiers et de dossiers. "
+                "Utilise 'create_file' pour enregistrer du code ou du texte (C'EST LA MEILLEURE MÉTHODE POUR CRÉER DES SCRIPTS). "
+                "Utilise 'read_file' pour lire le contenu d'un fichier."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "L'action à effectuer : 'create_dir', 'delete', 'copy', 'move', 'list_files', 'calculate_size', 'find_duplicates'.",
-                        "enum": ["create_dir", "delete", "copy", "move", "rename", "list_files", "calculate_size", "find_duplicates", "archive", "unarchive"],
+                        "description": "L'action à effectuer.",
+                        "enum": ["create_file", "read_file", "create_dir", "delete", "copy", "move", "rename", "list_files", "calculate_size", "archive", "unarchive"],
                     },
                     "source_path": {
                         "type": "string",
-                        "description": "Chemin du fichier ou dossier source (obligatoire pour copy/move/delete/list/calculate)."
+                        "description": "Chemin complet du fichier ou dossier."
                     },
                     "destination_path": {
                         "type": "string",
-                        "description": "Chemin de destination (obligatoire pour copy/move/rename). Si l'action est 'rename', c'est le nouveau nom du fichier/dossier."
+                        "description": "Destination (pour copy/move) ou nouveau nom (pour rename)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Le contenu TEXTUEL à écrire dans le fichier (obligatoire pour 'create_file')."
                     }
                 },
                 "required": ["action", "source_path"],
@@ -703,6 +713,25 @@ class AudioLoop:
             }
         }
 
+        expert_coder = EXPERT_CODER_TOOL_DECLARATION
+
+        expert_coder_write_file = {
+            "name": "expert_coder_write_file",
+            "description": (
+                "Écrit dans un fichier le DERNIER code généré par l'outil 'expert_coder'. "
+                "Utilise ce tool pour sauvegarder du code sans avoir à gérer les guillemets ou le formatage du contenu."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_path": {
+                        "type": "string",
+                        "description": "Chemin complet du fichier où le code expert doit être écrit (ex: chemin d'un script sur le Bureau ou dans Documents).",
+                    },
+                },
+                "required": ["target_path"],
+            },
+        }
 
         tools = [
             {"function_declarations": [
@@ -726,6 +755,8 @@ class AudioLoop:
                 agenda_tool,
                 email_tool,
                 document_manager,
+                expert_coder,
+                expert_coder_write_file,
             ]},
             google_search_tool
         ]
@@ -763,6 +794,26 @@ Si tu dois écrire un script Python ou chercher un fichier, utilise TOUJOURS ces
 
 Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je suis ton développeur. Tu es comme un pote collegue avec moi tu peux me charier parfois ou etre tres franc aussi. et tu es une IA conçue pour m'aider dans mes projets d'ingénierie ainsi que dans mes tâches quotidiennes. Adresse-toi à moi en m'appelant « Monsieur ». Merci également de veiller à ce que tes réponses soient concises.
     
+    Règle CRITIQUE pour la création et la MODIFICATION de Code :
+
+    1. CRÉATION (Nouveau projet) :
+       - Si je demande un nouveau programme : Utilise `expert_coder` avec une description détaillée.
+       - Ensuite, pour ÉCRIRE le code sur le disque, tu appelles UNIQUEMENT le tool `expert_coder_write_file` avec `target_path` = chemin complet du fichier (ex: sur le Bureau).
+       - Tu n'as JAMAIS à copier/coller le code dans les paramètres d'un tool : c'est le backend Python qui gère tout le contenu du code.
+
+    2. MODIFICATION (Projet existant) :
+       - Si je demande de changer, corriger ou améliorer un fichier existant :
+         ÉTAPE A : Tu utilises `file_manager` avec action='read_file' pour lire le fichier cible.
+         ÉTAPE B : ⚠️ RÈGLE DE SILENCE : Quand tu as lu le code, NE L'AFFICHE PAS dans le chat. NE LE RÉPÈTE PAS. Garde-le en mémoire uniquement. Dis juste : "J'ai lu le fichier, je transmets à l'expert."
+         ÉTAPE C : Tu appelles `expert_coder`. Dans les `specifications`, tu colles le code que tu as lu + mes instructions.
+         ÉTAPE D : Quand l'expert a renvoyé le nouveau code, tu écrases l'ancien fichier en appelant `expert_coder_write_file` avec `target_path` = chemin du fichier à mettre à jour (pas `file_manager.create_file`).
+
+    3. RÈGLES GÉNÉRALES :
+       - Le code reçu de l'expert est BRUT. Ne le modifie pas, ne l'affiche pas.
+       - Sauvegarde-le immédiatement via `expert_coder_write_file`.
+    
+    4. INTERDICTION FORMELLE d'utiliser `execute_python` pour créer ou modifier un fichier contenant du code généré. Utilise `expert_coder` + `expert_coder_write_file` (et `file_manager` seulement pour lire/lister/déplacer/supprimer). 
+
     Règles pour les demandes d'heure :
     - Considère que je vis en France métropolitaine (fuseau 'Europe/Paris').
     - Si je demande simplement l'heure sans préciser de ville ou de pays (ex: « il est quelle heure ? »),
@@ -852,6 +903,13 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     - Tu peux combiner google_search avec les autres tools (file_manager, execute_python, etc.) si ça améliore la précision de ce que tu fais.
     - **NE MENTIONNE PAS** les sources ni les URLs dans ta réponse vocale, sauf si je te le demande explicitement.
     - **CONCENTRE-TOI** uniquement sur le résumé vocal clair de la réponse.
+
+    Règle CRITIQUE pour la création de fichiers avec du code (Code, Texte, Scripts) :
+    - Si je te demande de "créer un fichier", "faire un script", "enregistrer un code" :
+      1. Tu génères le contenu du code.
+      2. Tu utilises EXCLUSIVEMENT l'outil `file_manager` avec `action='create_file'`, `content='LE_CODE'` et `source_path='...'`.
+      3. INTERDICTION FORMELLE d'utiliser `execute_python` pour créer un fichier (ne fais jamais de `with open(...)` dans un script Python).
+      4. Une fois le fichier créé via `file_manager`, SI ET SEULEMENT SI je demande de l'exécuter, alors tu utilises `execute_python` pour lancer le fichier créé.
     
     Règle pour file_manager :
     - Utilise cette outil en priorité pour :
@@ -1007,6 +1065,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             "tools": tools,
         }
 
+    
 
     def _generate_ssml(self, text: str) -> str:
         """Emballe le texte dans du SSML pour contrôler la vitesse et le ton."""
@@ -1026,12 +1085,27 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                                                                               
     @staticmethod
     def _clean_text_for_tts(text: str) -> str:
-        """Nettoie le texte (Markdown, symboles) pour la lecture vocale uniquement."""
+        """Nettoie le texte pour la lecture vocale (Supprime le code et le Markdown)."""
         import re
-        # Enlève les astérisques (*), dièses (#), underscores (_), backticks (`)
-        # On garde la ponctuation normale (. , ? !)
+        
+        # 1. SUPPRIMER LES BLOCS DE CODE (Entre ``` et ```)
+        # On remplace tout le bloc de code par une courte pause silencieuse
+        text = re.sub(r'```[\s\S]*?```', ' [Code analysé] ', text)
+        
+        # 2. SUPPRIMER LES LIGNES DE CODE TYPIQUES (Sécurité supplémentaire)
+        # Si une ligne commence par 'import ', 'def ', 'class ', on la zappe
+        lines = text.split('\n')
+        clean_lines = []
+        for line in lines:
+            l = line.strip()
+            if not l.startswith(('import ', 'from ', 'def ', 'class ', 'return ', 'self.', '@', 'print(')):
+                clean_lines.append(line)
+        text = '\n'.join(clean_lines)
+
+        # 3. Nettoyage Markdown standard (*, #, _, `)
         clean = re.sub(r'[\*#_`]', '', text)
-        return clean.strip()    
+        
+        return clean.strip()
                                                                                  
     def _boost_microphone_gain(self):
         """Augmente automatiquement le gain du micro au démarrage"""
@@ -2017,7 +2091,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             return f"{bytes_size/1024**3:.2f} GB"
     
     @staticmethod
-    def _file_manager(action: str, source_path: str, destination_path: str | None = None) -> str:
+    def _file_manager(action: str, source_path: str, destination_path: str | None = None, content: str | None = None) -> str:
         """
         Tool Python pour la gestion de fichiers/dossiers.
         Gère intelligemment la redirection vers OneDrive.
@@ -2039,7 +2113,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             if p_lower in ["images", "pictures", "photos"]: return IMAGES_REAL
             
             # 3. Redirection des chemins standards Windows vers les chemins réels (OneDrive)
-            # On construit le chemin "théorique" C:\Users\User\Documents
             std_docs = os.path.normpath(os.path.join(USER_HOME, "Documents"))
             std_desk = os.path.normpath(os.path.join(USER_HOME, "Desktop"))
             
@@ -2058,6 +2131,33 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             destination_path = _resolve_path(destination_path)
             
         action = action.lower()
+
+        # --- NOUVEAU : CRÉER UN FICHIER (ÉCRIRE DU CODE) ---
+        if action == "create_file":
+            if not content:
+                return "Erreur : Le contenu du fichier est manquant."
+            try:
+                # Créer le dossier parent si besoin
+                parent_dir = os.path.dirname(source_path)
+                if parent_dir and not os.path.exists(parent_dir):
+                    os.makedirs(parent_dir, exist_ok=True)
+
+                with open(source_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                return f"Fichier créé avec succès : {source_path}"
+            except Exception as e:
+                return f"Erreur lors de l'écriture du fichier : {e}"
+
+        # --- NOUVEAU : LIRE UN FICHIER ---
+        if action == "read_file":
+            if not os.path.exists(source_path):
+                return f"Le fichier '{source_path}' n'existe pas."
+            try:
+                with open(source_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    data = f.read()
+                return f"Contenu de '{source_path}' :\n\n{data[:4000]}" # Limite 4000 chars
+            except Exception as e:
+                return f"Erreur de lecture : {e}"
         
         # --- 1. Créer un Dossier/Structure ---
         if action == "create_dir":
@@ -2116,7 +2216,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 return "Le chemin de destination est manquant."
             try:
                 if os.path.isdir(source_path):
-                    shutil.copytree(source_path, destination_path)
+                    shutil.copytree(source_path, destination_path, dirs_exist_ok=True) # Fix dirs_exist_ok
                 else:
                     shutil.copy2(source_path, destination_path)
                 return f"Copié vers '{destination_path}'."
@@ -2164,7 +2264,26 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 return f"Décompressé dans '{destination_path}'."
             except Exception as e: return f"Erreur décompression : {e}"
 
-        return f"Action inconnue : {action}"                                                                                       
+        return f"Action inconnue : {action}"                                                                                     
+
+    @staticmethod
+    def _expert_coder_write_file(target_path: str) -> str:
+        """
+        Écrit dans un fichier le DERNIER code généré par l'outil expert_coder,
+        en utilisant le même moteur que file_manager (gestion OneDrive, etc.).
+        Cela évite à Gemini de devoir gérer les guillemets et les retours à la ligne du code.
+        """
+        try:
+            expert = get_expert()
+        except Exception as e:
+            return f"Erreur : impossible d'accéder à l'expert_coder ({e})"
+
+        code = getattr(expert, "last_code", None)
+        if not code:
+            return "Erreur : aucun code expert en mémoire. Tu dois d'abord appeler l'outil 'expert_coder'."
+
+        # On délègue toute la logique de chemin à file_manager
+        return AudioLoop._file_manager(action="create_file", source_path=target_path, content=code)
                                                                                               
     @staticmethod
     def _get_time(timezone: str | None = None) -> str:
@@ -3440,6 +3559,9 @@ FUNCTION_MAP = {
     "manage_agenda": AudioLoop._manage_agenda,
     "email_manager": AudioLoop._email_manager,
     "document_manager": AudioLoop._document_manager,
+    "expert_coder": expert_coder_tool,
+    "expert_coder_write_file": AudioLoop._expert_coder_write_file,
+    "expert_stats": expert_stats,
 }
 
 def run_backend(gui_queue):
