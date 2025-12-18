@@ -32,14 +32,16 @@ load_dotenv()
 
 from expert_coder import expert_coder_tool, EXPERT_CODER_TOOL_DECLARATION, expert_stats, get_expert
 from google import genai
+from spotify_controller import spotify_tool, SPOTIFY_TOOL_DECLARATION
+from analyze_screen import analyze_screen_tool, SCREEN_ANALYZER_TOOL_DECLARATION
 
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION") # ex: "francecentral"
-AZURE_VOICE_NAME = "fr-FR-HenriNeural" # Ou "fr-FR-HenriNeural" pour un homme
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION") 
+AZURE_VOICE_NAME = "fr-FR-HenriNeural" 
 
 PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
 PYTHON_EXECUTION_LOG = []   # Historique des exécutions
@@ -179,14 +181,14 @@ class AudioLoop:
                 self.porcupine = pvporcupine.create(
                     access_key=access_key, 
                     keyword_paths=[keyword_path], 
-                    sensitivities=[WAKE_WORD_SENSITIVITY] # <--- Utilise la constante
+                    sensitivities=[WAKE_WORD_SENSITIVITY] 
                 )
                 print(f">>> [INIT] Wake Word chargé (Sensibilité : {WAKE_WORD_SENSITIVITY})")
             else:
                 self.porcupine = pvporcupine.create(
                     access_key=access_key, 
                     keywords=['porcupine'], 
-                    sensitivities=[WAKE_WORD_SENSITIVITY] # <--- Ici aussi
+                    sensitivities=[WAKE_WORD_SENSITIVITY]
                 )
                 
         except Exception as e:
@@ -198,13 +200,13 @@ class AudioLoop:
         # Variables d'état pour la conversation
         self.conversation_active = False
         self.last_interaction_time = 0
-        self.CONVERSATION_TIMEOUT = 15.0 # 15 secondes
+        self.CONVERSATION_TIMEOUT = 15.0 
         
         self._boost_microphone_gain()
         
     
 
-        # Déclaration du tool "get_time" pour Gemini
+        # Tools de Cypher
         get_time = {
             "name": "get_time",
             "description": (
@@ -294,7 +296,7 @@ class AudioLoop:
             },
         }
 
-        # Déclaration du tool pour le chronomètre
+        
         manage_stopwatch = {
             "name": "manage_stopwatch",
             "description": (
@@ -315,7 +317,7 @@ class AudioLoop:
             },
         }
 
-        # Déclaration du tool pour le compte à rebours
+        
         manage_timer = {
             "name": "manage_timer",
             "description": (
@@ -757,6 +759,8 @@ class AudioLoop:
                 document_manager,
                 expert_coder,
                 expert_coder_write_file,
+                SPOTIFY_TOOL_DECLARATION,
+                SCREEN_ANALYZER_TOOL_DECLARATION,
             ]},
             google_search_tool
         ]
@@ -764,7 +768,6 @@ class AudioLoop:
         # --- CHARGEMENT DU CERVEAU AU DÉMARRAGE ---
         memory_content = ""
         
-        # 🟢 CORRECTION : Chemin relatif au fichier script (juste à côté de main.py)
         script_dir = os.path.dirname(os.path.abspath(__file__))
         mem_path = os.path.join(script_dir, "cypher_memory_cortex.json") 
         
@@ -825,6 +828,23 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
       avec le timezone correspondant, puis tu précises la ville dans ta réponse.
     - Ne redemande PAS le fuseau horaire si la demande peut être raisonnablement interprétée
       (France par défaut si rien n'est dit).
+       
+    Règle pour web_navigator (INTERNAUTE) :
+    - Utilise cet outil pour des recherches APPROFONDIES ou des actions sur le web.
+    - Scénarios :
+      * "Va sur le site de la NASA et dis-moi la dernière news" -> action='navigate', url='nasa.gov'
+      * "Cherche des images de chatons" -> action='search_images'
+      * "Télécharge ce PDF" -> action='download'
+      * "Fais une recherche complète sur X" -> action='search' (mieux que google_search car plus détaillé)
+    - Si l'utilisateur demande juste une info rapide ("Quelle heure est-il à Tokyo ?"), garde `Google Search`.
+    - Pour lire un article complet : action='scrape'.
+      
+    Règle pour spotify_control (DJ Musique) :
+    - Utilise cet outil dès que je parle de musique, de chansons, d'artistes ou de volume sonore.
+    - Pour "Mets de la musique" ou "Joue du rock" → action='play_track' ou 'search' puis 'play'.
+    - Pour "Mets pause", "Suivant", "Monte le volume" → utilise les actions correspondantes (pause, next, volume_up).
+    - Si je demande une playlist spécifique ("Playlist Lo-Fi") → action='play_playlist'.
+    - Tu as le contrôle total : ne demande pas confirmation pour changer de musique.
     
     Règles pour les demandes de date :
     - Si je demande simplement « on est quel jour ? » ou « c'est quoi la date aujourd'hui ? »,
@@ -948,6 +968,13 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
         - Mettre en veille le pc
         - Verrouiller le pc
         - Redémarrer ou éteindre le pc
+        
+    Règle pour analyze_screen (VISION / YEUX) :
+    - Tu as maintenant la capacité de VOIR l'écran de l'utilisateur.
+    - DÉCLENCHEURS : Dès que je dis "Regarde ça", "Qu'est-ce qu'il y a à l'écran", "Analyse ce bug", "Lis ce texte", "Décris l'image".
+    - ACTION PAR DÉFAUT : Utilise `action='describe'` pour avoir une description textuelle rapide de ce qui est ouvert.
+    - POUR LE CODE / ERREURS : Utilise `action='full_analysis'` avec `detailed_ocr=True`. Cela va lire tout le texte à l'écran (OCR) pour que tu puisses déboguer sans que je copie-colle.
+    - INTERDIT : Ne dis jamais "Je suis une IA textuelle, je ne peux pas voir". Tu PEUX voir via cet outil.
         
     Règle pour system_optimize :
     - Utilise cette outil en priorité pour :
@@ -2979,21 +3006,33 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     def _interrupt_playback(self):
         """KILL SWITCH : Coupe la parole instantanément."""
         if self.is_speaking:
-            print(">>> [INTERRUPTION] Silence demandé !")
+            print(">>> [INTERRUPTION] Wake word détecté - Cypher se tait !")
             
             # 1. On vide la file d'attente du TTS (ce qui reste à générer)
-            while not self.response_queue_tts.empty():
-                try: self.response_queue_tts.get_nowait()
-                except queue.Empty: break
+            if self.response_queue_tts:
+                while not self.response_queue_tts.empty():
+                    try: 
+                        self.response_queue_tts.get_nowait()
+                    except asyncio.QueueEmpty: 
+                        break
             
             # 2. On vide la file d'attente du Player (ce qui reste à jouer)
-            while not self.audio_in_queue_player.empty():
-                try: self.audio_in_queue_player.get_nowait()
-                except queue.Empty: break
+            if self.audio_in_queue_player:
+                while not self.audio_in_queue_player.empty():
+                    try: 
+                        self.audio_in_queue_player.get_nowait()
+                    except asyncio.QueueEmpty: 
+                        break
             
-            # 3. On force l'état silencieux
+            # 3. On arrête le son pygame en cours s'il y en a
+            try:
+                pygame.mixer.music.stop()
+            except:
+                pass
+            
+            # 4. On force l'état silencieux
             self.is_speaking = False
-            self.gui_queue.put(("STATUS", "interrupted"))
+            self.gui_queue.put(("STATUS", "listening"))
 
     async def send_realtime(self):
         import websockets
@@ -3020,56 +3059,81 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         import struct
         import numpy as np
         from collections import deque
-        import winsound # Pour le BIP de réveil
+        import winsound
+        from scipy import signal  # Pour le resample
         
         frame_length = self.porcupine.frame_length
         mic_info = pya.get_default_input_device_info()
         
+        # 🔧 NOUVEAU : Détection du sample rate natif du Jabra
+        native_rate = int(mic_info.get('defaultSampleRate', 16000))
+        print(f">>> [AUDIO] Micro détecté : {mic_info['name']}")
+        print(f">>> [AUDIO] Sample rate natif : {native_rate} Hz")
+        print(f">>> [AUDIO] Sample rate Porcupine : {self.porcupine.sample_rate} Hz")
+        
+        # On ouvre le stream au sample rate NATIF du micro
         self.audio_stream = await asyncio.to_thread(
             pya.open, format=FORMAT, channels=CHANNELS, 
-            rate=self.porcupine.sample_rate,
+            rate=native_rate,  # ⚠️ CHANGÉ ICI
             input=True, input_device_index=mic_info["index"], 
-            frames_per_buffer=frame_length
+            frames_per_buffer=int(frame_length * native_rate / self.porcupine.sample_rate)
         )
         
         audio_buffer = deque(maxlen=30)
         
-        # Ce gain sera à remettre à 1.0 quand tu auras le Jabra
-        GAIN_MULTIPLIER = 2.5 
+        GAIN_MULTIPLIER = 1.0
+        
+        # 🔧 NOUVEAU : Calcul du ratio de resample
+        resample_needed = (native_rate != self.porcupine.sample_rate)
+        resample_ratio = self.porcupine.sample_rate / native_rate if resample_needed else 1.0
         
         print(f">>> [VEILLE] En écoute... (Seuil volume: {WAKE_MIN_VOLUME})")
+        if resample_needed:
+            print(f">>> [AUDIO] Resample activé : {native_rate} Hz → {self.porcupine.sample_rate} Hz")
         
         while True:
             try:
-                pcm = await asyncio.to_thread(self.audio_stream.read, frame_length, exception_on_overflow=False)
+                # Calcul dynamique de la taille de buffer
+                read_size = int(frame_length * native_rate / self.porcupine.sample_rate)
+                pcm = await asyncio.to_thread(self.audio_stream.read, read_size, exception_on_overflow=False)
             except:
                 continue
             
             # Traitement Audio
             audio_array = np.frombuffer(pcm, dtype=np.int16)
             
+            # 🔧 RESAMPLE SI NÉCESSAIRE
+            if resample_needed:
+                # Resample vers le sample rate de Porcupine
+                num_samples = int(len(audio_array) * resample_ratio)
+                audio_array = signal.resample(audio_array, num_samples).astype(np.int16)
+            
             # --- MESURE DU VOLUME (RMS) ---
-            # On calcule la puissance du signal actuel
             volume_level = np.abs(audio_array).mean()
             
             # Amplification
             audio_array = np.clip(audio_array * GAIN_MULTIPLIER, -32768, 32767).astype(np.int16)
-            pcm_amplified = audio_array.tobytes()
             
+            # 🔧 IMPORTANT : On s'assure que la taille est exactement frame_length
+            if len(audio_array) != frame_length:
+                if len(audio_array) < frame_length:
+                    audio_array = np.pad(audio_array, (0, frame_length - len(audio_array)), mode='constant')
+                else:
+                    audio_array = audio_array[:frame_length]
+            
+            pcm_amplified = audio_array.tobytes()
             audio_buffer.append(pcm_amplified)
-
+    
             # --- CAS 1 : CYPHER PARLE (BARGE-IN) ---
             if self.is_speaking:
                 pcm_unpacked = struct.unpack_from("h" * frame_length, pcm_amplified)
                 keyword_index = self.porcupine.process(pcm_unpacked)
                 
                 if keyword_index >= 0:
-                    # FILTRE ANTI-FAUX POSITIF : 
-                    # Si le volume est trop faible, c'est sûrement un bruit parasite, on ignore.
+                    # FILTRE ANTI-FAUX POSITIF
                     if volume_level < WAKE_MIN_VOLUME:
-                        # print(f">>> [IGNORE] Faux positif détecté (Volume trop faible : {volume_level:.0f})")
                         continue
-
+    
                     print(">>> [INTERRUPTION] Silence demandé !")
                     self._interrupt_playback()
                     self.conversation_active = True
@@ -3079,33 +3143,29 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         buffered = audio_buffer.popleft()
                         await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
                 continue
-
+    
             # --- CAS 2 : MODE CONVERSATION ---
             if self.conversation_active:
-
                 if volume_level > 200: 
                     self.last_interaction_time = time.time()
-
+    
                 if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy:
                     print(">>> [SLEEP] Silence prolongé.")
                     self.gui_queue.put(("STATUS", "idle"))
                     self.conversation_active = False
                     audio_buffer.clear()
                     continue
-
-                # MODIFICATION 2 : Si on est occupé, on n'envoie PAS de son à Gemini 
-                # (pour éviter de le perturber pendant qu'il réfléchit/exécute)
+    
                 if self.is_busy:
                     continue
-
+    
                 await self.out_queue_gemini.put({"data": pcm_amplified, "mime_type": "audio/pcm"})
-
+    
             # --- CAS 3 : VEILLE (ATTENTE MOT CLÉ) ---
             else:
                 pcm_unpacked = struct.unpack_from("h" * frame_length, pcm_amplified)
                 if self.porcupine.process(pcm_unpacked) >= 0:
                     
-                    # --- FILTRE ANTI-FAUX POSITIF (Le plus important) ---
                     if volume_level < WAKE_MIN_VOLUME:
                         print(f">>> [IGNORE] Faux positif rejeté (Vol: {volume_level:.0f} < {WAKE_MIN_VOLUME})")
                         continue
@@ -3120,10 +3180,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         except Exception as e:
                             print(f">>> [ERREUR SON] : {e}")
                     else:
-                        # Fallback si le fichier n'est pas trouvé
                         winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
-                    
-                    
                     
                     self.gui_queue.put(("STATUS", "listening"))
                     self.conversation_active = True
@@ -3159,16 +3216,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
         while True:
             try:
-                if self.is_speaking:
-                    await asyncio.sleep(0.1)
-                    continue
 
-                turn = self.session.receive() 
-                
-                # ... (La gestion des tools et server_content reste inchangée, on se concentre sur le texte) ...
-                # Pour gagner de la place ici, je ne remets pas le bloc "tool_call" et "server_content" 
-                # car ils ne changent pas. Assure-toi de ne pas les effacer si tu copies-colles tout le bloc.
-                # Si tu remplaces toute la fonction, voici la version COMPLÈTE avec le fix :
+                turn = self.session.receive()
 
                 tool_responses = []
                 web_search_urls = set()
@@ -3562,6 +3611,8 @@ FUNCTION_MAP = {
     "expert_coder": expert_coder_tool,
     "expert_coder_write_file": AudioLoop._expert_coder_write_file,
     "expert_stats": expert_stats,
+    "spotify_control": spotify_tool,
+    "analyze_screen": analyze_screen_tool,
 }
 
 def run_backend(gui_queue):
@@ -3594,7 +3645,7 @@ def run_backend(gui_queue):
 if __name__ == "__main__":
     import queue
     import threading
-    from gui import CypherGUI # Assure-toi que gui.py est bien dans le même dossier
+    from gui import CypherGUI 
 
     print(">>> [INIT] Lancement de l'interface graphique...")
 
