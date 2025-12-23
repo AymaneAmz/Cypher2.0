@@ -24,6 +24,10 @@ import queue
 import threading
 from gui import CypherGUI
 import pygame
+import openwakeword
+from openwakeword.model import Model
+import numpy as np
+
 
 from dotenv import load_dotenv
 
@@ -46,7 +50,7 @@ AZURE_VOICE_NAME = "fr-FR-HenriNeural"
 PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
 PYTHON_EXECUTION_LOG = []   # Historique des exécutions
 
-WAKE_WORD_SENSITIVITY = 0.8
+WAKE_WORD_SENSITIVITY = 0.001
 WAKE_MIN_VOLUME = 0
 
 TTS_RATE = "+15%"
@@ -166,35 +170,27 @@ class AudioLoop:
         pygame.mixer.init() # On allume le moteur audio
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.wake_sound_path = os.path.join(script_dir, "wake.mp3")
+        self.end_sound_path = os.path.join(script_dir, "end_listening.mp3")
         
-        import pvporcupine
-        self.porcupine = None
+        self.oww_model = None
         try:
-            keyword_path = os.getenv("PICOVOICE_KEYWORD_PATH")
-            access_key = os.getenv("PICOVOICE_ACCESS_KEY")
+            # On cherche Cypher.onnx dans le dossier du script
+            model_path = os.path.join(script_dir, "Cypher.onnx")
             
-            # Vérification basique
-            if not access_key:
-                raise ValueError("La clé PICOVOICE_ACCESS_KEY est vide dans le .env")
-
-            if keyword_path and os.path.exists(keyword_path):
-                self.porcupine = pvporcupine.create(
-                    access_key=access_key, 
-                    keyword_paths=[keyword_path], 
-                    sensitivities=[WAKE_WORD_SENSITIVITY] 
+            if os.path.exists(model_path):
+                # Chargement du modèle
+                self.oww_model = Model(
+                    wakeword_models=[model_path], 
+                    inference_framework="onnx"
                 )
-                print(f">>> [INIT] Wake Word chargé (Sensibilité : {WAKE_WORD_SENSITIVITY})")
+                print(f">>> [INIT] Wake Word 'Cypher' chargé via OpenWakeWord !")
             else:
-                self.porcupine = pvporcupine.create(
-                    access_key=access_key, 
-                    keywords=['porcupine'], 
-                    sensitivities=[WAKE_WORD_SENSITIVITY]
-                )
+                print(f">>> [ERREUR] Fichier 'Cypher.onnx' introuvable dans {script_dir}")
+                print(">>> Veuillez copier le fichier Cypher.onnx à côté de main.py")
+                sys.exit(1)
                 
         except Exception as e:
-            # 🛑 STOP IMMÉDIAT pour voir l'erreur
-            print(f"\n>>> [ERREUR FATALE PICOVOICE] : {e}")
-            print(">>> Vérifiez votre clé API et le chemin du fichier .ppn dans le .env")
+            print(f"\n>>> [ERREUR FATALE OPENWAKEWORD] : {e}")
             sys.exit(1)
 
         # Variables d'état pour la conversation
@@ -3004,50 +3000,75 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 await asyncio.sleep(1)
                 
     def _interrupt_playback(self):
-        """KILL SWITCH : Coupe la parole instantanément."""
+        """KILL SWITCH : Coupe la parole instantanément et FORCE l'écoute."""
+        # --- FIX CRITIQUE : On débloque le cerveau immédiatement ---
+        self.is_busy = False 
+        
         if self.is_speaking:
             print(">>> [INTERRUPTION] Wake word détecté - Cypher se tait !")
             
-            # 1. On vide la file d'attente du TTS (ce qui reste à générer)
+            # 1. On vide la file d'attente du TTS
             if self.response_queue_tts:
                 while not self.response_queue_tts.empty():
-                    try: 
-                        self.response_queue_tts.get_nowait()
-                    except asyncio.QueueEmpty: 
-                        break
+                    try: self.response_queue_tts.get_nowait()
+                    except asyncio.QueueEmpty: break
             
-            # 2. On vide la file d'attente du Player (ce qui reste à jouer)
+            # 2. On vide la file d'attente du Player
             if self.audio_in_queue_player:
                 while not self.audio_in_queue_player.empty():
-                    try: 
-                        self.audio_in_queue_player.get_nowait()
-                    except asyncio.QueueEmpty: 
-                        break
+                    try: self.audio_in_queue_player.get_nowait()
+                    except asyncio.QueueEmpty: break
             
-            # 3. On arrête le son pygame en cours s'il y en a
-            try:
-                pygame.mixer.music.stop()
-            except:
-                pass
+            # 3. On arrête le son pygame
+            try: pygame.mixer.music.stop()
+            except: pass
             
             # 4. On force l'état silencieux
             self.is_speaking = False
             self.gui_queue.put(("STATUS", "listening"))
 
     async def send_realtime(self):
-        import websockets
+        import base64
+        import json
+        
         try:
             while True:
                 msg = await self.out_queue_gemini.get()
                 try:
-                    await self.session.send(input=msg)
-                except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError):
-                    print(">>> [WARN] Connexion WebSocket perdue pendant l'envoi.")
-                    # ON LÈVE UNE ERREUR POUR FORCER LE REDÉMARRAGE IMMÉDIAT DU TASKGROUP
-                    raise ConnectionResetError("WebSocket coupé")
+                    if not self.session: continue
+                    
+                    # Extraction du contenu
+                    if isinstance(msg, dict):
+                        content = msg.get("data")
+                        mime_type = msg.get("mime_type", "text/plain")
+                    else:
+                        content = msg
+                        mime_type = "text/plain"
+
+                    if not content: continue 
+
+                    # 1. ENVOI TEXTE (Simple)
+                    if isinstance(content, str):
+                        await self.session.send(input=content, end_of_turn=True)
+                    
+                    # 2. ENVOI AUDIO (Encodage Base64 pour compatibilité MAXIMALE)
+                    elif isinstance(content, bytes):
+                        # On encode les octets en Base64 (texte)
+                        b64_data = base64.b64encode(content).decode("utf-8")
+                        
+                        # On construit le payload standard de l'API Gemini
+                        payload = {
+                            "mime_type": "audio/pcm",
+                            "data": b64_data
+                        }
+                        
+                        # On envoie via la méthode générique send() qui gère les dicts
+                        # end_of_turn=False car c'est du streaming continu
+                        await self.session.send(input=payload, end_of_turn=False)
+                            
                 except Exception as e:
-                    print(f">>> [ERROR send_realtime] {e}")
-                    break
+                    # On ignore les erreurs silencieuses pour la fluidité
+                    pass
                 finally:
                     self.out_queue_gemini.task_done()
         except asyncio.CancelledError:
@@ -3060,135 +3081,134 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         import numpy as np
         from collections import deque
         import winsound
-        from scipy import signal  # Pour le resample
+        from scipy import signal
         
-        frame_length = self.porcupine.frame_length
-        mic_info = pya.get_default_input_device_info()
+        # Configuration OpenWakeWord
+        OWW_CHUNK_SIZE = 1280
+        TARGET_RATE = 16000
         
-        # 🔧 NOUVEAU : Détection du sample rate natif du Jabra
-        native_rate = int(mic_info.get('defaultSampleRate', 16000))
-        print(f">>> [AUDIO] Micro détecté : {mic_info['name']}")
-        print(f">>> [AUDIO] Sample rate natif : {native_rate} Hz")
-        print(f">>> [AUDIO] Sample rate Porcupine : {self.porcupine.sample_rate} Hz")
+        # --- CONFIGURATION DU MICRO (JABRA) ---
+        target_device_index = 1 
         
-        # On ouvre le stream au sample rate NATIF du micro
-        self.audio_stream = await asyncio.to_thread(
-            pya.open, format=FORMAT, channels=CHANNELS, 
-            rate=native_rate,  # ⚠️ CHANGÉ ICI
-            input=True, input_device_index=mic_info["index"], 
-            frames_per_buffer=int(frame_length * native_rate / self.porcupine.sample_rate)
-        )
+        # 1. Récupération fréquence native
+        try:
+            dev_info = pya.get_device_info_by_index(target_device_index)
+            native_rate = int(dev_info.get('defaultSampleRate', 44100))
+        except Exception as e:
+            print(f">>> [ERREUR AUDIO] : {e}")
+            return
+
+        # 2. Calcul ratio
+        resample_ratio = native_rate / TARGET_RATE
+        read_size = int(OWW_CHUNK_SIZE * resample_ratio)
         
-        audio_buffer = deque(maxlen=30)
+        # Ouverture du flux
+        try:
+            self.audio_stream = await asyncio.to_thread(
+                pya.open, 
+                format=FORMAT, 
+                channels=CHANNELS, 
+                rate=native_rate, 
+                input=True, 
+                input_device_index=target_device_index, 
+                frames_per_buffer=read_size
+            )
+        except Exception as e:
+            print(f">>> [ERREUR AUDIO FATALE] : {e}")
+            return
         
-        GAIN_MULTIPLIER = 1.0
+        audio_buffer = deque(maxlen=50)
+        print(f">>> [VEILLE] En écoute de 'Cypher'... (Seuil Réveil: {WAKE_WORD_SENSITIVITY})")
         
-        # 🔧 NOUVEAU : Calcul du ratio de resample
-        resample_needed = (native_rate != self.porcupine.sample_rate)
-        resample_ratio = self.porcupine.sample_rate / native_rate if resample_needed else 1.0
-        
-        print(f">>> [VEILLE] En écoute... (Seuil volume: {WAKE_MIN_VOLUME})")
-        if resample_needed:
-            print(f">>> [AUDIO] Resample activé : {native_rate} Hz → {self.porcupine.sample_rate} Hz")
+        # --- PROTECTION ANTI-ECHO (Barge-In) ---
+        # On ajuste à 0.84 (juste au-dessus de ton écho max de 0.825)
+        BARGE_IN_THRESHOLD = 0.001
         
         while True:
             try:
-                # Calcul dynamique de la taille de buffer
-                read_size = int(frame_length * native_rate / self.porcupine.sample_rate)
-                pcm = await asyncio.to_thread(self.audio_stream.read, read_size, exception_on_overflow=False)
+                pcm = await asyncio.to_thread(
+                    self.audio_stream.read, 
+                    read_size, 
+                    exception_on_overflow=False
+                )
             except:
                 continue
             
-            # Traitement Audio
+            # Conversion & Resample
             audio_array = np.frombuffer(pcm, dtype=np.int16)
+            if native_rate != TARGET_RATE:
+                audio_array = signal.resample(audio_array, OWW_CHUNK_SIZE).astype(np.int16)
             
-            # 🔧 RESAMPLE SI NÉCESSAIRE
-            if resample_needed:
-                # Resample vers le sample rate de Porcupine
-                num_samples = int(len(audio_array) * resample_ratio)
-                audio_array = signal.resample(audio_array, num_samples).astype(np.int16)
-            
-            # --- MESURE DU VOLUME (RMS) ---
             volume_level = np.abs(audio_array).mean()
+            pcm_final = audio_array.tobytes()
+            audio_buffer.append(pcm_final)
             
-            # Amplification
-            audio_array = np.clip(audio_array * GAIN_MULTIPLIER, -32768, 32767).astype(np.int16)
-            
-            # 🔧 IMPORTANT : On s'assure que la taille est exactement frame_length
-            if len(audio_array) != frame_length:
-                if len(audio_array) < frame_length:
-                    audio_array = np.pad(audio_array, (0, frame_length - len(audio_array)), mode='constant')
-                else:
-                    audio_array = audio_array[:frame_length]
-            
-            pcm_amplified = audio_array.tobytes()
-            audio_buffer.append(pcm_amplified)
-    
-            # --- CAS 1 : CYPHER PARLE (BARGE-IN) ---
-            if self.is_speaking:
-                pcm_unpacked = struct.unpack_from("h" * frame_length, pcm_amplified)
-                keyword_index = self.porcupine.process(pcm_unpacked)
+            # --- PRÉDICTION WAKE WORD ---
+            if self.oww_model:
+                prediction = self.oww_model.predict(audio_array)
+                cypher_score = prediction.get("Cypher", 0.0)
                 
-                if keyword_index >= 0:
-                    # FILTRE ANTI-FAUX POSITIF
-                    if volume_level < WAKE_MIN_VOLUME:
+                # DEBUG : Affiche le score si > 0.5 pour voir ce qui se passe
+                if cypher_score > 0.001:
+                     state = "[PARLE]" if self.is_speaking else "[VEILLE]"
+                     print(f"🎤 {state} Score: {cypher_score:.3f} (Seuil Interruption: {BARGE_IN_THRESHOLD})")
+                
+                # --- CAS 1 : INTERRUPTION (Barge-in AJUSTÉ) ---
+                if self.is_speaking:
+                    # On coupe SEULEMENT si le score dépasse le seuil anti-écho
+                    if cypher_score >= BARGE_IN_THRESHOLD:
+                        if volume_level > WAKE_MIN_VOLUME:
+                            print(f">>> [INTERRUPTION] Score {cypher_score:.3f} >= {BARGE_IN_THRESHOLD} -> Arrêt.")
+                            self._interrupt_playback()
+                            self.conversation_active = True
+                            self.last_interaction_time = time.time()
+                            
+                            while audio_buffer:
+                                buffered = audio_buffer.popleft()
+                                await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
                         continue
-    
-                    print(">>> [INTERRUPTION] Silence demandé !")
-                    self._interrupt_playback()
-                    self.conversation_active = True
-                    self.last_interaction_time = time.time()
                     
-                    while len(audio_buffer) > 0:
-                        buffered = audio_buffer.popleft()
-                        await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
-                continue
-    
-            # --- CAS 2 : MODE CONVERSATION ---
+                    # Sinon, on ignore (c'est probablement de l'écho)
+                
+                # --- CAS 2 : RÉVEIL (Wake word classique) ---
+                elif not self.conversation_active and cypher_score >= WAKE_WORD_SENSITIVITY:
+                    if volume_level > WAKE_MIN_VOLUME:
+                        print(f">>> [WAKE] 'Cypher' détecté ! (Score: {cypher_score:.3f})")
+                        
+                        if os.path.exists(self.wake_sound_path):
+                            try: pygame.mixer.music.load(self.wake_sound_path); pygame.mixer.music.play()
+                            except: pass
+                        else: 
+                            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                        
+                        self.gui_queue.put(("STATUS", "listening"))
+                        self.conversation_active = True
+                        self.last_interaction_time = time.time()
+                        
+                        while audio_buffer:
+                            buffered = audio_buffer.popleft()
+                            await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
+                    continue
+            
+            # --- CAS 3 : CONVERSATION ACTIVE ---
             if self.conversation_active:
-                if volume_level > 200: 
+                if volume_level > 200:
                     self.last_interaction_time = time.time()
-    
+                
                 if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy:
                     print(">>> [SLEEP] Silence prolongé.")
+                    if os.path.exists(self.end_sound_path):
+                        try: pygame.mixer.music.load(self.end_sound_path); pygame.mixer.music.play()
+                        except: pass
                     self.gui_queue.put(("STATUS", "idle"))
                     self.conversation_active = False
+                    if self.oww_model: self.oww_model.reset()
                     audio_buffer.clear()
                     continue
-    
-                if self.is_busy:
-                    continue
-    
-                await self.out_queue_gemini.put({"data": pcm_amplified, "mime_type": "audio/pcm"})
-    
-            # --- CAS 3 : VEILLE (ATTENTE MOT CLÉ) ---
-            else:
-                pcm_unpacked = struct.unpack_from("h" * frame_length, pcm_amplified)
-                if self.porcupine.process(pcm_unpacked) >= 0:
-                    
-                    if volume_level < WAKE_MIN_VOLUME:
-                        print(f">>> [IGNORE] Faux positif rejeté (Vol: {volume_level:.0f} < {WAKE_MIN_VOLUME})")
-                        continue
-                    
-                    print(f">>> [WAKE] 'Cypher' validé ! (Volume: {volume_level:.0f})")
-                    
-                    # --- JOUER SON MP3 ---
-                    if os.path.exists(self.wake_sound_path):
-                        try:
-                            pygame.mixer.music.load(self.wake_sound_path)
-                            pygame.mixer.music.play()
-                        except Exception as e:
-                            print(f">>> [ERREUR SON] : {e}")
-                    else:
-                        winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
-                    
-                    self.gui_queue.put(("STATUS", "listening"))
-                    self.conversation_active = True
-                    self.last_interaction_time = time.time()
-                    
-                    while len(audio_buffer) > 0:
-                        buffered = audio_buffer.popleft()
-                        await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
+                
+                # --- PROTECTION : ON N'ENVOIE PAS SI CYPHER PARLE ---
+                if not self.is_busy and not self.is_speaking: 
+                    await self.out_queue_gemini.put({"data": pcm_final, "mime_type": "audio/pcm"})
 
     @staticmethod
     def _shorten_for_tts(text: str) -> str:
@@ -3343,14 +3363,16 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 self.last_interaction_time = time.time()
 
             except Exception as e:
-                # Si c'est une erreur 1011 ou une déconnexion, on provoque une erreur pour relancer run()
-                if "1011" in str(e) or "unavailable" in str(e).lower():
-                    print("\n>>> [WARN] Session expirée. Redémarrage immédiat...")
-                    raise ConnectionResetError("Session expirée")
+                error_str = str(e).lower()
+                if "1011" in error_str or "unavailable" in error_str or "connection" in error_str or "deadline" in error_str:
+                    print(f"\n>>> [WARN] Session expirée: {e}")
+                    self.needs_reconnect = True
+                    return  # Sortir proprement au lieu de raise
                 
                 print(f"\n>>> [ERROR in receive_text]: {e}")
-                await asyncio.sleep(1) # On attend un peu plus longtemps pour éviter le spam violent
-                break # Par sécurité, on sort de la boucle pour relancer une connexion propre
+                traceback.print_exc()
+                self.needs_reconnect = True
+                return  # Sortir proprement
 
     async def tts(self):
         """
@@ -3529,61 +3551,134 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             except:
                 pass
 
-    
+    def _cleanup_queues(self):
+        """Vide toutes les queues pour repartir sur une base propre après reconnexion"""
+        print(">>> [CLEANUP] Nettoyage des queues audio...")
+        
+        # Vider la queue TTS
+        if self.response_queue_tts:
+            while not self.response_queue_tts.empty():
+                try:
+                    self.response_queue_tts.get_nowait()
+                    self.response_queue_tts.task_done()
+                except:
+                    break
+        
+        # Vider la queue Player
+        if self.audio_in_queue_player:
+            while not self.audio_in_queue_player.empty():
+                try:
+                    self.audio_in_queue_player.get_nowait()
+                    self.audio_in_queue_player.task_done()
+                except:
+                    break
+        
+        # Vider la queue Gemini
+        if self.out_queue_gemini:
+            while not self.out_queue_gemini.empty():
+                try:
+                    self.out_queue_gemini.get_nowait()
+                    self.out_queue_gemini.task_done()
+                except:
+                    break
+        
+        # Reset des états
+        self.is_speaking = False
+        self.is_busy = False
+        
+        print(">>> [CLEANUP] ✅ Queues vidées, prêt pour reconnexion")
 
     async def run(self):
         import websockets
-        # Boucle de reconnexion infinie
+        reconnect_delay = 2
+        max_delay = 30
+        
         while True:
+            self.needs_reconnect = False
+            
             try:
-                print(">>> [CONNEXION] Tentative de connexion à Gemini...")
+                print(f">>> [CONNEXION] Tentative de connexion à Gemini...")
+                self.session = None
+                
                 async with self.client.aio.live.connect(model=MODEL, config=self.config) as session:
                     self.session = session
                     self.out_queue_gemini = asyncio.Queue(maxsize=20)
                     
-                    # On ne recrée pas ces queues si elles existent déjà pour ne pas perdre le TTS en cours
                     if self.response_queue_tts is None:
                         self.response_queue_tts = asyncio.Queue()
                     if self.audio_in_queue_player is None:
                         self.audio_in_queue_player = asyncio.Queue()
 
-                    print(">>> [INFO] Connecté ! Starting tasks...")
+                    print(">>> [INFO] ✅ Connecté !")
+                    self.gui_queue.put(("STATUS", "idle"))
+                    print(">>> [INIT] Lancement du briefing de démarrage...")
+                    
+                    # On construit un prompt invisible pour forcer le briefing
+                    boot_prompt = (
+                        "Système initialisé. Tu viens de démarrer. "
+                        "Fais un accueil très court et stylé (style J.A.R.V.I.S). "
+                        "Donne l'heure actuelle, la météo locale rapide, et vérifie s'il y a des mails non lus ou des RDV aujourd'hui. "
+                        "Sois concis et efficace."
+                    )
+                    
+                    # On l'injecte directement dans le cerveau
+                    await self.out_queue_gemini.put({"data": boot_prompt, "mime_type": "text/plain"})
+                    reconnect_delay = 2
 
-                    async with asyncio.TaskGroup() as tg:
-                        tg.create_task(self.listen_audio())
-                        tg.create_task(self.send_realtime())
-                        tg.create_task(self.receive_text())
-                        tg.create_task(self.tts())
-                        tg.create_task(self.play_audio())
-                        tg.create_task(self.timer_watcher())
-                        tg.create_task(self.agenda_watcher())
+                    try:
+                        async with asyncio.TaskGroup() as tg:
+                            tg.create_task(self.listen_audio())
+                            tg.create_task(self.send_realtime())
+                            tg.create_task(self.receive_text())
+                            tg.create_task(self.tts())
+                            tg.create_task(self.play_audio())
+                            tg.create_task(self.timer_watcher())
+                            tg.create_task(self.agenda_watcher())
+                    except* (websockets.exceptions.ConnectionClosed,
+                            websockets.exceptions.ConnectionClosedError,
+                            ConnectionResetError) as eg:
+                        print(f"\n>>> [RECONNECT] Connexion perdue (group): {eg}")
+                        self.needs_reconnect = True
+                    except* Exception as eg:
+                        print(f"\n>>> [RECONNECT] Erreur TaskGroup: {eg}")
+                        self.needs_reconnect = True
 
-                        # Si une tâche plante (ex: déconnexion), le TaskGroup se ferme
-                        # et on sort du bloc 'async with', ce qui nous ramène à la boucle while True
-            
             except asyncio.CancelledError:
-                print("\n>>> [INFO] Arrêt manuel demandé.")
-                break # On sort vraiment si c'est toi qui arrête
+                print("\n>>> [INFO] Arrêt manuel.")
+                break
             
-            except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
-                print(f"\n>>> [RECONNECT] Connexion perdue ({e}). Reconnexion dans 2s...")
-                await asyncio.sleep(2)
-                continue # On recommence la boucle
+            except (websockets.exceptions.ConnectionClosed, 
+                    websockets.exceptions.ConnectionClosedError,
+                    ConnectionResetError) as e:
+                print(f"\n>>> [RECONNECT] Connexion perdue: {e}")
+                self.needs_reconnect = True
             
             except Exception as e:
-                print(f"\n>>> [CRASH] Erreur inattendue : {e}")
+                print(f"\n>>> [ERROR] Erreur inattendue: {e}")
                 traceback.print_exc()
-                print(">>> [RETRY] Tentative de redémarrage dans 5s...")
-                await asyncio.sleep(5)
-                continue
+                self.needs_reconnect = True
             
             finally:
-                if self.audio_stream and self.audio_stream.is_active():
+                self.session = None
+                if self.audio_stream:
                     try:
-                        self.audio_stream.stop_stream()
+                        if self.audio_stream.is_active():
+                            self.audio_stream.stop_stream()
                         self.audio_stream.close()
                     except:
                         pass
+            
+            # Reconnexion si nécessaire
+            if self.needs_reconnect:
+                print(f">>> [RECONNECT] Reconnexion dans {reconnect_delay}s...")
+                self._cleanup_queues()
+                self.gui_queue.put(("STATUS", "reconnecting"))
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.5, max_delay)
+                continue
+            else:
+                break
+
 
 
 FUNCTION_MAP = {
