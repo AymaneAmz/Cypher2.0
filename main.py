@@ -24,9 +24,12 @@ import queue
 import threading
 from gui import CypherGUI
 import pygame
-import openwakeword
-from openwakeword.model import Model
+# OpenWakeWord supprimé - on utilise uniquement SpeechBrain
 import numpy as np
+import torch
+from speechbrain.inference import EncoderClassifier
+from collections import deque
+
 
 
 from dotenv import load_dotenv
@@ -50,7 +53,7 @@ AZURE_VOICE_NAME = "fr-FR-HenriNeural"
 PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
 PYTHON_EXECUTION_LOG = []   # Historique des exécutions
 
-WAKE_WORD_SENSITIVITY = 0.001
+WAKE_WORD_SENSITIVITY = 0.5
 WAKE_MIN_VOLUME = 0
 
 TTS_RATE = "+15%"
@@ -165,33 +168,47 @@ class AudioLoop:
         self.audio_stream = None
         self.is_speaking = False
         self.is_busy = False
+        self._interrupted_flag = False  # Flag pour annuler les tool calls en cours
         self.client = genai.Client(api_key=GEMINI_API_KEY)
 
         pygame.mixer.init() # On allume le moteur audio
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.wake_sound_path = os.path.join(script_dir, "wake.mp3")
         self.end_sound_path = os.path.join(script_dir, "end_listening.mp3")
-        
-        self.oww_model = None
-        try:
-            # On cherche Cypher.onnx dans le dossier du script
-            model_path = os.path.join(script_dir, "Cypher.onnx")
-            
-            if os.path.exists(model_path):
-                # Chargement du modèle
-                self.oww_model = Model(
-                    wakeword_models=[model_path], 
-                    inference_framework="onnx"
-                )
-                print(f">>> [INIT] Wake Word 'Cypher' chargé via OpenWakeWord !")
-            else:
-                print(f">>> [ERREUR] Fichier 'Cypher.onnx' introuvable dans {script_dir}")
-                print(">>> Veuillez copier le fichier Cypher.onnx à côté de main.py")
-                sys.exit(1)
-                
-        except Exception as e:
-            print(f"\n>>> [ERREUR FATALE OPENWAKEWORD] : {e}")
+
+        # Chargement du modèle SpeechBrain pour la détection du wake word "Sayfeure"
+        self.sb_classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cpu"}  # Change en "cuda" si tu as une GPU
+        )
+
+        # Charger l'embedding du wake word (généré par train_wakeword.py)
+        embedding_path = os.path.join(script_dir, "wakeword_embedding.npy")
+        if not os.path.exists(embedding_path):
+            print(f">>> [ERREUR] Fichier wakeword_embedding.npy introuvable dans {script_dir}")
+            print(">>> Exécute train_wakeword.py pour générer l'embedding à partir des fichiers vocab/")
             sys.exit(1)
+        
+        self.sb_target = np.load(embedding_path).astype(np.float32)
+
+        # paramètres detection (à peaufiner)
+        self.sb_sr = 16000
+        self.sb_window_sec = 1.0
+        self.sb_hop_sec = 0.25
+        self.sb_trigger_threshold = 0.5      # tu l’as dit: ton Cypher est ~0.48–0.60
+        self.sb_min_rms = 0.030               # ignore silence/bruit bas
+        self.sb_need_hits = 3                 # “3 hits sur les derniers frames”
+        self.sb_cooldown_sec = 1.2            # évite double trigger
+
+        # états internes
+        self.sb_audio_buf = deque(maxlen=int(self.sb_sr * self.sb_window_sec))
+        self.sb_hits = deque(maxlen=5)
+        self.sb_last_trigger = 0.0
+        
+        # Variables d'état pour la détection du wake word
+        self._wake_hit_count = 0
+        self.WAKE_THRESHOLD = 0.42  # Seuil de similitude cosine (abaissé pour meilleure détection)
+        self.WAKE_MIN_RMS = 0.020   # Seuil minimum de volume (légèrement abaissé)
 
         # Variables d'état pour la conversation
         self.conversation_active = False
@@ -2998,11 +3015,17 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             except Exception as e:
                 print(f">>> [ERROR in timer_watcher]: {e}")
                 await asyncio.sleep(1)
-                
+    
+    def _sb_cosine(self, a: np.ndarray, b: np.ndarray) -> float:
+        a = a.astype(np.float32)
+        b = b.astype(np.float32)
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
     def _interrupt_playback(self):
         """KILL SWITCH : Coupe la parole instantanément et FORCE l'écoute."""
         # --- FIX CRITIQUE : On débloque le cerveau immédiatement ---
-        self.is_busy = False 
+        self.is_busy = False
+        self._interrupted_flag = True  # Marquer qu'on a été interrompu
         
         if self.is_speaking:
             print(">>> [INTERRUPTION] Wake word détecté - Cypher se tait !")
@@ -3074,141 +3097,202 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         except asyncio.CancelledError:
             pass
     
-    
 
     async def listen_audio(self):
-        import struct
+        """Écoute le microphone et détecte le wake word 'Sayfeure' avec SpeechBrain"""
         import numpy as np
         from collections import deque
         import winsound
-        from scipy import signal
+        import pyaudio
         
-        # Configuration OpenWakeWord
-        OWW_CHUNK_SIZE = 1280
-        TARGET_RATE = 16000
+        target_device_index = 1  # Index du micro (ajuste si nécessaire)
+        sample_rate = 16000
+        chunk_size = 4000  # ~250ms à 16kHz
         
-        # --- CONFIGURATION DU MICRO (JABRA) ---
-        target_device_index = 1 
+        print(">>> [AUDIO] Initialisation du micro pour la détection du wake word...")
         
-        # 1. Récupération fréquence native
-        try:
-            dev_info = pya.get_device_info_by_index(target_device_index)
-            native_rate = int(dev_info.get('defaultSampleRate', 44100))
-        except Exception as e:
-            print(f">>> [ERREUR AUDIO] : {e}")
-            return
-
-        # 2. Calcul ratio
-        resample_ratio = native_rate / TARGET_RATE
-        read_size = int(OWW_CHUNK_SIZE * resample_ratio)
-        
-        # Ouverture du flux
         try:
             self.audio_stream = await asyncio.to_thread(
                 pya.open, 
-                format=FORMAT, 
-                channels=CHANNELS, 
-                rate=native_rate, 
+                format=pyaudio.paInt16, 
+                channels=1, 
+                rate=sample_rate, 
                 input=True, 
                 input_device_index=target_device_index, 
-                frames_per_buffer=read_size
+                frames_per_buffer=chunk_size
             )
         except Exception as e:
-            print(f">>> [ERREUR AUDIO FATALE] : {e}")
+            print(f">>> [ERREUR AUDIO] Impossible d'ouvrir le micro : {e}")
             return
         
-        audio_buffer = deque(maxlen=50)
-        print(f">>> [VEILLE] En écoute de 'Cypher'... (Seuil Réveil: {WAKE_WORD_SENSITIVITY})")
+        # Buffer audio pour accumuler ~1 seconde d'audio
+        audio_deque = deque(maxlen=4)  # ~1 seconde à 16kHz
+        last_detection_time = 0
+        cooldown_sec = 1.0  # Temps minimum entre deux détections (réduit pour plus de réactivité)
+        barge_in_skip_counter = 0  # Compteur pour traiter moins souvent pendant que Cypher parle
         
-        # --- PROTECTION ANTI-ECHO (Barge-In) ---
-        # On ajuste à 0.84 (juste au-dessus de ton écho max de 0.825)
-        BARGE_IN_THRESHOLD = 0.001
+        print(">>> [READY] Écoute active - dis 'Sayfeure' pour activer (barge-in activé)")
         
         while True:
             try:
-                pcm = await asyncio.to_thread(
+                # Lecture du micro
+                data = await asyncio.to_thread(
                     self.audio_stream.read, 
-                    read_size, 
+                    chunk_size, 
                     exception_on_overflow=False
                 )
-            except:
-                continue
-            
-            # Conversion & Resample
-            audio_array = np.frombuffer(pcm, dtype=np.int16)
-            if native_rate != TARGET_RATE:
-                audio_array = signal.resample(audio_array, OWW_CHUNK_SIZE).astype(np.int16)
-            
-            volume_level = np.abs(audio_array).mean()
-            pcm_final = audio_array.tobytes()
-            audio_buffer.append(pcm_final)
-            
-            # --- PRÉDICTION WAKE WORD ---
-            if self.oww_model:
-                prediction = self.oww_model.predict(audio_array)
-                cypher_score = prediction.get("Cypher", 0.0)
                 
-                # DEBUG : Affiche le score si > 0.5 pour voir ce qui se passe
-                if cypher_score > 0.001:
-                     state = "[PARLE]" if self.is_speaking else "[VEILLE]"
-                     print(f"🎤 {state} Score: {cypher_score:.3f} (Seuil Interruption: {BARGE_IN_THRESHOLD})")
+                # Convertir en float32 normalisé [-1, 1]
+                np_data = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                audio_deque.append(np_data)
                 
-                # --- CAS 1 : INTERRUPTION (Barge-in AJUSTÉ) ---
+                # Si Cypher parle, on traite moins souvent pour économiser CPU
+                # mais on continue d'écouter pour permettre le barge-in
                 if self.is_speaking:
-                    # On coupe SEULEMENT si le score dépasse le seuil anti-écho
-                    if cypher_score >= BARGE_IN_THRESHOLD:
-                        if volume_level > WAKE_MIN_VOLUME:
-                            print(f">>> [INTERRUPTION] Score {cypher_score:.3f} >= {BARGE_IN_THRESHOLD} -> Arrêt.")
-                            self._interrupt_playback()
-                            self.conversation_active = True
-                            self.last_interaction_time = time.time()
-                            
-                            while audio_buffer:
-                                buffered = audio_buffer.popleft()
-                                await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
+                    barge_in_skip_counter += 1
+                    # Traiter seulement 1 fois sur 3 pour économiser CPU
+                    if barge_in_skip_counter < 3:
+                        continue
+                    barge_in_skip_counter = 0
+                else:
+                    barge_in_skip_counter = 0
+                
+                # Il faut au moins 3 chunks pour analyser (~750ms)
+                if len(audio_deque) < 3:
+                    continue
+                
+                # Concaténer les chunks pour avoir une fenêtre d'analyse
+                live_audio = np.concatenate(list(audio_deque))
+                
+                # Calculer le RMS (volume moyen)
+                rms = float(np.sqrt(np.mean(np_data ** 2) + 1e-12))
+                
+                # Si Cypher parle, on utilise un seuil RMS plus élevé pour éviter les faux positifs
+                # (sa propre voix ne doit pas déclencher le wake word)
+                min_rms_threshold = self.WAKE_MIN_RMS * 2.0 if self.is_speaking else self.WAKE_MIN_RMS
+                
+                # Ignorer le silence/bruit faible
+                if rms < min_rms_threshold:
+                    score = 0.0
+                    is_detected = False
+                else:
+                    # Convertir en tensor pour SpeechBrain
+                    audio_tensor = torch.tensor(live_audio, dtype=torch.float32).unsqueeze(0)  # [1, T]
+                    
+                    # Générer l'embedding avec SpeechBrain
+                    with torch.no_grad():
+                        emb = self.sb_classifier.encode_batch(audio_tensor).squeeze().cpu().numpy()
+                    
+                    # Calculer la similarité cosine avec l'embedding cible
+                    score = self._sb_cosine(emb, self.sb_target)
+                    
+                    # Détection plus réactive : 1 seul hit suffit (au lieu de 2)
+                    # Cela rend la détection plus immédiate et fiable
+                    if score >= self.WAKE_THRESHOLD:
+                        self._wake_hit_count = 1  # On met directement à 1 pour déclencher
+                        is_detected = True
+                    else:
+                        self._wake_hit_count = 0
+                        is_detected = False
+                    
+                    # Debug : afficher les scores élevés pour calibration
+                    if score > 0.35:  # Afficher seulement les scores intéressants
+                        print(f">>> [WAKE-DEBUG] Score: {score:.3f}, RMS: {rms:.3f}, Threshold: {self.WAKE_THRESHOLD}")
+                
+                current_time = time.time()
+                
+                # Détection du wake word
+                if is_detected and (current_time - last_detection_time > cooldown_sec):
+                    # BARGE-IN : Si Cypher parle ou travaille, on l'interrompt immédiatement
+                    if self.is_speaking or self.is_busy:
+                        print(f">>> [BARGE-IN] Sayfeure détecté pendant la parole/travail - Interruption ! (Score: {score:.3f})")
+                        self._interrupt_playback()
+                        # Activer la conversation immédiatement
+                        self.conversation_active = True
+                        self.last_interaction_time = time.time()
+                        last_detection_time = current_time
+                        # Son de confirmation
+                        if os.path.exists(self.wake_sound_path):
+                            try:
+                                pygame.mixer.music.load(self.wake_sound_path)
+                                pygame.mixer.music.play()
+                            except:
+                                pass
+                        # Envoyer l'audio actuel à Gemini (après l'interruption, is_busy est False)
+                        pcm_buffer = (live_audio * 32767).astype(np.int16).tobytes()
+                        await self.out_queue_gemini.put({
+                            "data": pcm_buffer, 
+                            "mime_type": "audio/pcm"
+                        })
+                        # On vide le buffer pour repartir proprement
+                        audio_deque.clear()
                         continue
                     
-                    # Sinon, on ignore (c'est probablement de l'écho)
-                
-                # --- CAS 2 : RÉVEIL (Wake word classique) ---
-                elif not self.conversation_active and cypher_score >= WAKE_WORD_SENSITIVITY:
-                    if volume_level > WAKE_MIN_VOLUME:
-                        print(f">>> [WAKE] 'Cypher' détecté ! (Score: {cypher_score:.3f})")
+                    # Activation normale (quand Cypher ne parle pas)
+                    if not self.conversation_active:
+                        print(f">>> [WAKE] Sayfeure détecté ! (Score: {score:.3f}, RMS: {rms:.3f})")
                         
+                        # Son de confirmation
                         if os.path.exists(self.wake_sound_path):
-                            try: pygame.mixer.music.load(self.wake_sound_path); pygame.mixer.music.play()
-                            except: pass
-                        else: 
-                            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                            try:
+                                pygame.mixer.music.load(self.wake_sound_path)
+                                pygame.mixer.music.play()
+                            except:
+                                pass
+                        else:
+                            try:
+                                winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                            except:
+                                pass
                         
+                        # Activer la conversation
                         self.gui_queue.put(("STATUS", "listening"))
                         self.conversation_active = True
                         self.last_interaction_time = time.time()
+                        last_detection_time = current_time
                         
-                        while audio_buffer:
-                            buffered = audio_buffer.popleft()
-                            await self.out_queue_gemini.put({"data": buffered, "mime_type": "audio/pcm"})
-                    continue
+                        # Envoyer l'audio actuel à Gemini (qui contient le wake word)
+                        pcm_buffer = (live_audio * 32767).astype(np.int16).tobytes()
+                        if not self.is_busy:
+                            await self.out_queue_gemini.put({
+                                "data": pcm_buffer, 
+                                "mime_type": "audio/pcm"
+                            })
+                
+                # Gestion de la conversation active
+                if self.conversation_active:
+                    # Détecter si l'utilisateur parle encore
+                    vol = np.abs(np_data).mean()
+                    if vol > 0.01:
+                        self.last_interaction_time = time.time()
+                    
+                    # Timeout après silence
+                    if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy:
+                        print(">>> [SLEEP] Silence détecté, retour en veille.")
+                        if os.path.exists(self.end_sound_path):
+                            try:
+                                pygame.mixer.music.load(self.end_sound_path)
+                                pygame.mixer.music.play()
+                            except:
+                                pass
+                        self.gui_queue.put(("STATUS", "idle"))
+                        self.conversation_active = False
+                        audio_deque.clear()
+                        continue
+                    
+                    # Envoyer l'audio à Gemini pendant la conversation
+                    if not self.is_busy:
+                        await self.out_queue_gemini.put({
+                            "data": data, 
+                            "mime_type": "audio/pcm"
+                        })
             
-            # --- CAS 3 : CONVERSATION ACTIVE ---
-            if self.conversation_active:
-                if volume_level > 200:
-                    self.last_interaction_time = time.time()
-                
-                if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy:
-                    print(">>> [SLEEP] Silence prolongé.")
-                    if os.path.exists(self.end_sound_path):
-                        try: pygame.mixer.music.load(self.end_sound_path); pygame.mixer.music.play()
-                        except: pass
-                    self.gui_queue.put(("STATUS", "idle"))
-                    self.conversation_active = False
-                    if self.oww_model: self.oww_model.reset()
-                    audio_buffer.clear()
-                    continue
-                
-                # --- PROTECTION : ON N'ENVOIE PAS SI CYPHER PARLE ---
-                if not self.is_busy and not self.is_speaking: 
-                    await self.out_queue_gemini.put({"data": pcm_final, "mime_type": "audio/pcm"})
+            except Exception as e:
+                # En cas d'erreur, on continue pour éviter de planter
+                print(f">>> [ERREUR dans listen_audio] : {e}")
+                await asyncio.sleep(0.1)
+                continue
+
 
     @staticmethod
     def _shorten_for_tts(text: str) -> str:
@@ -3249,6 +3333,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     if hasattr(chunk, "tool_call") and chunk.tool_call:
                         # 🔒 ON VERROUILLE : Cypher commence à travailler
                         self.is_busy = True
+                        self._interrupted_flag = False  # Réinitialiser le flag d'interruption
                         
                         function_calls = chunk.tool_call.function_calls
                         if function_calls:
@@ -3256,6 +3341,12 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             for fc in function_calls:
                                 fname = fc.name
                                 args = dict(fc.args or {})
+                                
+                                # Vérifier si on a été interrompu avant même de commencer
+                                if self._interrupted_flag:
+                                    print(f">>> [INTERRUPTION] Tool {fname} annulé avant exécution (interruption en cours)")
+                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
+                                    continue
                                 
                                 # 1. FEEDBACK VISUEL
                                 if fname in ["execute_python", "document_manager", "google_search", "file_manager"]:
@@ -3271,34 +3362,57 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                     self.is_speaking = True # Active l'animation de l'orbe
                                     await self.response_queue_tts.put(phrase)
                                 
-                                # 3. EXECUTION DE L'OUTIL (Reste inchangé)
+                                # 3. EXECUTION DE L'OUTIL
                                 if fname not in FUNCTION_MAP:
                                     tool_responses.append({"id": fc.id, "name": fname, "response": {"error": f"Function {fname} not implemented"}})
                                     continue
-                                try:
-                                    # Exécution de l'outil
-                                    result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
-                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
-                                except Exception as e:
-                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
                                 
-                                if fname not in FUNCTION_MAP:
-                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": f"Function {fname} not implemented"}})
-                                    continue
                                 try:
                                     # Exécution de l'outil
                                     result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
-                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
+                                    
+                                    # Si on a été interrompu pendant l'exécution, on annule l'envoi
+                                    if self._interrupted_flag:
+                                        print(f">>> [INTERRUPTION] Tool {fname} annulé suite à l'interruption pendant l'exécution")
+                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
+                                    else:
+                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
                                 except Exception as e:
-                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
+                                    # Même si une exception se produit, on ajoute l'erreur (sauf si interrompu)
+                                    if not self._interrupted_flag:
+                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
+                                    else:
+                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
                             
-                            # Envoi des résultats à Gemini
-                            if tool_responses:
-                                await self.session.send_tool_response(function_responses=tool_responses)
+                            # Construire les réponses finales : si interrompu, on envoie uniquement des annulations
+                            was_interrupted = self._interrupted_flag
+                            if self._interrupted_flag:
+                                # Si interrompu, on remplace toutes les réponses par des annulations
+                                final_responses = [{"id": fc.id, "name": fc.name, "response": {"error": "Operation cancelled by user interruption"}} for fc in function_calls]
+                                print(f">>> [INTERRUPTION] Envoi de {len(final_responses)} réponse(s) d'annulation à Gemini pour débloquer la session")
+                            else:
+                                final_responses = tool_responses
                             
-                            # 🔓 ON DEVERROUILLE : Cypher a fini ce tool
+                            # Toujours envoyer une réponse à Gemini pour débloquer la session
+                            if final_responses:
+                                try:
+                                    await self.session.send_tool_response(function_responses=final_responses)
+                                    print(f">>> [TOOL] Réponse(s) envoyée(s) à Gemini ({len(final_responses)} tool(s)) - Session débloquée")
+                                except Exception as e:
+                                    print(f">>> [ERREUR] Impossible d'envoyer la réponse tool à Gemini: {e}")
+                            
+                            # 🔓 ON DEVERROUILLE : Cypher a fini ce tool (ou a été interrompu)
                             self.is_busy = False
                             self.last_interaction_time = time.time() # On remet le chrono à zéro
+                            
+                            # Si on a été interrompu, on reset le flag pour la prochaine fois
+                            # IMPORTANT: On reset le flag APRÈS avoir envoyé la réponse pour éviter les race conditions
+                            if was_interrupted:
+                                print(f">>> [INTERRUPTION] Reset du flag d'interruption - prêt pour nouvelle interaction")
+                                self._interrupted_flag = False
+                                
+                                # Forcer un petit délai pour s'assurer que Gemini a bien reçu la réponse
+                                await asyncio.sleep(0.1)
                         continue
 
                     if hasattr(chunk, "server_content") and chunk.server_content:
