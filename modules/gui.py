@@ -69,6 +69,11 @@ class CypherGUI(ctk.CTk):
         self.agent_vision_photo = None
         self.agent_vision_logs = deque(maxlen=50)  # Historique des logs
         
+        # Task Master Dashboard
+        self.tasks_dashboard_window = None
+        self.tasks_scrollable_frame = None
+        self.tasks_widgets = {}  # Dictionnaire pour stocker les widgets de tâches
+        
         # Statistiques pour graphiques
         self.cpu_history = deque(maxlen=50)
         self.ram_history = deque(maxlen=50)
@@ -130,6 +135,9 @@ class CypherGUI(ctk.CTk):
                 elif msg_type == "AGENT_VIEW_UPDATE":
                     # Reçoit une mise à jour de l'agent web (streaming optimisé)
                     self._update_agent_vision(content)
+                elif msg_type == "TASKS_UPDATE":
+                    # Reçoit une mise à jour des tâches
+                    self._update_tasks_dashboard(content)
         except queue.Empty:
             pass
         self.after(50, self.check_queue)
@@ -613,7 +621,14 @@ class CypherGUI(ctk.CTk):
                                    fg_color=JARVIS_CYAN_DIM, hover_color=JARVIS_BORDER,
                                    text_color=JARVIS_GREEN, font=("Arial", 14),
                                    corner_radius=8, command=self._export_conversation)
-        export_btn.pack(side="left")
+        export_btn.pack(side="left", padx=(0, 5))
+        
+        # Bouton Task Master
+        tasks_btn = ctk.CTkButton(btns_frame, text="✓", width=35, height=35,
+                                  fg_color=JARVIS_CYAN_DIM, hover_color=JARVIS_BORDER,
+                                  text_color=JARVIS_PURPLE, font=("Arial", 16, "bold"),
+                                  corner_radius=8, command=self._show_tasks_dashboard)
+        tasks_btn.pack(side="left")
         
         # Barre de recherche (cachée par défaut)
         self.search_frame = ctk.CTkFrame(conv_frame, fg_color="transparent")
@@ -1383,6 +1398,280 @@ class CypherGUI(ctk.CTk):
                 print(f"Erreur mise à jour Agent Vision: {e}")
             if self.agent_vision_log_text:
                 self._add_log_to_console(f"❌ Erreur: {e}", "error")
+    
+    # ========================================
+    # TASK MASTER DASHBOARD
+    # ========================================
+    
+    def _create_tasks_dashboard(self):
+        """Crée la fenêtre du dashboard Task Master"""
+        if self.tasks_dashboard_window is not None:
+            return
+        
+        # Créer une fenêtre Toplevel
+        self.tasks_dashboard_window = ctk.CTkToplevel(self)
+        self.tasks_dashboard_window.title("TASK MASTER - Mission Control")
+        self.tasks_dashboard_window.geometry("1200x800")
+        self.tasks_dashboard_window.configure(fg_color=JARVIS_BG)
+        
+        # Empêcher la fermeture complète (juste masquer)
+        self.tasks_dashboard_window.protocol("WM_DELETE_WINDOW", self._hide_tasks_dashboard)
+        
+        # Header
+        header = ctk.CTkFrame(self.tasks_dashboard_window, fg_color=JARVIS_PANEL_BG, 
+                             corner_radius=0, border_width=0, border_color=JARVIS_BORDER)
+        header.pack(fill="x", padx=0, pady=0)
+        header.grid_columnconfigure(1, weight=1)
+        
+        header_inner = ctk.CTkFrame(header, fg_color="transparent")
+        header_inner.pack(fill="x", padx=20, pady=15)
+        header_inner.grid_columnconfigure(1, weight=1)
+        
+        # Logo et titre
+        title_frame = ctk.CTkFrame(header_inner, fg_color="transparent")
+        title_frame.grid(row=0, column=0, sticky="w")
+        
+        ctk.CTkLabel(title_frame, text="✓", font=("Arial", 32, "bold"), 
+                    text_color=JARVIS_PURPLE).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(title_frame, text="TASK MASTER", font=("Consolas", 28, "bold"), 
+                    text_color=JARVIS_CYAN).pack(side="left")
+        ctk.CTkLabel(title_frame, text="Mission Control", font=("Arial", 14), 
+                    text_color=JARVIS_TEXT_DIM).pack(side="left", padx=(10, 0))
+        
+        # Boutons header
+        btn_frame = ctk.CTkFrame(header_inner, fg_color="transparent")
+        btn_frame.grid(row=0, column=1, sticky="e")
+        
+        refresh_btn = ctk.CTkButton(btn_frame, text="🔄", width=40, height=40,
+                                    fg_color=JARVIS_CYAN_DIM, hover_color=JARVIS_BORDER,
+                                    text_color=JARVIS_CYAN, font=("Arial", 16),
+                                    corner_radius=8, command=self._refresh_tasks_dashboard)
+        refresh_btn.pack(side="left", padx=(0, 5))
+        
+        close_btn = ctk.CTkButton(btn_frame, text="✕", width=40, height=40,
+                                 fg_color=JARVIS_CYAN_DIM, hover_color=JARVIS_RED,
+                                 text_color=JARVIS_TEXT, font=("Arial", 16),
+                                 corner_radius=8, command=self._hide_tasks_dashboard)
+        close_btn.pack(side="left")
+        
+        # Contenu principal
+        main_container = ctk.CTkFrame(self.tasks_dashboard_window, fg_color="transparent")
+        main_container.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        main_container.grid_rowconfigure(0, weight=1)
+        main_container.grid_columnconfigure(0, weight=1)
+        
+        # Frame scrollable pour les tâches
+        self.tasks_scrollable_frame = ctk.CTkScrollableFrame(
+            main_container,
+            fg_color=JARVIS_PANEL_BG,
+            corner_radius=15,
+            border_width=1,
+            border_color=JARVIS_BORDER
+        )
+        self.tasks_scrollable_frame.grid(row=0, column=0, sticky="nsew")
+        self.tasks_scrollable_frame.grid_columnconfigure(0, weight=1)
+        
+        # Charger les tâches initiales
+        self._refresh_tasks_dashboard()
+    
+    def _hide_tasks_dashboard(self):
+        """Masque la fenêtre Task Master (sans la détruire)"""
+        if self.tasks_dashboard_window:
+            self.tasks_dashboard_window.withdraw()
+    
+    def _show_tasks_dashboard(self):
+        """Affiche la fenêtre Task Master"""
+        if self.tasks_dashboard_window is None:
+            self._create_tasks_dashboard()
+        self.tasks_dashboard_window.deiconify()
+        self.tasks_dashboard_window.lift()
+        self._refresh_tasks_dashboard()
+    
+    def _refresh_tasks_dashboard(self):
+        """Rafraîchit l'affichage des tâches depuis le TaskManager"""
+        try:
+            from modules.task_manager import get_task_manager
+            task_mgr = get_task_manager()
+            tasks = task_mgr.list_tasks()
+            self._update_tasks_dashboard({"tasks": tasks})
+        except Exception as e:
+            print(f"Erreur lors du rafraîchissement des tâches: {e}")
+    
+    def _update_tasks_dashboard(self, data: Dict[str, Any]):
+        """
+        Met à jour l'affichage du dashboard avec les nouvelles tâches.
+        data doit contenir {"tasks": [...]}
+        """
+        if not self.tasks_scrollable_frame:
+            return
+        
+        try:
+            tasks = data.get("tasks", [])
+            
+            # Supprimer les anciens widgets
+            for widget in self.tasks_scrollable_frame.winfo_children():
+                widget.destroy()
+            self.tasks_widgets.clear()
+            
+            if not tasks:
+                # Message vide
+                empty_frame = ctk.CTkFrame(self.tasks_scrollable_frame, fg_color="transparent")
+                empty_frame.pack(fill="x", padx=20, pady=50)
+                
+                ctk.CTkLabel(empty_frame, text="📋", font=("Arial", 48), 
+                            text_color=JARVIS_TEXT_DIM).pack(pady=(0, 10))
+                ctk.CTkLabel(empty_frame, text="Aucune tâche", 
+                            font=("Arial", 18, "bold"), 
+                            text_color=JARVIS_TEXT_DIM).pack()
+                ctk.CTkLabel(empty_frame, text="Créez une tâche avec Cypher", 
+                            font=("Arial", 12), 
+                            text_color=JARVIS_TEXT_DIM).pack()
+                return
+            
+            # Afficher chaque tâche
+            for task in tasks:
+                self._create_task_widget(task)
+        
+        except Exception as e:
+            print(f"Erreur lors de la mise à jour du dashboard: {e}")
+    
+    def _create_task_widget(self, task: Dict[str, Any]):
+        """Crée un widget pour une tâche"""
+        task_id = task.get('id', '')
+        
+        # Couleurs selon priorité
+        priority_colors = {
+            "critical": JARVIS_RED,
+            "high": JARVIS_ORANGE,
+            "medium": JARVIS_YELLOW,
+            "low": JARVIS_GREEN
+        }
+        priority_color = priority_colors.get(task.get('priority', 'medium'), JARVIS_YELLOW)
+        
+        # Frame de la tâche
+        task_frame = ctk.CTkFrame(
+            self.tasks_scrollable_frame,
+            fg_color=JARVIS_CYAN_DIM,
+            corner_radius=12,
+            border_width=1,
+            border_color=priority_color
+        )
+        task_frame.pack(fill="x", padx=10, pady=8)
+        task_frame.grid_columnconfigure(1, weight=1)
+        
+        # Colonne gauche : Icônes et priorité
+        left_col = ctk.CTkFrame(task_frame, fg_color="transparent")
+        left_col.grid(row=0, column=0, sticky="n", padx=(15, 10), pady=12)
+        
+        # Icône priorité
+        priority_icons = {
+            "critical": "🔴",
+            "high": "🟠",
+            "medium": "🟡",
+            "low": "🟢"
+        }
+        priority_icon = priority_icons.get(task.get('priority', 'medium'), "⚪")
+        ctk.CTkLabel(left_col, text=priority_icon, font=("Arial", 20)).pack()
+        
+        # Icône récurrence
+        if task.get('recurrence'):
+            recur_icons = {
+                "daily": "🔄",
+                "weekly": "🔄",
+                "monthly": "🔄",
+                "yearly": "🔄"
+            }
+            recur_icon = recur_icons.get(task.get('recurrence'), "🔄")
+            ctk.CTkLabel(left_col, text=recur_icon, font=("Arial", 16), 
+                        text_color=JARVIS_CYAN).pack(pady=(5, 0))
+        
+        # Colonne centrale : Contenu
+        center_col = ctk.CTkFrame(task_frame, fg_color="transparent")
+        center_col.grid(row=0, column=1, sticky="ew", padx=10, pady=12)
+        center_col.grid_columnconfigure(0, weight=1)
+        
+        # Titre
+        status_icons = {
+            "todo": "⏳",
+            "in_progress": "🔄",
+            "done": "✅"
+        }
+        status_icon = status_icons.get(task.get('status', 'todo'), "⏳")
+        
+        title_frame = ctk.CTkFrame(center_col, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 5))
+        
+        title_label = ctk.CTkLabel(
+            title_frame,
+            text=f"{status_icon} {task.get('title', 'Sans titre')}",
+            font=("Arial", 16, "bold"),
+            text_color=JARVIS_TEXT,
+            anchor="w"
+        )
+        title_label.pack(side="left")
+        
+        # Description
+        if task.get('description'):
+            desc_label = ctk.CTkLabel(
+                center_col,
+                text=task.get('description', ''),
+                font=("Arial", 12),
+                text_color=JARVIS_TEXT_DIM,
+                anchor="w",
+                wraplength=600
+            )
+            desc_label.pack(fill="x", pady=(0, 5))
+        
+        # Métadonnées (date, tags)
+        meta_frame = ctk.CTkFrame(center_col, fg_color="transparent")
+        meta_frame.pack(fill="x")
+        
+        # Date d'échéance
+        if task.get('due_date'):
+            from datetime import datetime
+            try:
+                due_dt = datetime.strptime(task['due_date'], "%Y-%m-%d %H:%M")
+                now = datetime.now()
+                if due_dt < now and task.get('status') != 'done':
+                    overdue_text = " [EN RETARD]"
+                    overdue_color = JARVIS_RED
+                else:
+                    overdue_text = ""
+                    overdue_color = JARVIS_TEXT_DIM
+            except:
+                overdue_text = ""
+                overdue_color = JARVIS_TEXT_DIM
+            
+            date_label = ctk.CTkLabel(
+                meta_frame,
+                text=f"📅 {task.get('due_date', '')}{overdue_text}",
+                font=("Arial", 11),
+                text_color=overdue_color
+            )
+            date_label.pack(side="left", padx=(0, 10))
+        
+        # Tags
+        if task.get('tags'):
+            tags_text = " ".join([f"#{tag}" for tag in task.get('tags', [])])
+            tags_label = ctk.CTkLabel(
+                meta_frame,
+                text=tags_text,
+                font=("Arial", 10),
+                text_color=JARVIS_CYAN
+            )
+            tags_label.pack(side="left")
+        
+        # ID (petit, discret)
+        id_label = ctk.CTkLabel(
+            center_col,
+            text=f"ID: {task_id[:8]}...",
+            font=("Consolas", 9),
+            text_color=JARVIS_TEXT_DIM
+        )
+        id_label.pack(anchor="e", pady=(5, 0))
+        
+        # Stocker le widget
+        self.tasks_widgets[task_id] = task_frame
 
 
 # Pour tests sans le main.py

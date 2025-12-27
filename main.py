@@ -16,6 +16,7 @@ import websockets
 import pyaudio
 import argparse
 from datetime import datetime, timedelta
+from typing import Dict, Any
 import time
 import random
 import requests
@@ -64,6 +65,7 @@ from core.wake_word_detector import WakeWordDetector
 from core.tool_executor import ToolExecutor
 from core.sound_manager import get_sound_manager
 from core.learning_system import get_learning_system
+from core.state_manager import get_state_manager
 from core.paths import get_project_root, get_sounds_dir, get_models_dir, get_vocab_dir, get_memory_dir, get_rag_db_dir
 
 # Import des modules fonctionnels
@@ -73,6 +75,32 @@ from modules.spotify_controller import spotify_tool, SPOTIFY_TOOL_DECLARATION
 from modules.analyze_screen import analyze_screen_tool, SCREEN_ANALYZER_TOOL_DECLARATION
 from modules.web_navigator import web_navigator_tool, WEB_NAVIGATOR_TOOL_DECLARATION, get_navigator
 from modules.gui import CypherGUI
+
+# Import des nouveaux modules refactorisés
+from core.tool_declarations import get_all_tool_declarations
+from modules.system_tools import (
+    network_manager,
+    window_manager,
+    system_control,
+    process_manager,
+    power_control,
+    system_optimize
+)
+from modules.time_management import (
+    get_time,
+    get_date,
+    format_duration,
+    manage_stopwatch,
+    manage_timer,
+    manage_agenda,
+    get_timer_end,
+    get_timer_alert_triggered,
+    set_timer_alert_triggered,
+    set_timer_end
+)
+from core.tts_utils import generate_ssml, clean_text_for_tts, shorten_for_tts
+from core.utils import get_weather, get_folder_size, format_bytes
+from modules.app_launcher import open_app, open_website
 
 # Logger principal
 logger = get_logger("main")
@@ -125,12 +153,8 @@ if sys.version_info < (3, 11, 0):
     asyncio.ExceptionGroup = exceptiongroup.ExceptionGroup
 
 # --- État global pour le chronomètre et le compte à rebours ---
-STOPWATCH_START = None       # datetime ou None
-STOPWATCH_ACCUM = 0.0        # secondes accumulées
-STOPWATCH_RUNNING = False    # bool
-TIMER_ALERT_TRIGGERED = False  # Pour ne pas annoncer 15 fois la fin du timer
-
-TIMER_END = None             # datetime ou None
+# NOTE: Ces variables ont été déplacées dans modules/time_management.py
+# Utiliser les fonctions get_timer_end(), get_timer_alert_triggered(), set_timer_alert_triggered()
 
 # --- Audio Configuration ---
 FORMAT = pyaudio.paInt16
@@ -250,11 +274,20 @@ class AudioLoop:
                     self.sb_classifier = None
                     self.sb_target = None
                 else:
+                    # AMÉLIORATION 1: Cache embedding wake word - Pré-normaliser pour accélérer
                     self.sb_target = np.load(str(embedding_path)).astype(np.float32)
+                    # Pré-normaliser l'embedding cible une fois pour toutes
+                    target_norm = np.linalg.norm(self.sb_target)
+                    if target_norm > 0:
+                        self.sb_target_normalized = self.sb_target / target_norm
+                    else:
+                        self.sb_target_normalized = self.sb_target
+                    print(">>> [OPTIM] Embedding wake word chargé et pré-normalisé (cache activé)")
             except Exception as e:
                 print(f"⚠️ [WARNING] Erreur lors du chargement de SpeechBrain: {e}")
                 self.sb_classifier = None
                 self.sb_target = None
+                self.sb_target_normalized = None
 
         # paramètres detection (à peaufiner)
         self.sb_sr = 16000
@@ -280,6 +313,21 @@ class AudioLoop:
         self.last_interaction_time = 0
         self.CONVERSATION_TIMEOUT = self.cypher_config.conversation_timeout
         
+        # AMÉLIORATION 4: Initialiser le StateManager pour auto-sauvegarde et résumé contexte
+        self.state_manager = get_state_manager()
+        # Tenter de restaurer l'état précédent
+        saved_state = self.state_manager.load_state()
+        if saved_state:
+            print(">>> [RESTORE] État précédent trouvé. Utilise 'restore_state' pour le restaurer si besoin.")
+        
+        # Initialiser le TaskManager pour la gestion de tâches professionnelle
+        from modules.task_manager import get_task_manager
+        self.task_manager = get_task_manager()
+        # Les tâches sont automatiquement chargées depuis cypher_tasks.json au démarrage
+        task_count = len(self.task_manager.tasks)
+        if task_count > 0:
+            print(f">>> [TASKS] {task_count} tâche(s) chargée(s) depuis le fichier de persistance")
+        
         # Initialiser le tool executor (sera initialisé après avoir chargé FUNCTION_MAP)
         self.tool_executor = None
         
@@ -288,584 +336,8 @@ class AudioLoop:
         
         self._boost_microphone_gain()
         
-    
-
-        # Tools de Cypher
-        get_time = {
-            "name": "get_time",
-            "description": (
-                "Retourne l'heure actuelle au format HH:MM. "
-                "Si l'utilisateur ne précise pas de lieu, considère qu'il est en France métropolitaine "
-                "(fuseau 'Europe/Paris') et ne demande pas de précision. "
-                "Si l'utilisateur mentionne une ville ou un pays spécifique (par exemple Londres, New York), "
-                "utilise un fuseau horaire adapté (ex: 'Europe/London', 'America/New_York')."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "timezone": {
-                        "type": "string",
-                        "description": (
-                            "Nom du fuseau IANA, ex: 'Europe/Paris', 'Europe/London', 'UTC'. "
-                            "Si ce paramètre est omis, l'heure par défaut est celle de la France métropolitaine "
-                            "(Europe/Paris)."
-                        ),
-                    }
-                },
-                "required": [],
-            },
-        }
-
-        get_date = {
-            "name": "get_date",
-            "description": (
-                "Retourne la date actuelle dans un format lisible (ex: 'Lundi 3 Février 2025'). "
-                "Si l'utilisateur ne précise pas de lieu, utilise la France métropolitaine "
-                "(Europe/Paris). Si une ville ou un pays est mentionné, utilise un fuseau horaire adapté."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "timezone": {
-                        "type": "string",
-                        "description": "Fuseau IANA. Si omis, utilise Europe/Paris."
-                    }
-                },
-                "required": [],
-            },
-        }
-
-        get_weather = {
-            "name": "get_weather",
-            "description": (
-                "Retourne une description météo simple. "
-                "Si l'utilisateur ne précise ni ville ni jour, utilise Petit-Couronne et la date d'aujourd'hui. "
-                "Si une ville est mentionnée, utilise cette localisation. "
-                "Si un jour est mentionné (ex: aujourd'hui, demain, après-demain), adapte la description."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": (
-                            "Ville ou lieu demandé. Ex: 'Rouen', 'Paris', 'Londres'. "
-                            "Si omis, utilise 'Petit-Couronne'."
-                        ),
-                    },
-                    "day": {
-                        "type": "string",
-                        "description": (
-                            "Jour visé. Ex: 'aujourd'hui', 'demain', 'après-demain'. "
-                            "Si omis, considère qu'il s'agit d'aujourd'hui."
-                        ),
-                    },
-                },
-                "required": [],
-            },
-        }
-
-        get_time = {
-            "name": "get_time",
-            "description": "Retourne l'heure actuelle au format HH:MM pour un fuseau horaire donné.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "timezone": {
-                        "type": "string",
-                        "description": "Nom du fuseau IANA, ex: 'Europe/Paris' ou 'UTC'. Si omis, utilise l'heure de Paris."
-                    }
-                },
-                "required": [],
-            },
-        }
-
-        
-        manage_stopwatch = {
-            "name": "manage_stopwatch",
-            "description": (
-                "Gère un chronomètre interne : démarrage, arrêt, remise à zéro ou affichage du temps écoulé. "
-                "Tu DOIS appeler cette fonction dès que l'utilisateur parle de chronomètre, de chrono, "
-                "de temps écoulé, de 'on est à combien', 'combien de temps depuis le début', etc."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action à effectuer sur le chronomètre.",
-                        "enum": ["start", "stop", "reset", "status"],
-                    }
-                },
-                "required": ["action"],
-            },
-        }
-
-        
-        manage_timer = {
-            "name": "manage_timer",
-            "description": (
-                "Gère un compte à rebours interne : démarrage, consultation du temps restant ou annulation."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action à effectuer : start, status ou cancel.",
-                        "enum": ["start", "status", "cancel"],
-                    },
-                    "duration_seconds": {
-                        "type": "integer",
-                        "description": (
-                            "Durée du compte à rebours en secondes. "
-                            "Obligatoire pour l'action 'start'."
-                        ),
-                    },
-                },
-                "required": ["action"],
-            },
-        }
-
-        open_app = {
-            "name": "open_app",
-            "description": (
-                "Ouvre une application installée sur le système Windows. "
-                "Tu DOIS appeler ce tool dès que l’utilisateur dit des phrases comme "
-                "« ouvre », « lance », « démarre », suivies d’un nom d’application, "
-                "par exemple : 'ouvre chrome', 'lance vscode', 'ouvre spotify', "
-                "ou 'ouvre Excel EDF'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "application": {
-                        "type": "string",
-                        "description": "Nom de l'application à ouvrir. Ex: 'chrome', 'vscode', 'spotify', 'excel'.",
-                    }
-                },
-                "required": ["application"],
-            },
-        }
-
-        open_website = {
-            "name": "open_website",
-            "description": (
-                "Ouvre un site web dans le navigateur par défaut. "
-                "Tu DOIS appeler ce tool pour des phrases comme "
-                "« ouvre YouTube », « va sur TryHackMe », « ouvre Outlook », "
-                "« ouvre le site de l'ESIGELEC », etc."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url_or_name": {
-                        "type": "string",
-                        "description": "Nom du site ou URL. Ex: 'youtube', 'tryhackme', 'outlook'."
-                    }
-                },
-                "required": ["url_or_name"],
-            },
-        }
-
-        google_search_tool = {"google_search": {}}
-
-        
-        
-
-        execute_python = {
-            "name": "execute_python",
-            "description": (
-                "Écrit et exécute du code Python local. "
-                "Tu dois TOUJOURS l'utiliser en deux étapes : "
-                "1) Premier appel avec confirmed=False pour prévisualiser et vérifier la sécurité du code "
-                "(cela reste interne, tu n'as PAS besoin d'expliquer le résumé à Monsieur). "
-                "2) Immédiatement après, tu rappelles execute_python avec les MÊMES instructions mais "
-                "confirmed=True pour exécuter réellement le code. "
-                "Tu ne dois PAS demander de confirmation explicite à Monsieur, sauf s'il te le demande lui-même. "
-                "Utilise ce tool pour toutes les tâches locales : gestion de fichiers, automatisations, "
-                "analyse de données, scripts système, etc."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "Code Python complet à exécuter.",
-                    },
-                    "confirmed": {
-                        "type": "boolean",
-                        "description": "False = prévisualisation interne, True = exécution réelle.",
-                        "default": False,
-                    },
-                },
-                "required": ["code"],
-            },
-        }
-        
-        file_manager = {
-            "name": "file_manager",
-            "description": (
-                "Gère toutes les manipulations de fichiers et de dossiers. "
-                "Utilise 'create_file' pour enregistrer du code ou du texte (C'EST LA MEILLEURE MÉTHODE POUR CRÉER DES SCRIPTS). "
-                "Utilise 'read_file' pour lire le contenu d'un fichier."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "L'action à effectuer.",
-                        "enum": ["create_file", "read_file", "create_dir", "delete", "copy", "move", "rename", "list_files", "calculate_size", "archive", "unarchive"],
-                    },
-                    "source_path": {
-                        "type": "string",
-                        "description": "Chemin complet du fichier ou dossier."
-                    },
-                    "destination_path": {
-                        "type": "string",
-                        "description": "Destination (pour copy/move) ou nouveau nom (pour rename)."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Le contenu TEXTUEL à écrire dans le fichier (obligatoire pour 'create_file')."
-                    }
-                },
-                "required": ["action", "source_path"],
-            },
-        }
-        
-        window_manager = {
-            "name": "window_manager",
-            "description": "Gère les fenêtres ouvertes : maximiser, réduire, fermer, mettre au premier plan (focus), lister les fenêtres, trouver la fenêtre active.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["minimize", "maximize", "restore", "close", "focus", "list", "active"],
-                        "description": "Action à effectuer sur la fenêtre."
-                    },
-                    "target_window": {
-                        "type": "string",
-                        "description": "Nom (ou partie du nom) de la fenêtre visée. Obligatoire sauf pour 'list' et 'active'."
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-
-        system_control = {
-            "name": "system_control",
-            "description": "Contrôle les paramètres matériels du PC (Volume, Luminosité) et le presse-papier.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "feature": {
-                        "type": "string",
-                        "enum": ["volume", "mute", "brightness", "clipboard_get", "clipboard_set"],
-                        "description": "Paramètre à modifier."
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Valeur cible (ex: '50', '+10', '-20', ou texte pour le presse-papier). Laisser vide pour lire la valeur actuelle."
-                    }
-                },
-                "required": ["feature"]
-            }
-        }
-
-        process_manager = {
-            "name": "process_manager",
-            "description": "Gère les processus système et l'état du PC (CPU/RAM). Permet de lister les applis gourmandes ou de tuer un programme bloqué.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["system_info", "list", "kill"],
-                        "description": "Action : info système, lister processus, tuer processus."
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Nom du processus à tuer (ex: 'chrome', 'notepad'). Obligatoire pour 'kill'."
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-        
-        power_control = {
-            "name": "power_control",
-            "description": "Contrôle l'alimentation du PC : mettre en veille, verrouiller, redémarrer ou éteindre.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["sleep", "lock", "shutdown", "restart", "abort"],
-                        "description": "Action d'alimentation."
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Forcer la fermeture des applications (DANGER de perte de données).",
-                        "default": False
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-
-        system_optimize = {
-            "name": "system_optimize",
-            "description": "Outils de nettoyage système : vider les fichiers temporaires ou tenter de libérer de la RAM.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["clean_temp", "clean_ram"],
-                        "description": "Action d'optimisation."
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-        
-        network_manager = {
-            "name": "network_manager",
-            "description": "Gère les connexions réseaux : Wi-Fi (lister, connecter, déconnecter), Bluetooth (statut, paramètres) et Mode Avion.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "list_networks", "connect_wifi", "disconnect_wifi", "wifi_status", 
-                            "airplane_mode", 
-                            "bluetooth_status", "bluetooth_settings", "connect_bluetooth"
-                        ],
-                        "description": "Action réseau à effectuer."
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Nom (SSID) du réseau Wi-Fi pour la connexion."
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-
-        memory_manager = {
-            "name": "memory_manager",
-            "description": (
-                "Accède à la mémoire longue durée (Cerveau) de Cypher. "
-                "Utilise cet outil pour stocker (remember), récupérer (recall) ou oublier (forget) des informations. "
-                "Tu DOIS classer l'information dans l'une des catégories suivantes : "
-                "'profil_utilisateur' (infos sur Monsieur), 'gouts_et_preferences', 'projets_actifs', "
-                "'environnement_systeme' (config PC), 'entourage', 'base_de_connaissances' (faits appris), 'journal_evenements'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["remember", "recall", "forget", "list_categories"],
-                        "description": "Action à effectuer."
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "La sphère cognitive concernée (ex: 'projets_actifs', 'profil_utilisateur')."
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Le sujet précis ou la clé de l'information (ex: 'deadline_cypher', 'couleur_preferee')."
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "L'information à stocker (obligatoire pour 'remember'). Sois précis et complet."
-                    }
-                },
-                "required": ["action", "category"]
-            }
-        }
-
-        error_history_tool = {
-            "name": "error_history",
-            "description": "Permet de consulter les dernières erreurs système ou Python rencontrées par Cypher pour ne pas les reproduire.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "Nom du module ou tool, ex: 'execute_python', 'file_manager'. Laisser vide pour tout.",
-                    }
-                },
-                "required": []
-            }
-        }
-
-        user_preferences_tool = {
-            "name": "user_preferences",
-            "description": "Consulte les préférences et habitudes apprises par Cypher pour personnaliser l'interaction.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "Action à effectuer: 'view' pour voir les préférences, 'reset' pour réinitialiser",
-                        "enum": ["view", "reset"]
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-
-        agenda_tool = {
-            "name": "manage_agenda",
-            "description": "Gère l'agenda personnel : ajouter, consulter ou supprimer des événements.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["add", "list", "delete"],
-                        "description": "Action à effectuer."
-                    },
-                    "date_iso": {
-                        "type": "string",
-                        "description": "Date et heure de l'événement au format EXACT 'YYYY-MM-DD HH:MM'. Calcule-la toi-même par rapport à la date actuelle."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Description de l'événement."
-                    },
-                    "alarm": {
-                        "type": "boolean",
-                        "description": "Si True, Cypher parlera vocalement à l'heure dite.",
-                        "default": False
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-
-        email_tool = {
-            "name": "email_manager",
-            "description": "Gère l'application Outlook locale : lire les mails non lus, chercher un mail, ou envoyer un e-mail.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read_recent", "search", "send"],
-                        "description": "Action : lire les nouveaux (read_recent), chercher (search), envoyer (send)."
-                    },
-                    "recipient": {
-                        "type": "string",
-                        "description": "Adresse email du destinataire (pour action 'send')."
-                    },
-                    "subject": {
-                        "type": "string",
-                        "description": "Objet de l'e-mail (pour action 'send')."
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Contenu du message (pour action 'send')."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Mots-clés pour la recherche (sujet ou expéditeur)."
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-
-        document_manager = {
-            "name": "document_manager",
-            "description": (
-                "Système RAG pour lire et interroger des documents locaux (PDF, Obsidian, Cours). "
-                "Utilise 'index' pour apprendre un dossier entier, 'search' pour poser une question sur le contenu, "
-                "et 'summary' pour résumer un fichier unique. "
-                "C'est l'outil ULTIME pour répondre aux questions sur les cours, notes ou fichiers de l'utilisateur."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["index", "search", "reset", "summary"],
-                        "description": "Action : apprendre (index), chercher (search), résumer un fichier (summary), tout oublier (reset)."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "La question posée ou le sujet recherché (pour 'search')."
-                    },
-                    "source_folder": {
-                        "type": "string",
-                        "description": "Le chemin du dossier à scanner (pour 'index')."
-                    },
-                    "source_file": {
-                        "type": "string",
-                        "description": "Chemin complet du fichier à résumer (pour 'summary')."
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-
-        expert_coder = EXPERT_CODER_TOOL_DECLARATION
-
-        expert_coder_write_file = {
-            "name": "expert_coder_write_file",
-            "description": (
-                "Écrit dans un fichier le DERNIER code généré par l'outil 'expert_coder'. "
-                "Utilise ce tool pour sauvegarder du code sans avoir à gérer les guillemets ou le formatage du contenu."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_path": {
-                        "type": "string",
-                        "description": "Chemin complet du fichier où le code expert doit être écrit (ex: chemin d'un script sur le Bureau ou dans Documents).",
-                    },
-                },
-                "required": ["target_path"],
-            },
-        }
-
-        tools = [
-            {"function_declarations": [
-                open_app,
-                file_manager,
-                execute_python,
-                get_time,
-                get_date,
-                get_weather,
-                manage_stopwatch,
-                manage_timer,
-                open_website,
-                window_manager,
-                system_control,
-                process_manager,
-                power_control,
-                system_optimize,
-                network_manager,
-                memory_manager,
-                error_history_tool,
-                agenda_tool,
-                email_tool,
-                document_manager,
-                expert_coder,
-                expert_coder_write_file,
-                SPOTIFY_TOOL_DECLARATION,
-                SCREEN_ANALYZER_TOOL_DECLARATION,
-                WEB_NAVIGATOR_TOOL_DECLARATION,
-                user_preferences_tool,
-            ]},
-            google_search_tool
-        ]
+        # Tools de Cypher - Utiliser les déclarations centralisées
+        tools = get_all_tool_declarations()
 
         # --- CHARGEMENT DU CERVEAU AU DÉMARRAGE ---
         memory_content = ""
@@ -893,17 +365,24 @@ class AudioLoop:
         self._current_tools_used = []
         self._current_response = ""
 
+        # AMÉLIORATION 2: Ajouter le résumé du contexte précédent si disponible
+        # Note: Le résumé sera injecté dynamiquement dans la conversation si nécessaire
+        context_summary = self.state_manager.get_context_summary()
+        context_summary_text = f"\n{context_summary}" if context_summary else ""
+        
         self.config = {
             "response_modalities": ["TEXT"],
             "system_instruction": f"""
 {current_context}
-{learning_preferences}
+{learning_preferences}{context_summary_text}
 
 ⚠️ CONFIGURATION SYSTÈME CRITIQUE :
 Le dossier "Documents" réel de l'utilisateur est : {DOCUMENTS_REAL}
 Le dossier "Bureau" réel de l'utilisateur est : {DESKTOP_REAL}
 Le dossier "Images" réel de l'utilisateur est : {IMAGES_REAL}
 Si tu dois écrire un script Python ou chercher un fichier, utilise TOUJOURS ces chemins absolus au lieu des chemins par défaut de Windows.
+
+IMPORTANT : Le dossier "Downloads" (Téléchargements) doit utiliser le chemin standard Windows (C:\\Users\\...\\Downloads) et NON PAS le chemin OneDrive. Ne redirige PAS Downloads vers OneDrive.
 
 Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je suis ton développeur. Tu es comme un pote collegue avec moi tu peux me charier parfois ou etre tres franc aussi. et tu es une IA conçue pour m'aider dans mes projets d'ingénierie ainsi que dans mes tâches quotidiennes. Adresse-toi à moi en m'appelant « Monsieur ». Merci également de veiller à ce que tes réponses soient concises.
     
@@ -1040,6 +519,29 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
       2. Tu utilises EXCLUSIVEMENT l'outil `file_manager` avec `action='create_file'`, `content='LE_CODE'` et `source_path='...'`.
       3. INTERDICTION FORMELLE d'utiliser `execute_python` pour créer un fichier (ne fais jamais de `with open(...)` dans un script Python).
       4. Une fois le fichier créé via `file_manager`, SI ET SEULEMENT SI je demande de l'exécuter, alors tu utilises `execute_python` pour lancer le fichier créé.
+    
+    Règles pour le gestionnaire de tâches (Task Master - manage_tasks) :
+    - Tu disposes d'un gestionnaire de tâches professionnel avec récurrence automatique.
+    - Si l'utilisateur mentionne une habitude ou une action répétitive :
+        * "tous les jours", "chaque jour", "quotidiennement" → recurrence="daily"
+        * "chaque semaine", "toutes les semaines", "hebdomadaire" → recurrence="weekly"
+        * "chaque mois", "mensuel" → recurrence="monthly"
+        * "chaque année", "annuel" → recurrence="yearly"
+        * "chaque mardi", "tous les lundis" → recurrence="weekly" (avec due_date calculée)
+    - Actions disponibles :
+        * "Ajoute une tâche X" → action="add" avec title, priority, due_date, recurrence si mentionné
+        * "Liste mes tâches" → action="list" (peut filtrer par status, priority, date_range)
+        * "J'ai fini la tâche X" ou "Marque X comme terminée" → action="complete" avec fuzzy_name ou task_id
+        * "Supprime la tâche X" → action="delete" avec fuzzy_name (IMPORTANT: si la tâche est récurrente, toutes les occurrences seront supprimées automatiquement)
+        * "Statistiques des tâches" → action="stats"
+    - IMPORTANT pour les tâches récurrentes :
+        * Lorsqu'une tâche récurrente est complétée, une nouvelle occurrence est automatiquement créée.
+        * Lorsqu'une tâche récurrente est supprimée par son nom (fuzzy_name), TOUTES les occurrences (passées, présentes et futures) sont supprimées automatiquement.
+        * Ne fournis JAMAIS task_id pour supprimer une tâche récurrente, utilise toujours fuzzy_name pour que toutes les occurrences soient supprimées.
+    - Les priorités : "low", "medium", "high", "critical" (défaut: "medium").
+    - Pour les dates d'échéance, calcule-les toi-même au format "YYYY-MM-DD HH:MM" par rapport à la date actuelle.
+    - Utilise fuzzy_name pour trouver une tâche par son nom partiel si task_id n'est pas fourni.
+    - Format de réponse : Réponds de manière claire et concise, sans emojis ni caractères spéciaux inutiles.
     
     Règle pour file_manager :
     - Utilise cette outil en priorité pour :
@@ -1206,43 +708,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
     def _generate_ssml(self, text: str) -> str:
         """Emballe le texte dans du SSML pour contrôler la vitesse et le ton."""
-        # On échappe les caractères spéciaux XML au cas où
-        safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        
-        ssml = f"""
-        <speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='fr-FR'>
-            <voice name='{AZURE_VOICE_NAME}'>
-                <prosody rate='{TTS_RATE}' pitch='{TTS_PITCH}'>
-                    {safe_text}
-                </prosody>
-            </voice>
-        </speak>
-        """
-        return ssml                                                                                          
-                                                                                              
-    @staticmethod
-    def _clean_text_for_tts(text: str) -> str:
-        """Nettoie le texte pour la lecture vocale (Supprime le code et le Markdown)."""
-        import re
-        
-        # 1. SUPPRIMER LES BLOCS DE CODE (Entre ``` et ```)
-        # On remplace tout le bloc de code par une courte pause silencieuse
-        text = re.sub(r'```[\s\S]*?```', ' [Code analysé] ', text)
-        
-        # 2. SUPPRIMER LES LIGNES DE CODE TYPIQUES (Sécurité supplémentaire)
-        # Si une ligne commence par 'import ', 'def ', 'class ', on la zappe
-        lines = text.split('\n')
-        clean_lines = []
-        for line in lines:
-            l = line.strip()
-            if not l.startswith(('import ', 'from ', 'def ', 'class ', 'return ', 'self.', '@', 'print(')):
-                clean_lines.append(line)
-        text = '\n'.join(clean_lines)
-
-        # 3. Nettoyage Markdown standard (*, #, _, `)
-        clean = re.sub(r'[\*#_`]', '', text)
-        
-        return clean.strip()
+        return generate_ssml(text, AZURE_VOICE_NAME, TTS_RATE, TTS_PITCH)
                                                                                  
     def _boost_microphone_gain(self):
         """Augmente automatiquement le gain du micro au démarrage"""
@@ -1590,92 +1056,225 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             except Exception as e:
                 print(f">>> [ERROR Agenda Watcher] : {e}")
 
-    @staticmethod
-    def _manage_agenda(action: str, date_iso: str | None = None, description: str | None = None, alarm: bool = False) -> str:
+    def _manage_tasks(
+        self,
+        action: str,
+        title: str | None = None,
+        description: str | None = None,
+        priority: str | None = None,
+        due_date: str | None = None,
+        recurrence: str | None = None,
+        tags: list | None = None,
+        task_id: str | None = None,
+        fuzzy_name: str | None = None,
+        filter_status: str | None = None,
+        filter_priority: str | None = None,
+        date_range: str | None = None
+    ) -> str:
         """
-        Gère l'agenda personnel (RDV, rappels).
-        Stockage dans cypher_agenda.json.
+        Gestionnaire de tâches professionnel (Task Master) avec récurrence automatique.
+        Utilise le module task_manager pour gérer les tâches avec persistance JSON.
         """
-        import json
-        import os
-        from datetime import datetime, timedelta
-
-        AGENDA_FILE = str(get_memory_dir() / "cypher_agenda.json")
-
-        # Charger l'agenda
-        if os.path.exists(AGENDA_FILE):
-            try:
-                with open(AGENDA_FILE, 'r', encoding='utf-8') as f:
-                    agenda = json.load(f)
-            except:
-                agenda = []
-        else:
-            agenda = []
-
+        from modules.task_manager import get_task_manager
+        
+        task_mgr = get_task_manager()
         action = action.lower()
-
-        # --- AJOUTER UN ÉVÉNEMENT ---
+        
+        # --- AJOUTER UNE TÂCHE ---
         if action == "add":
-            if not date_iso or not description:
-                return "Il me faut une date (ISO) et une description."
+            if not title:
+                return "Erreur: Le titre de la tâche est obligatoire."
             
-            event = {
-                "id": str(int(time.time())), # ID simple basé sur le timestamp
-                "date": date_iso, # Format attendu: YYYY-MM-DD HH:MM
-                "description": description,
-                "alarm": alarm,
-                "status": "pending"
-            }
-            agenda.append(event)
+            # Valeurs par défaut
+            priority = priority or "medium"
+            description = description or ""
+            tags = tags or []
             
-            # Trier par date
-            agenda.sort(key=lambda x: x["date"])
-            
-            with open(AGENDA_FILE, 'w', encoding='utf-8') as f:
-                json.dump(agenda, f, indent=4, ensure_ascii=False)
-            
-            alarm_msg = "avec alarme sonore" if alarm else "sans alarme"
-            return f"📅 Événement ajouté : '{description}' le {date_iso} ({alarm_msg})."
-
-        # --- CONSULTER (LISTER) ---
+            # Ajouter la tâche
+            try:
+                task = task_mgr.add_task(
+                    title=title,
+                    description=description,
+                    priority=priority,
+                    due_date=due_date,
+                    recurrence=recurrence,
+                    tags=tags
+                )
+                
+                # Message de confirmation (format propre, sans emojis)
+                msg = f"Tâche ajoutée : {title}"
+                if priority == "critical":
+                    msg += " (Critique)"
+                elif priority == "high":
+                    msg += " (Haute priorité)"
+                
+                if recurrence:
+                    if recurrence == "daily":
+                        msg += " - Récurrente quotidienne"
+                    elif recurrence == "weekly":
+                        msg += " - Récurrente hebdomadaire"
+                    elif recurrence == "monthly":
+                        msg += " - Récurrente mensuelle"
+                    elif recurrence == "yearly":
+                        msg += " - Récurrente annuelle"
+                
+                if due_date:
+                    msg += f" - Échéance : {due_date}"
+                
+                # Notifier la GUI
+                try:
+                    tasks = task_mgr.list_tasks()
+                    self.gui_queue.put(("TASKS_UPDATE", {"tasks": tasks}))
+                except:
+                    pass
+                
+                return msg
+            except Exception as e:
+                return f"Erreur lors de l'ajout de la tâche: {e}"
+        
+        # --- LISTER LES TÂCHES ---
         if action == "list":
-            if not agenda:
-                return "L'agenda est vide, Monsieur."
-            
-            # Filtrage intelligent (si date_iso est fourni, on filtre autour, sinon tout le futur)
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-            upcoming = [e for e in agenda if e["date"] >= now_str]
-            
-            if not upcoming:
-                return "Rien de prévu à l'avenir."
-            
-            # Si on demande "demain" ou une date précise, on peut filtrer ici,
-            # mais le plus simple est de lister les 10 prochains et laisser Gemini résumer.
-            report = "📅 Vos prochains événements :\n"
-            for e in upcoming[:10]:
-                alarm_icon = "🔔" if e.get("alarm") else ""
-                report += f"- [{e['date']}] {e['description']} {alarm_icon}\n"
-            
-            return report
-
-        # --- SUPPRIMER ---
+            try:
+                tasks = task_mgr.list_tasks(
+                    filter_status=filter_status,
+                    filter_priority=filter_priority,
+                    date_range=date_range
+                )
+                
+                if not tasks:
+                    return "Aucune tâche trouvée avec ces critères."
+                
+                # Construire le rapport (format propre, sans emojis)
+                report = f"Liste des tâches ({len(tasks)} trouvée(s)):\n\n"
+                
+                for task in tasks:
+                    # Priorité en texte
+                    priority_text = ""
+                    if task.get('priority') == "critical":
+                        priority_text = " [CRITIQUE]"
+                    elif task.get('priority') == "high":
+                        priority_text = " [HAUTE]"
+                    elif task.get('priority') == "low":
+                        priority_text = " [BASSE]"
+                    
+                    # Récurrence
+                    recur_text = ""
+                    if task.get('recurrence'):
+                        recur_text = " (Récurrente)"
+                    
+                    # Statut
+                    status_text = ""
+                    if task.get('status') == "in_progress":
+                        status_text = " [EN COURS]"
+                    elif task.get('status') == "done":
+                        status_text = " [TERMINÉE]"
+                    
+                    # Vérifier si en retard
+                    overdue_text = ""
+                    if task.get('due_date') and task.get('status') != 'done':
+                        from datetime import datetime
+                        due_dt = task_mgr._parse_due_date(task.get('due_date'))
+                        if due_dt and due_dt < datetime.now():
+                            overdue_text = " [EN RETARD]"
+                    
+                    # Format simple et propre
+                    report += f"{task['title']}{priority_text}{recur_text}{status_text}{overdue_text}\n"
+                    
+                    if task.get('description'):
+                        report += f"  Description: {task['description']}\n"
+                    if task.get('due_date'):
+                        report += f"  Échéance: {task['due_date']}\n"
+                    if task.get('tags'):
+                        report += f"  Tags: {', '.join(task['tags'])}\n"
+                    
+                    report += "\n"
+                
+                return report
+            except Exception as e:
+                return f"Erreur lors de la récupération des tâches: {e}"
+        
+        # --- COMPLÉTER UNE TÂCHE ---
+        if action == "complete":
+            try:
+                result = task_mgr.mark_as_done(task_id=task_id, fuzzy_name=fuzzy_name)
+                
+                if not result.get("success"):
+                    return f"Erreur: {result.get('message', 'Erreur inconnue')}"
+                
+                msg = result['message']
+                
+                # Si récurrence créée, mentionner la nouvelle tâche
+                if result.get("recurrence_created") and result.get("new_task"):
+                    new_task = result["new_task"]
+                    msg += f". Nouvelle occurrence créée pour {new_task.get('due_date', 'N/A')}"
+                
+                # Notifier la GUI
+                try:
+                    tasks = task_mgr.list_tasks()
+                    self.gui_queue.put(("TASKS_UPDATE", {"tasks": tasks}))
+                except:
+                    pass
+                
+                return msg
+            except Exception as e:
+                return f"Erreur lors de la complétion de la tâche: {e}"
+        
+        # --- SUPPRIMER UNE TÂCHE ---
         if action == "delete":
-            # On cherche par description (fuzzy) ou date
-            if not description:
-                return "Quel événement dois-je supprimer ?"
-            
-            initial_len = len(agenda)
-            # On garde ceux qui ne contiennent PAS la description
-            agenda = [e for e in agenda if description.lower() not in e["description"].lower()]
-            
-            if len(agenda) < initial_len:
-                with open(AGENDA_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(agenda, f, indent=4, ensure_ascii=False)
-                return f"Événement contenant '{description}' supprimé."
-            else:
-                return f"Je n'ai pas trouvé d'événement correspondant à '{description}'."
-
-        return "Action agenda inconnue."
+            try:
+                # Si on a un fuzzy_name, vérifier si c'est une tâche récurrente
+                # Si oui, supprimer toutes les occurrences
+                if fuzzy_name and not task_id:
+                    # Trouver la tâche pour vérifier si elle est récurrente
+                    task = task_mgr.find_task_by_name(fuzzy_name)
+                    if task and task.get('recurrence'):
+                        # Supprimer toutes les occurrences de cette tâche récurrente
+                        result = task_mgr.delete_recurring_task_by_title(task['title'])
+                    else:
+                        # Tâche unique, suppression normale
+                        result = task_mgr.delete_task(fuzzy_name=fuzzy_name)
+                else:
+                    # Suppression par ID ou normale
+                    result = task_mgr.delete_task(task_id=task_id, fuzzy_name=fuzzy_name)
+                
+                if not result.get("success"):
+                    return f"Erreur: {result.get('message', 'Erreur inconnue')}"
+                
+                # Notifier la GUI
+                try:
+                    tasks = task_mgr.list_tasks()
+                    self.gui_queue.put(("TASKS_UPDATE", {"tasks": tasks}))
+                except:
+                    pass
+                
+                return result['message']
+            except Exception as e:
+                return f"Erreur lors de la suppression de la tâche : {e}"
+        
+        # --- STATISTIQUES ---
+        if action == "stats":
+            try:
+                stats = task_mgr.get_stats()
+                
+                report = "Statistiques des tâches:\n\n"
+                report += f"Total: {stats['total']} tâches\n"
+                report += f"À faire: {stats['todo']}\n"
+                report += f"En cours: {stats['in_progress']}\n"
+                report += f"Terminées: {stats['done']}\n"
+                report += f"En retard: {stats['overdue']}\n"
+                report += f"Récurrentes: {stats['recurring']}\n\n"
+                
+                report += "Par priorité (non terminées):\n"
+                report += f"  Critique: {stats['by_priority']['critical']}\n"
+                report += f"  Haute: {stats['by_priority']['high']}\n"
+                report += f"  Moyenne: {stats['by_priority']['medium']}\n"
+                report += f"  Basse: {stats['by_priority']['low']}\n"
+                
+                return report
+            except Exception as e:
+                return f"❌ Erreur lors du calcul des statistiques : {e}"
+        
+        return f"❌ Action inconnue : {action}"
     
     @staticmethod
     def _user_preferences(action: str) -> str:
@@ -1895,408 +1494,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
         return "Action mémoire inconnue."
 
-    @staticmethod
-    def _power_control(action: str, force: bool = False) -> str:
-        """
-        Contrôle l'alimentation du PC : veille, redémarrage, arrêt, verrouillage.
-        """
-        import os
-        import subprocess
-        
-        action = action.lower()
-        
-        # Commande de base pour shutdown
-        # /s = shutdown, /r = restart, /l = logoff, /h = hibernate
-        # /t 0 = temps 0s, /f = force (si force=True)
-        
-        force_flag = "/f" if force else ""
-        
-        try:
-            if action == "sleep":
-                # La mise en veille se fait via rundll32
-                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
-                return "Mise en veille du système..."
-            
-            elif action == "lock":
-                os.system("rundll32.exe user32.dll,LockWorkStation")
-                return "Session verrouillée."
-            
-            elif action == "shutdown":
-                os.system(f"shutdown /s /t 5 {force_flag}")
-                return "Arrêt du système dans 5 secondes."
-            
-            elif action == "restart":
-                os.system(f"shutdown /r /t 5 {force_flag}")
-                return "Redémarrage du système dans 5 secondes."
-                
-            elif action == "abort":
-                os.system("shutdown /a")
-                return "Annulation de l'arrêt/redémarrage planifié."
-                
-        except Exception as e:
-            return f"Erreur lors de l'action d'alimentation : {e}"
-            
-        return "Action d'alimentation inconnue."
-    
-    @staticmethod
-    def _system_optimize(action: str) -> str:
-        """
-        Outils d'optimisation : vider la RAM (via EmptyStandbyList si dispo, sinon garbage collector), vider les temp.
-        """
-        import gc
-        import os
-        import shutil
-        import tempfile
-        
-        action = action.lower()
-        
-        if action == "clean_ram":
-            # 1. Force le Garbage Collector de Python
-            gc.collect()
-            
-            # 2. Sous Windows, on ne peut pas vraiment "vider la RAM" sans droits admin et outils tiers.
-            # On peut suggérer de fermer les apps gourmandes via process_manager.
-            return "Garbage Collector Python exécuté. Pour libérer plus de RAM système, utilisez `process_manager` pour fermer les applications gourmandes."
-
-        if action == "clean_temp":
-            temp_dir = tempfile.gettempdir()
-            deleted_count = 0
-            total_size = 0
-            
-            try:
-                for root, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        try:
-                            file_path = os.path.join(root, file)
-                            size = os.path.getsize(file_path)
-                            os.remove(file_path)
-                            deleted_count += 1
-                            total_size += size
-                        except:
-                            pass # Fichier utilisé, on ignore
-            except Exception as e:
-                return f"Erreur lors du nettoyage : {e}"
-            
-            size_mb = total_size / (1024 * 1024)
-            return f"Nettoyage terminé. {deleted_count} fichiers temporaires supprimés (~{size_mb:.2f} MB libérés)."
-            
-        return "Action d'optimisation inconnue."
-
-    @staticmethod
-    def _network_manager(action: str, target: str | None = None) -> str:
-        """
-        Gère le Wi-Fi, le Bluetooth et le Mode Avion.
-        Utilise netsh pour le Wi-Fi et Powershell/Commandes pour le reste.
-        """
-        import subprocess
-        
-        action = action.lower()
-        
-        def run_command(args):
-            try:
-                # encoding='cp850' est souvent nécessaire pour la console Windows FR
-                result = subprocess.run(args, capture_output=True, text=True, encoding='cp850', shell=True)
-                return result.stdout.strip()
-            except Exception as e:
-                return str(e)
-
-        # --- WI-FI ---
-        if action == "list_networks":
-            output = run_command("netsh wlan show networks mode=bssid")
-            networks = []
-            for line in output.split('\n'):
-                if "SSID" in line and ":" in line:
-                    parts = line.split(":")
-                    if len(parts) > 1:
-                        networks.append(parts[1].strip())
-            unique_networks = list(set(networks))
-            return "Réseaux Wi-Fi visibles :\n" + "\n".join(unique_networks[:10])
-
-        if action == "wifi_status":
-            return f"État de l'interface Wi-Fi :\n{run_command('netsh wlan show interfaces')}"
-
-        if action == "disconnect_wifi":
-            run_command("netsh wlan disconnect")
-            return "Déconnexion du réseau Wi-Fi effectuée."
-
-        if action == "connect_wifi":
-            if not target:
-                return "Quel réseau Wi-Fi dois-je rejoindre ?"
-            output = run_command(f'netsh wlan connect name="{target}"')
-            if "réussie" in output or "successfully" in output:
-                return f"Tentative de connexion au réseau '{target}'..."
-            else:
-                return f"Erreur : {output}. (Le profil doit exister dans Windows)."
-
-        # --- MODE AVION ---
-        if action == "airplane_mode":
-            # Windows 10/11 ne permet pas de toggle le mode avion facilement par ligne de commande
-            # sans scripts PowerShell complexes ou droits admin. On ouvre la page dédiée.
-            subprocess.Popen("start ms-settings:network-airplanemode", shell=True)
-            return "J'ouvre les paramètres du Mode Avion (Windows restreint l'accès direct)."
-
-        # --- BLUETOOTH ---
-        if action == "bluetooth_status":
-            # Utilise PowerShell pour lister les périphériques Bluetooth connectés/appairés
-            ps_script = "Get-PnpDevice -Class Bluetooth | Where-Object {$_.Status -eq 'OK'} | Select-Object -ExpandProperty FriendlyName"
-            output = run_command(f'powershell -Command "{ps_script}"')
-            if output:
-                return f"Périphériques Bluetooth actifs/détectés :\n{output}"
-            return "Aucun périphérique Bluetooth actif détecté ou erreur de lecture."
-
-        if action == "bluetooth_settings" or action == "connect_bluetooth":
-            # La connexion Bluetooth spécifique en ligne de commande est très instable sur Windows.
-            # Le mieux est d'ouvrir la page d'appairage.
-            subprocess.Popen("start ms-settings:bluetooth", shell=True)
-            return "J'ouvre les paramètres Bluetooth pour gérer les connexions."
-
-        return f"Action réseau non reconnue : {action}"                                                                                      
-                                                                                              
-    @staticmethod
-    def _window_manager(action: str, target_window: str | None = None) -> str:
-        """
-        Gère les fenêtres Windows : minimiser, maximiser, fermer, lister, focus.
-        Utilise pygetwindow.
-        """
-        import pygetwindow as gw
-        
-        action = action.lower()
-
-        # Lister les fenêtres visibles
-        if action == "list":
-            titles = [w.title for w in gw.getAllWindows() if w.title.strip()]
-            return f"Fenêtres ouvertes :\n" + "\n".join(titles[:15])
-
-        # Récupérer la fenêtre active
-        if action == "active":
-            try:
-                win = gw.getActiveWindow()
-                if win:
-                    return f"La fenêtre active est : {win.title}"
-                return "Aucune fenêtre active détectée."
-            except:
-                return "Impossible de détecter la fenêtre active."
-
-        # Pour les actions suivantes, il faut une cible
-        if not target_window:
-            return "Quelle fenêtre dois-je cibler ?"
-
-        # Recherche floue de la fenêtre (ex: "Chrome" trouve "Google Chrome...")
-        target_window = target_window.lower()
-        windows = [w for w in gw.getAllWindows() if target_window in w.title.lower()]
-
-        if not windows:
-            return f"Je ne trouve aucune fenêtre contenant '{target_window}'."
-        
-        win = windows[0] # On prend la première correspondance
-
-        try:
-            if action == "minimize":
-                win.minimize()
-                return f"Fenêtre '{win.title}' réduite."
-            elif action == "maximize":
-                win.maximize()
-                return f"Fenêtre '{win.title}' maximisée."
-            elif action == "restore":
-                win.restore()
-                return f"Fenêtre '{win.title}' restaurée."
-            elif action == "close":
-                win.close()
-                return f"Fenêtre '{win.title}' fermée."
-            elif action == "focus" or action == "activate":
-                try:
-                    win.activate()
-                    return f"Je bascule sur '{win.title}'."
-                except:
-                    # Parfois Windows bloque le focus forcé, on tente de minimiser/restaurer
-                    win.minimize()
-                    win.restore()
-                    return f"Tentative de focus sur '{win.title}'."
-        except Exception as e:
-            return f"Erreur lors de l'action sur la fenêtre : {e}"
-        
-        return "Action de fenêtre inconnue." 
-
-    @staticmethod
-    def _system_control(feature: str, value: str | int | None = None) -> str:
-        """
-        Contrôle le volume, la luminosité, et le presse-papier.
-        Feature: volume, brightness, mute, clipboard_get, clipboard_set.
-        """
-        import screen_brightness_control as sbc
-        import pyperclip
-        from ctypes import cast, POINTER
-        from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        import math
-
-        feature = feature.lower()
-
-        # --- PRESSE-PAPIER (Bonus) ---
-        if feature == "clipboard_get":
-            content = pyperclip.paste()
-            return f"Contenu du presse-papier : {content}" if content else "Le presse-papier est vide."
-        
-        if feature == "clipboard_set":
-            if not value: return "Aucun texte fourni pour le presse-papier."
-            pyperclip.copy(str(value))
-            return "Texte copié dans le presse-papier."
-
-        # --- LUMINOSITÉ ---
-        if feature == "brightness":
-            if value is None:
-                current = sbc.get_brightness()
-                return f"Luminosité actuelle : {current[0]}%." if current else "Impossible de lire la luminosité."
-            
-            try:
-                # Gérer "+10", "-10" ou "50"
-                val_str = str(value).strip()
-                if val_str.startswith("+") or val_str.startswith("-"):
-                    current = sbc.get_brightness()[0]
-                    new_val = current + int(val_str)
-                else:
-                    new_val = int(val_str)
-                
-                # Borner entre 0 et 100
-                new_val = max(0, min(100, new_val))
-                sbc.set_brightness(new_val)
-                return f"Luminosité réglée à {new_val}%."
-            except Exception as e:
-                return f"Erreur de luminosité : {e}"
-
-        # --- VOLUME (PyCaw) ---
-        if feature in ["volume", "mute"]:
-            try:
-                devices = AudioUtilities.GetSpeakers()
-                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                volume = cast(interface, POINTER(IAudioEndpointVolume))
-                
-                if feature == "mute":
-                    # Basculer le mute
-                    current_mute = volume.GetMute()
-                    volume.SetMute(not current_mute, None)
-                    return "Son coupé." if not current_mute else "Son réactivé."
-
-                if feature == "volume":
-                    # Convertir pourcentage en dB (échelle logarithmique approximative pour Windows)
-                    # Note: Pycaw utilise SetMasterVolumeLevelScalar pour le % (0.0 à 1.0)
-                    if value is None:
-                        current = round(volume.GetMasterVolumeLevelScalar() * 100)
-                        return f"Volume actuel : {current}%."
-
-                    val_str = str(value).strip()
-                    current_vol = volume.GetMasterVolumeLevelScalar() * 100
-                    
-                    if val_str.startswith("+") or val_str.startswith("-"):
-                        target = current_vol + int(val_str)
-                    else:
-                        target = int(val_str)
-                    
-                    target = max(0.0, min(100.0, target))
-                    volume.SetMasterVolumeLevelScalar(target / 100.0, None)
-                    return f"Volume réglé à {int(target)}%."
-
-            except Exception as e:
-                return f"Erreur de volume : {e}"
-
-        return "Fonctionnalité système inconnue."
-
-    @staticmethod
-    def _process_manager(action: str, target: str | None = None) -> str:
-        """
-        Gère les processus : lister (top CPU/RAM), tuer un processus, infos système.
-        Utilise psutil.
-        """
-        import psutil
-        import platform
-
-        action = action.lower()
-
-        # Infos Globales
-        if action == "system_info":
-            cpu = psutil.cpu_percent(interval=0.1)
-            ram = psutil.virtual_memory().percent
-            batt = psutil.sensors_battery()
-            batt_status = f"{batt.percent}%" if batt else "Secteur/Inconnu"
-            return (f"📊 État du Système :\n"
-                    f"- OS : {platform.system()} {platform.release()}\n"
-                    f"- CPU : {cpu}%\n"
-                    f"- RAM : {ram}%\n"
-                    f"- Batterie : {batt_status}")
-
-        # Lister les processus gourmands
-        if action == "list":
-            # Top 5 par utilisation mémoire
-            procs = []
-            for p in psutil.process_iter(['name', 'memory_percent']):
-                try:
-                    procs.append(p.info)
-                except:
-                    pass
-            # Trier et prendre le top 5
-            top_5 = sorted(procs, key=lambda x: x['memory_percent'] or 0, reverse=True)[:5]
-            
-            report = "🚀 Top 5 Processus (RAM) :\n"
-            for p in top_5:
-                report += f"- {p['name']} : {p['memory_percent']:.1f}%\n"
-            return report
-
-        # Tuer un processus
-        if action == "kill":
-            if not target:
-                return "Quel processus dois-je fermer ?"
-            
-            killed_count = 0
-            target = target.lower()
-            if not target.endswith(".exe"): 
-                target_exe = target + ".exe"
-            else:
-                target_exe = target
-
-            for proc in psutil.process_iter(['pid', 'name']):
-                try:
-                    # Correspondance nom exact ou partiel
-                    if proc.info['name'].lower() == target_exe or target in proc.info['name'].lower():
-                        proc.kill()
-                        killed_count += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            
-            if killed_count > 0:
-                return f"J'ai arrêté {killed_count} processus correspondant à '{target}'."
-            else:
-                return f"Je n'ai pas trouvé de processus nommé '{target}'."
-
-        return "Action de processus inconnue."                                                                                         
-                                                                                              
-    @staticmethod
-    def _get_folder_size(start_path='.'):
-        """Calcule récursivement la taille d'un dossier."""
-        import os
-        total_size = 0
-        try:
-            for dirpath, dirnames, filenames in os.walk(start_path):
-                for f in filenames:
-                    fp = os.path.join(dirpath, f)
-                    if not os.path.islink(fp):
-                        total_size += os.path.getsize(fp)
-        except:
-             return -1
-        return total_size
-    
-    @staticmethod
-    def _format_bytes(bytes_size):
-        """Formate la taille en B, KB, MB, GB."""
-        if bytes_size < 1024:
-            return f"{bytes_size} B"
-        elif bytes_size < 1024**2:
-            return f"{bytes_size/1024:.2f} KB"
-        elif bytes_size < 1024**3:
-            return f"{bytes_size/1024**2:.2f} MB"
-        else:
-            return f"{bytes_size/1024**3:.2f} GB"
-    
-    @staticmethod
     def _file_manager(action: str, source_path: str, destination_path: str | None = None, content: str | None = None) -> str:
         """
         Tool Python pour la gestion de fichiers/dossiers.
@@ -2319,8 +1516,10 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             if p_lower in ["images", "pictures", "photos"]: return IMAGES_REAL
             
             # 3. Redirection des chemins standards Windows vers les chemins réels (OneDrive)
+            # IMPORTANT: Seulement pour Desktop, Documents et Images. PAS pour Downloads/Téléchargements.
             std_docs = os.path.normpath(os.path.join(USER_HOME, "Documents"))
             std_desk = os.path.normpath(os.path.join(USER_HOME, "Desktop"))
+            std_images = os.path.normpath(os.path.join(USER_HOME, "Images"))
             
             # Si le chemin demandé commence par le faux chemin standard, on remplace par le vrai
             if p.startswith(std_docs) and DOCUMENTS_REAL not in p:
@@ -2328,7 +1527,11 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             
             if p.startswith(std_desk) and DESKTOP_REAL not in p:
                 return p.replace(std_desk, DESKTOP_REAL)
-                
+            
+            if p.startswith(std_images) and IMAGES_REAL not in p:
+                return p.replace(std_images, IMAGES_REAL)
+            
+            # Downloads/Téléchargements reste dans USER_HOME (pas de redirection OneDrive)
             return p
 
         # Application de la correction
@@ -2444,9 +1647,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         # --- 6. Calculer la Taille ---
         if action == "calculate_size":
             try:
-                size_bytes = AudioLoop._get_folder_size(source_path)
+                size_bytes = get_folder_size(source_path)
                 if size_bytes == -1: return "Erreur calcul taille."
-                return f"Taille : {AudioLoop._format_bytes(size_bytes)}."
+                return f"Taille : {format_bytes(size_bytes)}."
             except Exception as e: return f"Erreur : {e}"
 
         # --- 7. Archivage ---
@@ -2491,363 +1694,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         # On délègue toute la logique de chemin à file_manager
         return AudioLoop._file_manager(action="create_file", source_path=target_path, content=code)
                                                                                               
-    @staticmethod
-    def _get_time(timezone: str | None = None) -> str:
-        """
-        Tool Python appelé par Gemini via get_time.
-        Retourne une heure au format HH:MM (string).
-        """
-        from datetime import datetime
-        try:
-            # On essaye d'utiliser zoneinfo si le timezone est fourni
-            if timezone:
-                try:
-                    import zoneinfo
-                    tz = zoneinfo.ZoneInfo(timezone)
-                    now = datetime.now(tz)
-                except Exception:
-                    # Si le timezone est invalide, fallback heure locale
-                    now = datetime.now()
-            else:
-                # Par défaut, on considère l'heure de Paris
-                try:
-                    import zoneinfo
-                    tz = zoneinfo.ZoneInfo("Europe/Paris")
-                    now = datetime.now(tz)
-                except Exception:
-                    now = datetime.now()
-        except Exception:
-            now = datetime.now()
-
-        # On renvoie une chaîne simple, Gemini formulera la phrase
-        return now.strftime("%H:%M")
-    
-    @staticmethod
-    def _get_date(timezone: str | None = None) -> str:
-        """
-        Tool Python appelé par Gemini via get_date.
-        Retourne une date lisible : 'Lundi 3 Février 2025'
-        """
-        from datetime import datetime
-        import locale
-
-        # Forcer locale FR
-        try:
-            locale.setlocale(locale.LC_TIME, "fr_FR.UTF-8")
-        except:
-            pass  # Windows fallback
-
-        try:
-            if timezone:
-                try:
-                    import zoneinfo
-                    tz = zoneinfo.ZoneInfo(timezone)
-                    now = datetime.now(tz)
-                except:
-                    now = datetime.now()
-            else:
-                try:
-                    import zoneinfo
-                    tz = zoneinfo.ZoneInfo("Europe/Paris")
-                    now = datetime.now(tz)
-                except:
-                    now = datetime.now()
-        except:
-            now = datetime.now()
-
-        # Format : Lundi 3 Février 2025
-        try:
-            return now.strftime("%A %d %B %Y").capitalize()
-        except:
-            return now.strftime("%Y-%m-%d")
-    
-    @staticmethod
-    def _get_weather(location: str | None = None, day: str | None = None) -> str:
-        """
-        Météo réelle via l'API Open-Meteo.
-        Par défaut : Petit-Couronne, aujourd'hui.
-        """
-        import requests
-        from datetime import datetime, timedelta
-
-        # 1) Valeurs par défaut
-        if not location or not location.strip():
-            location = "Petit-Couronne"
-
-        if not day or not day.strip():
-            day_label = "aujourd'hui"
-            target_date = datetime.now().date()
-        else:
-            d = day.lower()
-            if "après" in d:
-                day_label = "après-demain"
-                target_date = datetime.now().date() + timedelta(days=2)
-            elif "demain" in d:
-                day_label = "demain"
-                target_date = datetime.now().date() + timedelta(days=1)
-            else:
-                day_label = "aujourd'hui"
-                target_date = datetime.now().date()
-
-        # 2) Géocodage pour obtenir latitude / longitude
-        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={location}&count=1"
-        geo_resp = requests.get(geo_url).json()
-
-        if "results" not in geo_resp or len(geo_resp["results"]) == 0:
-            return f"Je n'ai pas trouvé la ville '{location}', Monsieur."
-
-        lat = geo_resp["results"][0]["latitude"]
-        lon = geo_resp["results"][0]["longitude"]
-        resolved_name = geo_resp["results"][0]["name"]
-
-        # 3) Appel météo
-        meteo_url = (
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={lat}&longitude={lon}"
-            f"&current=temperature_2m,weather_code"
-            f"&daily=temperature_2m_max,temperature_2m_min,weather_code"
-            f"&timezone=Europe/Paris"
-        )
-
-        meteo = requests.get(meteo_url).json()
-
-        # 4) Si on parle d'aujourd'hui -> current weather
-        if target_date == datetime.now().date():
-            temp = meteo["current"]["temperature_2m"]
-            code = meteo["current"]["weather_code"]
-        else:
-            # Index dans daily
-            index = (target_date - datetime.now().date()).days
-            if index >= len(meteo["daily"]["weather_code"]):
-                return "Prévision météo trop lointaine, Monsieur."
-
-            temp = (
-                f"{meteo['daily']['temperature_2m_min'][index]}°C à "
-                f"{meteo['daily']['temperature_2m_max'][index]}°C"
-            )
-            code = meteo["daily"]["weather_code"][index]
-
-        # 5) Traduction météo du weather_code
-        weather_translate = {
-            0: "ciel dégagé",
-            1: "principalement dégagé",
-            2: "partiellement nuageux",
-            3: "ciel couvert",
-            45: "brouillard",
-            48: "brouillard givrant",
-            51: "bruine légère",
-            53: "bruine",
-            55: "bruine intense",
-            61: "pluie faible",
-            63: "pluie modérée",
-            65: "pluie forte",
-            71: "neige faible",
-            73: "neige modérée",
-            75: "forte neige",
-            95: "orage",
-        }
-
-        description = weather_translate.get(code, "temps variable")
-
-        # 6) Phrase finale
-        return f"À {resolved_name}, {day_label} : {temp} et {description}."
-    
-    @staticmethod
-    def _format_duration(seconds: float) -> str:
-        """Formate une durée en secondes en texte lisible (X min Y s)."""
-        total = int(seconds)
-        if total < 0:
-            total = 0
-        h = total // 3600
-        m = (total % 3600) // 60
-        s = total % 60
-
-        if h > 0:
-            return f"{h} h {m} min {s} s"
-        elif m > 0:
-            return f"{m} min {s} s"
-        else:
-            return f"{s} secondes"
-
-    @staticmethod
-    def _manage_stopwatch(action: str = "status") -> str:
-        """
-        Tool Python appelé par Gemini via manage_stopwatch.
-        Actions : start, stop, reset, status.
-        """
-        global STOPWATCH_START, STOPWATCH_ACCUM, STOPWATCH_RUNNING
-        now = datetime.now()
-        action = (action or "status").lower()
-
-        # START : on remet à zéro et on démarre
-        if action == "start":
-            STOPWATCH_START = now
-            STOPWATCH_ACCUM = 0.0
-            STOPWATCH_RUNNING = True
-            return "Chronomètre démarré, Monsieur."
-
-        # STOP : on fige le temps écoulé
-        if action == "stop":
-            if STOPWATCH_RUNNING and STOPWATCH_START is not None:
-                STOPWATCH_ACCUM += (now - STOPWATCH_START).total_seconds()
-                STOPWATCH_RUNNING = False
-                STOPWATCH_START = None
-                return f"Chronomètre arrêté, Monsieur. Temps écoulé : {AudioLoop._format_duration(STOPWATCH_ACCUM)}."
-            else:
-                return "Le chronomètre n'était pas en cours, Monsieur."
-
-        # RESET : on efface tout
-        if action == "reset":
-            STOPWATCH_START = None
-            STOPWATCH_ACCUM = 0.0
-            STOPWATCH_RUNNING = False
-            return "Le chronomètre a été remis à zéro, Monsieur."
-
-        # STATUS : temps écoulé actuel
-        if action == "status":
-            elapsed = STOPWATCH_ACCUM
-            if STOPWATCH_RUNNING and STOPWATCH_START is not None:
-                elapsed += (now - STOPWATCH_START).total_seconds()
-            if elapsed <= 0:
-                return "Le chronomètre est à zéro, Monsieur."
-            return f"Temps écoulé : {AudioLoop._format_duration(elapsed)}, Monsieur."
-
-        return "Je n'ai pas compris l'action demandée pour le chronomètre, Monsieur."
-    
-    @staticmethod
-    def _manage_timer(action: str = "status", duration_seconds: int | None = None) -> str:
-        """
-        Tool Python appelé par Gemini via manage_timer.
-        Gère un compte à rebours simple.
-        """
-        global TIMER_END, TIMER_ALERT_TRIGGERED
-        now = datetime.now()
-        action = (action or "status").lower()
-
-        # START : lancer un nouveau compte à rebours
-        if action == "start":
-            if duration_seconds is None or duration_seconds <= 0:
-                return "Je n'ai pas compris la durée du compte à rebours, Monsieur."
-
-            TIMER_END = now + timedelta(seconds=duration_seconds)
-            TIMER_ALERT_TRIGGERED = False  # on réarme l'alerte
-            duration_text = AudioLoop._format_duration(duration_seconds)
-            return f"Compte à rebours lancé pour {duration_text}, Monsieur."
-
-        # STATUS : savoir où on en est
-        if action == "status":
-            if TIMER_END is None:
-                return "Aucun compte à rebours n'est en cours, Monsieur."
-            remaining = (TIMER_END - now).total_seconds()
-            if remaining <= 0:
-                # Il est terminé, même si le watcher l'a déjà vu
-                TIMER_END = None
-                TIMER_ALERT_TRIGGERED = False
-                return "Le compte à rebours est terminé, Monsieur."
-            return f"Il reste {AudioLoop._format_duration(remaining)} au compte à rebours, Monsieur."
-
-        # CANCEL : annuler le minuteur
-        if action == "cancel":
-            if TIMER_END is None:
-                return "Il n'y avait aucun compte à rebours en cours, Monsieur."
-            TIMER_END = None
-            TIMER_ALERT_TRIGGERED = False
-            return "J'ai annulé le compte à rebours, Monsieur."
-
-        return "Je n'ai pas compris l'action demandée pour le compte à rebours, Monsieur."
-    
-    @staticmethod
-    def _open_app(application: str) -> str:
-        """
-        Tool Python appelé par Gemini via open_app.
-        Ouvre une application Windows en utilisant un mapping simple.
-        """
-        import subprocess
-        import os
-
-        # Dictionnaire d'applications courantes
-        APP_MAP = {
-            "firefox": r"C:\Program Files\Mozilla Firefox\firefox.exe",
-            "edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            "vscode": r"C:\Users\amarz\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-            "code": r"C:\Users\amarz\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-            "spotify": r"C:\Users\amarz\AppData\Roaming\Spotify\Spotify.exe",
-            "discord": r"C:\Users\amarz\AppData\Local\Discord\app-1.0.9217\Discord.exe",
-            "steam": r"C:\Program Files (x86)\Steam\steam.exe",
-            "invite de commandes": r"C:\Users\amarz\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\System Tools\Command Prompt.lnk",
-            "powershell": r"C:\Users\amarz\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\System Tools\Command Prompt.lnk",
-            "excel": r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
-            "word": r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
-            "outlook": r"C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE",
-        }
-
-        app = application.lower().strip()
-
-        # Trouver l'app la plus proche
-        for key in APP_MAP:
-            if key in app:
-                exe_path = APP_MAP[key]
-                break
-        else:
-            return f"Je ne connais pas cette application : {application}, Monsieur."
-
-        if not os.path.exists(exe_path):
-            return f"L'application '{application}' semble installée ailleurs, Monsieur."
-
-        try:
-            subprocess.Popen(exe_path)
-            return f"J’ouvre {application}, Monsieur."
-        except Exception as e:
-            return f"J’ai rencontré une erreur en ouvrant {application} : {e}."
-        
-    @staticmethod
-    def _open_website(url_or_name: str) -> str:
-        """
-        Ouvre un site web via le navigateur par défaut.
-        Supporte les noms de sites ('youtube', 'tryhackme', 'outlook') et les URLs complètes.
-        """
-        import webbrowser
-
-        SITE_MAP = {
-            "google": "https://www.google.com",
-            "youtube": "https://www.youtube.com",
-            "tryhackme": "https://tryhackme.com",
-            "outlook": "https://outlook.office.com",
-            "esigelec": "https://www.esigelec.fr",
-            "gmail": "https://mail.google.com",
-            "chatgpt": "https://chatgpt.com/",
-            "github": "https://github.com",
-            "wikipedia": "https://wikipedia.org",
-            "gemini": "https://gemini.google.com/app?hl=fr",
-        }
-
-        u = url_or_name.lower().strip()
-
-        # Si l'utilisateur donne une URL complète :
-        if u.startswith("http://") or u.startswith("https://"):
-            webbrowser.open(u)
-            return f"J’ouvre {u}, Monsieur."
-
-        # Sinon on cherche dans le dictionnaire
-        for key in SITE_MAP:
-            if key in u:
-                url = SITE_MAP[key]
-                webbrowser.open(url)
-                return f"J’ouvre {key}, Monsieur."
-
-        # Dernière chance : recherche Google
-        search_url = f"https://www.google.com/search?q={url_or_name.replace(' ', '+')}"
-        webbrowser.open(search_url)
-        return (
-            f"Je n'ai pas trouvé le site exact, Monsieur. "
-            f"J’ai effectué une recherche Google pour : {url_or_name}"
-        )
-    
-    
-    
-        
-    
-    @staticmethod
     def _execute_python(code: str, confirmed: bool = False) -> str:
         """
         Exécute du code Python avec confirmation obligatoire et sécurité maximale.
@@ -2930,6 +1776,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         code = _replace_join_home_folder(code, ["Desktop", "Bureau"], DESKTOP_REAL)
         code = _replace_join_home_folder(code, ["Documents"],        DOCUMENTS_REAL)
         code = _replace_join_home_folder(code, ["Images", "Pictures"], IMAGES_REAL)
+        # Note: Downloads/Téléchargements n'est PAS redirigé vers OneDrive
 
         # 5) Helper : os.path.expanduser("~") + "\\Dossier" ou "/Dossier"
         def _replace_concat_home_folder(code_str, folder_names, target_path):
@@ -2943,6 +1790,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         code = _replace_concat_home_folder(code, ["Desktop", "Bureau"], DESKTOP_REAL)
         code = _replace_concat_home_folder(code, ["Documents"],        DOCUMENTS_REAL)
         code = _replace_concat_home_folder(code, ["Images", "Pictures"], IMAGES_REAL)
+        # Note: Downloads/Téléchargements n'est PAS redirigé vers OneDrive
         # ==========================================
         # ÉTAPE 1 : MODE PREVIEW (confirmed=False)
         # ==========================================
@@ -3158,19 +2006,19 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         Surveille en tâche de fond le compte à rebours.
         Quand il atteint zéro, annonce automatiquement la fin.
         """
-        global TIMER_END, TIMER_ALERT_TRIGGERED
         while True:
             try:
                 await asyncio.sleep(0.5)
-                if TIMER_END is None:
+                timer_end = get_timer_end()
+                if timer_end is None:
                     continue
 
                 now = datetime.now()
-                remaining = (TIMER_END - now).total_seconds()
-                if remaining <= 0 and not TIMER_ALERT_TRIGGERED:
+                remaining = (timer_end - now).total_seconds()
+                if remaining <= 0 and not get_timer_alert_triggered():
                     print(">>> [DEBUG] Timer finished, sending auto alert.")
-                    TIMER_ALERT_TRIGGERED = True
-                    TIMER_END = None
+                    set_timer_alert_triggered(True)
+                    set_timer_end(None)  # Réinitialiser le timer après l'alerte
 
                     message = "Le compte à rebours est terminé, Monsieur."
                     # On envoie dans la file TTS comme une réponse normale
@@ -3412,8 +2260,18 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         with torch.no_grad():
                             emb = self.sb_classifier.encode_batch(audio_tensor).squeeze().cpu().numpy()
                         
-                        # Calculer la similarité cosine avec l'embedding cible
-                        score = self._sb_cosine(emb, self.sb_target)
+                        # AMÉLIORATION 1: Utiliser l'embedding pré-normalisé pour accélérer
+                        if hasattr(self, 'sb_target_normalized') and self.sb_target_normalized is not None:
+                            # Version optimisée avec embedding pré-normalisé (plus rapide)
+                            emb_norm = np.linalg.norm(emb)
+                            if emb_norm > 0:
+                                emb_normalized = emb / emb_norm
+                                score = float(np.dot(emb_normalized, self.sb_target_normalized))
+                            else:
+                                score = 0.0
+                        else:
+                            # Fallback vers l'ancienne méthode si pas de cache
+                            score = self._sb_cosine(emb, self.sb_target)
                         
                         # Détection plus réactive : 1 seul hit suffit (au lieu de 2)
                         # Cela rend la détection plus immédiate et fiable
@@ -3512,23 +2370,18 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 continue
 
 
-    @staticmethod
-    def _shorten_for_tts(text: str) -> str:
-        """Retourne une version courte du texte pour la voix (première phrase ou troncation)."""
-        if not text:
-            return ""
-        txt = text.strip().replace("\n", " ")
-        # Chercher la fin de la première phrase
-        end_idx = None
-        for i, ch in enumerate(txt):
-            if ch in ".?!":
-                if i >= 20:  # Éviter de couper sur une abréviation ultra courte
-                    end_idx = i + 1
-                    break
-        if end_idx is None:
-            end_idx = min(len(txt), 150) # Tronquer à 150 caractères maximum si pas de point
-        spoken = txt[:end_idx].strip()
-        return spoken
+    def _get_additional_state(self) -> Dict[str, Any]:
+        """Retourne l'état additionnel à sauvegarder"""
+        try:
+            return {
+                "conversation_active": self.conversation_active,
+                "is_speaking": self.is_speaking,
+                "is_busy": self.is_busy,
+                "last_interaction_time": self.last_interaction_time
+            }
+        except Exception as e:
+            logger.debug(f"Erreur lors de la récupération de l'état additionnel: {e}")
+            return {}
 
     async def receive_text(self):
         """
@@ -3608,7 +2461,11 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 
                                 try:
                                     # Exécution de l'outil
-                                    result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
+                                    # Gérer les fonctions d'instance (qui nécessitent self)
+                                    if fname == "manage_tasks":
+                                        result = await asyncio.to_thread(self._manage_tasks, **args)
+                                    else:
+                                        result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
                                     
                                     # Si on a été interrompu pendant l'exécution, on annule l'envoi
                                     if self._interrupted_flag:
@@ -3676,7 +2533,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         import re
                         text_lower_check = text_buffer.lower()
                         
-                        # Liste étendue des mots-clés d'au revoir (plus de variantes)
+                        # Liste étendue des mots-clés d'au revoir - patterns simplifiés pour détecter même au milieu d'une phrase
                         goodbye_patterns = [
                             r"\bau\s+revoir\b",
                             r"\bà\s+plus\b",
@@ -3685,18 +2542,18 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             r"\bà\s+bientôt\b",
                             r"\ba\s+bientot\b",
                             r"\bbonne\s+nuit\b",
-                            r"\bsalut\s*$",  # "salut" à la fin d'une phrase
+                            r"\bsalut\s*[.,;:!?]*\s*$",  # "salut" à la fin
                             r"\bciao\b",
                             r"\bsee\s+you\b",
                             r"\bgoodbye\b",
                             r"\bfarewell\b",
                             r"\bà\s+la\s+prochaine\b",
-                            r"\bprochainement\b"
+                            r"\bprochainement\b",
                         ]
                         
                         # Vérifier si un pattern d'au revoir est détecté dans le buffer
                         for pattern in goodbye_patterns:
-                            if re.search(pattern, text_lower_check):
+                            if re.search(pattern, text_lower_check, re.IGNORECASE):
                                 logger.info(f"Au revoir détecté dans la réponse: '{pattern}'")
                                 await self._handle_goodbye()
                                 text_buffer = ""  # Vider le buffer
@@ -3722,7 +2579,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 # Vérifier aussi chaque phrase individuellement
                                 sentence_lower = raw_sentence.lower()
                                 for pattern in goodbye_patterns:
-                                    if re.search(pattern, sentence_lower):
+                                    if re.search(pattern, sentence_lower, re.IGNORECASE):
                                         logger.info(f"Au revoir détecté dans une phrase: '{pattern}'")
                                         await self._handle_goodbye()
                                         text_buffer = ""
@@ -3734,7 +2591,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 
                                 # === LE FIX EST ICI ===
                                 # On nettoie AVANT d'envoyer à la voix
-                                clean_sentence = self._clean_text_for_tts(raw_sentence)
+                                clean_sentence = clean_text_for_tts(raw_sentence)
                                 
                                 if clean_sentence:
                                     self.is_speaking = True
@@ -3751,6 +2608,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     
                     # DERNIÈRE VÉRIFICATION À LA FIN DU TOUR
                     import re
+                    # Patterns simplifiés pour détecter même au milieu d'une phrase
                     goodbye_patterns_final = [
                         r"\bau\s+revoir\b",
                         r"\bà\s+plus\b",
@@ -3761,11 +2619,12 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         r"\bbonne\s+nuit\b",
                         r"\bciao\b",
                         r"\bsee\s+you\b",
-                        r"\bgoodbye\b"
+                        r"\bgoodbye\b",
+                        r"\bà\s+la\s+prochaine\b",
                     ]
                     
                     for pattern in goodbye_patterns_final:
-                        if re.search(pattern, text_lower):
+                        if re.search(pattern, text_lower, re.IGNORECASE):
                             logger.info(f"Au revoir détecté à la fin du tour: '{pattern}'")
                             await self._handle_goodbye()
                             text_buffer = ""
@@ -3785,7 +2644,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     self.gui_queue.put(("ASSISTANT_TEXT", text_buffer.strip()))
                     
                     # 2. On envoie le texte NETTOYÉ (sans *) à Azure pour qu'il le lise bien
-                    clean_buffer = self._clean_text_for_tts(text_buffer)
+                    clean_buffer = clean_text_for_tts(text_buffer)
                     await self.response_queue_tts.put(clean_buffer)
                     
                     text_buffer = "" 
@@ -3802,16 +2661,26 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     # (Pour l'instant on utilise un placeholder, idéalement on devrait capturer le texte transcrit)
                     user_input = self._current_user_input if hasattr(self, '_current_user_input') and self._current_user_input else "conversation_audio"
                     
-                    # Enregistrer l'interaction
+                    # Enregistrer l'interaction dans le learning system
                     try:
                         self.learning_system.record_interaction(
                             user_input=user_input,
                             cypher_response=self._current_response,
-                            tools_used=self._current_tools_used.copy() if self._current_tools_used else [],
+                            tools_used=self._current_tools_used,
                             context={"timestamp": datetime.now().isoformat()}
                         )
                     except Exception as e:
                         logger.debug(f"Erreur lors de l'enregistrement de l'interaction: {e}")
+                    
+                    # AMÉLIORATION 2 & 4: Enregistrer le tour dans le StateManager pour résumé et sauvegarde
+                    try:
+                        self.state_manager.add_conversation_turn(
+                            user_input=user_input,
+                            assistant_response=self._current_response,
+                            tools_used=self._current_tools_used
+                        )
+                    except Exception as e:
+                        logger.debug(f"Erreur lors de l'ajout du tour au StateManager: {e}")
                     
                     # Réinitialiser pour la prochaine interaction
                     self._current_user_input = ""
@@ -3858,7 +2727,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
     
             try:
                 # 1. On transforme le texte brut en SSML (XML avec réglages)
-                ssml_text = self._generate_ssml(full_text)
+                ssml_text = generate_ssml(full_text, AZURE_VOICE_NAME, TTS_RATE, TTS_PITCH)
 
                 # 2. On génère l'audio via SSML
                 def _generate_audio_blocking():
@@ -4084,6 +2953,11 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             tg.create_task(self.play_audio())
                             tg.create_task(self.timer_watcher())
                             tg.create_task(self.agenda_watcher())
+                            # AMÉLIORATION 4: Auto-sauvegarde périodique
+                            tg.create_task(self.state_manager.auto_save_loop(
+                                learning_system=self.learning_system,
+                                additional_state_callback=self._get_additional_state
+                            ))
                     except* (websockets.exceptions.ConnectionClosed,
                             websockets.exceptions.ConnectionClosedError,
                             ConnectionResetError) as eg:
@@ -4133,27 +3007,28 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
 
 FUNCTION_MAP = {
-    "get_time": AudioLoop._get_time,
-    "get_date": AudioLoop._get_date,
-    "get_weather": AudioLoop._get_weather,
-    "manage_stopwatch": AudioLoop._manage_stopwatch,
-    "manage_timer": AudioLoop._manage_timer,
-    "open_app": AudioLoop._open_app,
-    "open_website": AudioLoop._open_website,
+    "get_time": get_time,
+    "get_date": get_date,
+    "get_weather": get_weather,
+    "manage_stopwatch": manage_stopwatch,
+    "manage_timer": manage_timer,
+    "open_app": open_app,
+    "open_website": open_website,
     "execute_python": AudioLoop._execute_python,
     "get_python_execution_history": AudioLoop._get_python_execution_history,
     "file_manager": AudioLoop._file_manager,
-    "window_manager": AudioLoop._window_manager,
-    "system_control": AudioLoop._system_control,
-    "process_manager": AudioLoop._process_manager,
-    "power_control": AudioLoop._power_control,
-    "system_optimize": AudioLoop._system_optimize,
-    "network_manager": AudioLoop._network_manager,
+    "window_manager": window_manager,
+    "system_control": system_control,
+    "process_manager": process_manager,
+    "power_control": power_control,
+    "system_optimize": system_optimize,
+    "network_manager": network_manager,
     "memory_manager": AudioLoop._memory_manager,
     "error_history_tool": AudioLoop._error_history,
-    "manage_agenda": AudioLoop._manage_agenda,
+    "manage_agenda": manage_agenda,
     "email_manager": AudioLoop._email_manager,
     "document_manager": AudioLoop._document_manager,
+    "manage_tasks": AudioLoop._manage_tasks,
     "expert_coder": expert_coder_tool,
     "expert_coder_write_file": AudioLoop._expert_coder_write_file,
     "expert_stats": expert_stats,
