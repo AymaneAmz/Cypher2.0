@@ -101,6 +101,11 @@ from modules.time_management import (
 from core.tts_utils import generate_ssml, clean_text_for_tts, shorten_for_tts
 from core.utils import get_weather, get_folder_size, format_bytes
 from modules.app_launcher import open_app, open_website
+from modules.python_executor import execute_python, get_python_execution_history
+from modules.file_manager import file_manager
+from modules.document_manager import document_manager
+from modules.email_manager import email_manager
+from modules.memory_manager import memory_manager
 
 # Logger principal
 logger = get_logger("main")
@@ -113,32 +118,13 @@ AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION") 
 AZURE_VOICE_NAME = "fr-FR-HenriNeural" 
 
-PENDING_PYTHON_CODE = None  # Stockage du code en attente de confirmation
-PYTHON_EXECUTION_LOG = []   # Historique des exécutions
-
 WAKE_WORD_SENSITIVITY = 0.5
 WAKE_MIN_VOLUME = 0
 
 TTS_RATE = "+15%"
 TTS_PITCH = "default"
 
-USER_HOME = os.path.expanduser("~")
-ONEDRIVE_BASE = os.path.join(USER_HOME, "OneDrive")
-
-# Chemins réels
-DESKTOP_REAL   = os.path.join(ONEDRIVE_BASE, "Desktop")
-DOCUMENTS_REAL = os.path.join(ONEDRIVE_BASE, "Documents")
-IMAGES_REAL    = os.path.join(ONEDRIVE_BASE, "Images")
-
-# Si l'utilisateur a renommé son dossier OneDrive (cas rare)
-if not os.path.exists(DESKTOP_REAL):
-    DESKTOP_REAL = os.path.join(USER_HOME, "Desktop")
-
-if not os.path.exists(DOCUMENTS_REAL):
-    DOCUMENTS_REAL = os.path.join(USER_HOME, "Documents")
-
-if not os.path.exists(IMAGES_REAL):
-    IMAGES_REAL = os.path.join(USER_HOME, "Images")
+# Les chemins OneDrive sont maintenant dans modules/python_executor.py et modules/file_manager.py
 
 if not GEMINI_API_KEY:
     logger.critical("GEMINI_API_KEY not found. Please set it in your .env file.")
@@ -377,10 +363,8 @@ class AudioLoop:
 {learning_preferences}{context_summary_text}
 
 ⚠️ CONFIGURATION SYSTÈME CRITIQUE :
-Le dossier "Documents" réel de l'utilisateur est : {DOCUMENTS_REAL}
-Le dossier "Bureau" réel de l'utilisateur est : {DESKTOP_REAL}
-Le dossier "Images" réel de l'utilisateur est : {IMAGES_REAL}
-Si tu dois écrire un script Python ou chercher un fichier, utilise TOUJOURS ces chemins absolus au lieu des chemins par défaut de Windows.
+Les chemins Desktop, Documents et Images sont automatiquement redirigés vers OneDrive si nécessaire par les outils file_manager et execute_python.
+Si tu dois écrire un script Python ou chercher un fichier, utilise TOUJOURS les chemins absolus au lieu des chemins par défaut de Windows.
 
 IMPORTANT : Le dossier "Downloads" (Téléchargements) doit utiliser le chemin standard Windows (C:\\Users\\...\\Downloads) et NON PAS le chemin OneDrive. Ne redirige PAS Downloads vers OneDrive.
 
@@ -1494,187 +1478,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
         return "Action mémoire inconnue."
 
-    def _file_manager(action: str, source_path: str, destination_path: str | None = None, content: str | None = None) -> str:
-        """
-        Tool Python pour la gestion de fichiers/dossiers.
-        Gère intelligemment la redirection vers OneDrive.
-        """
-        import os
-        import shutil
-        
-        # --- CORRECTIF ONEDRIVE : Redirection automatique des chemins ---
-        def _resolve_path(p):
-            if not p: return p
-            # 1. Gestion du tilde ~ et normalisation
-            p = os.path.expanduser(p)
-            p = os.path.normpath(p)
-            
-            # 2. Détection des raccourcis simples
-            p_lower = p.lower().strip(os.path.sep)
-            if p_lower in ["documents", "doc", "mes documents"]: return DOCUMENTS_REAL
-            if p_lower in ["desktop", "bureau"]: return DESKTOP_REAL
-            if p_lower in ["images", "pictures", "photos"]: return IMAGES_REAL
-            
-            # 3. Redirection des chemins standards Windows vers les chemins réels (OneDrive)
-            # IMPORTANT: Seulement pour Desktop, Documents et Images. PAS pour Downloads/Téléchargements.
-            std_docs = os.path.normpath(os.path.join(USER_HOME, "Documents"))
-            std_desk = os.path.normpath(os.path.join(USER_HOME, "Desktop"))
-            std_images = os.path.normpath(os.path.join(USER_HOME, "Images"))
-            
-            # Si le chemin demandé commence par le faux chemin standard, on remplace par le vrai
-            if p.startswith(std_docs) and DOCUMENTS_REAL not in p:
-                return p.replace(std_docs, DOCUMENTS_REAL)
-            
-            if p.startswith(std_desk) and DESKTOP_REAL not in p:
-                return p.replace(std_desk, DESKTOP_REAL)
-            
-            if p.startswith(std_images) and IMAGES_REAL not in p:
-                return p.replace(std_images, IMAGES_REAL)
-            
-            # Downloads/Téléchargements reste dans USER_HOME (pas de redirection OneDrive)
-            return p
-
-        # Application de la correction
-        source_path = _resolve_path(source_path)
-        if destination_path:
-            destination_path = _resolve_path(destination_path)
-            
-        action = action.lower()
-
-        # --- NOUVEAU : CRÉER UN FICHIER (ÉCRIRE DU CODE) ---
-        if action == "create_file":
-            if not content:
-                return "Erreur : Le contenu du fichier est manquant."
-            try:
-                # Créer le dossier parent si besoin
-                parent_dir = os.path.dirname(source_path)
-                if parent_dir and not os.path.exists(parent_dir):
-                    os.makedirs(parent_dir, exist_ok=True)
-
-                with open(source_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                return f"Fichier créé avec succès : {source_path}"
-            except Exception as e:
-                return f"Erreur lors de l'écriture du fichier : {e}"
-
-        # --- NOUVEAU : LIRE UN FICHIER ---
-        if action == "read_file":
-            if not os.path.exists(source_path):
-                return f"Le fichier '{source_path}' n'existe pas."
-            try:
-                with open(source_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    data = f.read()
-                return f"Contenu de '{source_path}' :\n\n{data[:4000]}" # Limite 4000 chars
-            except Exception as e:
-                return f"Erreur de lecture : {e}"
-        
-        # --- 1. Créer un Dossier/Structure ---
-        if action == "create_dir":
-            try:
-                os.makedirs(source_path, exist_ok=True)
-                return f"Le dossier/structure '{source_path}' a été créé avec succès."
-            except Exception as e:
-                return f"Erreur lors de la création de '{source_path}': {e}"
-        
-        # --- 2. Lister les Fichiers/Scanner ---
-        if action == "list_files":
-            try:
-                if not os.path.isdir(source_path):
-                    return f"Erreur : '{source_path}' n'est pas un dossier valide ou n'existe pas."
-                
-                # Lister les fichiers
-                items = os.listdir(source_path)
-                if not items:
-                    return f"Le répertoire '{source_path}' est vide."
-                
-                # On sépare dossiers et fichiers pour plus de clarté
-                dirs = [d for d in items if os.path.isdir(os.path.join(source_path, d))]
-                files = [f for f in items if os.path.isfile(os.path.join(source_path, f))]
-                
-                # On limite l'affichage pour ne pas saturer la réponse
-                report = f"📂 Contenu de '{source_path}' :\n"
-                if dirs:
-                    report += "📁 DOSSIERS :\n" + "\n".join([f"  - {d}" for d in dirs[:15]])
-                    if len(dirs) > 15: report += "\n  ... (et autres dossiers)"
-                    report += "\n"
-                if files:
-                    report += "\n📄 FICHIERS :\n" + "\n".join([f"  - {f}" for f in files[:15]])
-                    if len(files) > 15: report += "\n  ... (et autres fichiers)"
-                
-                return report
-            except Exception as e:
-                return f"Erreur lors de la lecture du répertoire '{source_path}': {e}"
-
-        # --- 3. Déplacer / Renommer ---
-        if action == "move" or action == "rename":
-            if action == "rename" and destination_path:
-                destination_path = os.path.join(os.path.dirname(source_path), destination_path)
-            
-            if not destination_path:
-                return "Le chemin de destination est manquant."
-
-            try:
-                shutil.move(source_path, destination_path)
-                return f"'{source_path}' a été déplacé/renommé vers '{destination_path}'."
-            except Exception as e:
-                return f"Erreur : {e}"
-
-        # --- 4. Copier ---
-        if action == "copy":
-            if not destination_path:
-                return "Le chemin de destination est manquant."
-            try:
-                if os.path.isdir(source_path):
-                    shutil.copytree(source_path, destination_path, dirs_exist_ok=True) # Fix dirs_exist_ok
-                else:
-                    shutil.copy2(source_path, destination_path)
-                return f"Copié vers '{destination_path}'."
-            except Exception as e:
-                return f"Erreur copie : {e}"
-
-        # --- 5. Supprimer ---
-        if action == "delete":
-            try:
-                if os.path.isdir(source_path):
-                    shutil.rmtree(source_path)
-                    return f"Dossier '{source_path}' supprimé."
-                else:
-                    os.remove(source_path)
-                    return f"Fichier '{source_path}' supprimé."
-            except Exception as e:
-                return f"Erreur suppression : {e}"
-
-        # --- 6. Calculer la Taille ---
-        if action == "calculate_size":
-            try:
-                size_bytes = get_folder_size(source_path)
-                if size_bytes == -1: return "Erreur calcul taille."
-                return f"Taille : {format_bytes(size_bytes)}."
-            except Exception as e: return f"Erreur : {e}"
-
-        # --- 7. Archivage ---
-        if action == "archive":
-            if not destination_path: return "Destination manquante."
-            try:
-                base_name = os.path.basename(destination_path)
-                root_dir = os.path.dirname(source_path)
-                archive_path = shutil.make_archive(
-                    base_name=destination_path, format='zip', root_dir=root_dir,
-                    base_dir=os.path.basename(source_path) if os.path.isdir(source_path) else source_path
-                )
-                return f"Archivé dans : {archive_path}"
-            except Exception as e: return f"Erreur archivage : {e}"
-
-        # --- 8. Désarchivage ---
-        if action == "unarchive":
-            if not destination_path: return "Destination manquante."
-            try:
-                shutil.unpack_archive(filename=source_path, extract_dir=destination_path)
-                return f"Décompressé dans '{destination_path}'."
-            except Exception as e: return f"Erreur décompression : {e}"
-
-        return f"Action inconnue : {action}"                                                                                     
-
     @staticmethod
     def _expert_coder_write_file(target_path: str) -> str:
         """
@@ -1692,315 +1495,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             return "Erreur : aucun code expert en mémoire. Tu dois d'abord appeler l'outil 'expert_coder'."
 
         # On délègue toute la logique de chemin à file_manager
-        return AudioLoop._file_manager(action="create_file", source_path=target_path, content=code)
-                                                                                              
-    def _execute_python(code: str, confirmed: bool = False) -> str:
-        """
-        Exécute du code Python avec confirmation obligatoire et sécurité maximale.
-        """
-        # ⚠️ CRITIQUE : Déclarer les variables globales EN PREMIER
-        global PENDING_PYTHON_CODE, PYTHON_EXECUTION_LOG
+        return file_manager(action="create_file", source_path=target_path, content=code)
 
-        def _record_error(source: str, message: str, code_snippet: str | None = None):
-        
-            import os, json
-            from datetime import datetime
-            import hashlib
-
-            try:
-                error_file = str(get_memory_dir() / "cypher_memory_cortex.json")
-
-                # Charger l'existant
-                if os.path.exists(error_file):
-                    try:
-                        with open(error_file, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                    except json.JSONDecodeError:
-                        data = {}
-                else:
-                    data = {}
-
-                # Normalisation
-                source = source.lower()
-                if source not in data:
-                    data[source] = []
-
-                # On compress un peu l’info
-                msg = (message or "").strip()
-                if len(msg) > 400:
-                    msg = msg[:400] + "… (tronqué)"
-
-                # petit hash pour reconnaître les erreurs récurrentes
-                base = (source + "|" + msg).encode("utf-8", errors="ignore")
-                err_hash = hashlib.sha1(base).hexdigest()[:12]
-
-                entry = {
-                    "hash": err_hash,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "message": msg,
-                    "code_excerpt": (code_snippet[:400] + "…") if code_snippet else None,
-                }
-
-                # On évite de stocker 200 fois la même erreur : si même hash déjà présent on ne rajoute pas
-                if not any(e.get("hash") == err_hash for e in data[source]):
-                    data[source].append(entry)
-
-                with open(error_file, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-
-            except Exception:
-                # Surtout ne jamais faire planter Cypher à cause de la mémoire d'erreurs
-                pass
-        
-        import subprocess
-        import tempfile
-        import os
-        import re
-        from datetime import datetime
-        
-        # ==========================================
-        # CORRECTION AUTOMATIQUE DES CHEMINS UTILISATEUR (OneDrive)
-        # ==========================================
-        # On force les dossiers vers OneDrive pour ton user
-        
-        # 4) Helper : os.path.join(os.path.expanduser("~"), "Dossier")
-        def _replace_join_home_folder(code_str, folder_names, target_path):
-            pattern = (
-                r'os\.path\.join\(\s*os\.path\.expanduser\(["\']~["\']\)\s*,\s*["\']('
-                + "|".join(folder_names) +
-                r')["\']\s*\)'
-            )
-            # IMPORTANT : utiliser une fonction pour que re.sub ne réinterprète pas les backslashes
-            return re.sub(pattern, lambda m: repr(target_path), code_str)
-
-        code = _replace_join_home_folder(code, ["Desktop", "Bureau"], DESKTOP_REAL)
-        code = _replace_join_home_folder(code, ["Documents"],        DOCUMENTS_REAL)
-        code = _replace_join_home_folder(code, ["Images", "Pictures"], IMAGES_REAL)
-        # Note: Downloads/Téléchargements n'est PAS redirigé vers OneDrive
-
-        # 5) Helper : os.path.expanduser("~") + "\\Dossier" ou "/Dossier"
-        def _replace_concat_home_folder(code_str, folder_names, target_path):
-            pattern = (
-                r'os\.path\.expanduser\(["\']~["\']\)\s*\+\s*["\'][\\/]+('
-                + "|".join(folder_names) +
-                r')["\']'
-            )
-            return re.sub(pattern, lambda m: repr(target_path), code_str)
-
-        code = _replace_concat_home_folder(code, ["Desktop", "Bureau"], DESKTOP_REAL)
-        code = _replace_concat_home_folder(code, ["Documents"],        DOCUMENTS_REAL)
-        code = _replace_concat_home_folder(code, ["Images", "Pictures"], IMAGES_REAL)
-        # Note: Downloads/Téléchargements n'est PAS redirigé vers OneDrive
-        # ==========================================
-        # ÉTAPE 1 : MODE PREVIEW (confirmed=False)
-        # ==========================================
-        if not confirmed:
-            # Stocker le code CORRIGÉ pour le prochain appel
-            PENDING_PYTHON_CODE = code.strip()
-            
-            # Analyser le code pour donner un résumé intelligent
-            summary_parts = []
-            
-            # Détection des imports
-            imports = re.findall(r'^import\s+(\w+)', code, re.MULTILINE)
-            imports += re.findall(r'^from\s+(\w+)', code, re.MULTILINE)
-            if imports:
-                summary_parts.append(f"• Utilise les bibliothèques : {', '.join(set(imports))}")
-            
-            # Détection des opérations fichiers
-            if 'open(' in code or 'Path(' in code:
-                summary_parts.append("• Manipule des fichiers")
-            if 'os.mkdir' in code or 'os.makedirs' in code:
-                summary_parts.append("• Crée des dossiers")
-            if 'os.remove' in code or 'os.unlink' in code or 'shutil.rmtree' in code:
-                summary_parts.append("• Supprime des fichiers/dossiers")
-            if 'shutil.copy' in code or 'shutil.move' in code:
-                summary_parts.append("• Copie ou déplace des fichiers")
-            
-            # Détection des boucles
-            if 'for ' in code or 'while ' in code:
-                summary_parts.append("• Contient des boucles")
-            
-            # Détection des opérations réseau
-            if 'requests.' in code or 'urllib' in code or 'http' in code:
-                summary_parts.append("• Effectue des requêtes réseau")
-            
-            summary = "\n".join(summary_parts) if summary_parts else "• Script Python personnalisé"
-            
-            return (
-                f"CODE_EN_ATTENTE_DE_CONFIRMATION\n\n"
-                f"Résumé de ce que le code va faire :\n{summary}\n\n"
-                f"Lignes de code : {len(code.splitlines())}\n"
-                f"Taille : {len(code)} caractères"
-            )
-        
-        # ==========================================
-        # ÉTAPE 2 : MODE EXÉCUTION (confirmed=True)
-        # ==========================================
-        
-        # Utiliser le code stocké si disponible, sinon le code fourni
-        if PENDING_PYTHON_CODE:
-            code_to_execute = PENDING_PYTHON_CODE
-            PENDING_PYTHON_CODE = None  # Nettoyer après utilisation
-        else:
-            code_to_execute = code.strip()
-        
-        if not code_to_execute:
-            return "Erreur : Aucun code à exécuter, Monsieur."
-        
-        # --- SÉCURITÉ : Blacklist de chemins interdits ---
-        FORBIDDEN_PATHS = [
-            r"C:\System32",
-            "/etc",
-            "/sys",
-            "/root",
-            "/bin",
-            "/sbin",
-        ]
-        
-        code_lower = code_to_execute.lower()
-        for forbidden in FORBIDDEN_PATHS:
-            if forbidden.lower() in code_lower:
-                return f"🚫 SÉCURITÉ : Je ne peux pas exécuter du code qui accède à {forbidden}, Monsieur."
-        
-        # --- SÉCURITÉ : Détection de commandes système dangereuses ---
-        DANGEROUS_PATTERNS = [
-            r'os\.system\s*\(',
-            r'subprocess\.call\s*\(.+shell\s*=\s*True',
-            r'eval\s*\(',
-            r'exec\s*\(',
-        ]
-        
-        for pattern in DANGEROUS_PATTERNS:
-            if re.search(pattern, code_to_execute):
-                return f"🚫 SÉCURITÉ : Le code contient une opération potentiellement dangereuse ({pattern}), Monsieur."
-        
-        # --- CRÉATION DU FICHIER TEMPORAIRE ---
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode='w', 
-                suffix='.py', 
-                delete=False, 
-                encoding='utf-8'
-            ) as f:
-                f.write(code_to_execute)
-                temp_file = f.name
-            
-            print(f">>> [DEBUG] Code Python écrit dans : {temp_file}")
-            
-            # --- EXÉCUTION AVEC TIMEOUT ---
-            start_time = datetime.now()
-            
-            result = subprocess.run(
-                ['python', temp_file],
-                capture_output=True,
-                text=True,
-                timeout=90,  # Timeout de 30 secondes
-                encoding='utf-8',
-                errors='replace'
-            )
-            
-            execution_time = (datetime.now() - start_time).total_seconds()
-            
-            # --- NETTOYAGE ---
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-            
-            # --- LOG DE L'EXÉCUTION ---
-            log_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "code_lines": len(code_to_execute.splitlines()),
-                "execution_time": execution_time,
-                "success": result.returncode == 0,
-                "stdout_length": len(result.stdout),
-                "stderr_length": len(result.stderr),
-            }
-            PYTHON_EXECUTION_LOG.append(log_entry)
-            
-            # --- FORMATAGE DE LA RÉPONSE ---
-            if result.returncode == 0:
-                # Succès
-                output = result.stdout.strip()
-                
-                if output:
-                    # Limiter la sortie à 500 caractères pour éviter les réponses trop longues
-                    if len(output) > 500:
-                        output = output[:500] + "\n... (sortie tronquée)"
-                    
-                    return (
-                    f"EXECUTION_FINALE_OK\n" # <-- MARQUEUR
-                    f"✅ CODE EXÉCUTÉ AVEC SUCCÈS (en {execution_time:.2f}s)\n\n"
-                    f"Sortie :\n{output}"
-                )
-                else:
-                    return f"✅ CODE EXÉCUTÉ AVEC SUCCÈS (en {execution_time:.2f}s), Monsieur."
-            else:
-                # Erreur
-                error = result.stderr.strip()
-                if len(error) > 300:
-                    error = error[:300] + "\n... (erreur tronquée)"
-
-                # 🔴 Enregistrer dans la mémoire d'erreurs
-                try:
-                    _record_error(
-                        source="execute_python",
-                        message=error,
-                        code_snippet=code_to_execute
-                    )
-                except Exception:
-                    pass
-
-                return (
-                    "EXECUTION_FINALE_ERREUR\n"
-                    f"❌ ERREUR LORS DE L'EXÉCUTION (après {execution_time:.2f}s)\n\n"
-                    f"{error}"
-                )
-        
-        except subprocess.TimeoutExpired:
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-            # 🔴 Log timeout
-            try:
-                _record_error(
-                    source="execute_python",
-                    message="Timeout (30s) lors de l'exécution du script.",
-                    code_snippet=code_to_execute
-                )
-            except Exception:
-                pass
-
-            return "⏱️ TIMEOUT : Le code a dépassé la limite de 30 secondes, Monsieur."
-
-
-    # === OUTIL SUPPLÉMENTAIRE : Voir l'historique des exécutions ===
-
-    @staticmethod
-    def _get_python_execution_history() -> str:
-        """Retourne l'historique des dernières exécutions Python."""
-        global PYTHON_EXECUTION_LOG
-        
-        if not PYTHON_EXECUTION_LOG:
-            return "Aucune exécution Python n'a encore été effectuée, Monsieur."
-        
-        # Prendre les 5 dernières exécutions
-        recent = PYTHON_EXECUTION_LOG[-5:]
-        
-        lines = ["📊 HISTORIQUE DES EXÉCUTIONS PYTHON\n"]
-        for i, entry in enumerate(reversed(recent), 1):
-            status = "✅" if entry["success"] else "❌"
-            lines.append(
-                f"{i}. {status} {entry['timestamp'][:19]} - "
-                f"{entry['code_lines']} lignes - "
-                f"{entry['execution_time']:.2f}s"
-            )
-        
-        return "\n".join(lines)
-    
     async def timer_watcher(self):
         """
         Surveille en tâche de fond le compte à rebours.
@@ -3014,9 +2510,9 @@ FUNCTION_MAP = {
     "manage_timer": manage_timer,
     "open_app": open_app,
     "open_website": open_website,
-    "execute_python": AudioLoop._execute_python,
-    "get_python_execution_history": AudioLoop._get_python_execution_history,
-    "file_manager": AudioLoop._file_manager,
+    "execute_python": execute_python,
+    "get_python_execution_history": get_python_execution_history,
+    "file_manager": file_manager,
     "window_manager": window_manager,
     "system_control": system_control,
     "process_manager": process_manager,
