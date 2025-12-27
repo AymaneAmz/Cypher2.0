@@ -1,0 +1,40 @@
+# API et services
+google-genai>=0.2.0
+anthropic>=0.34.0
+python-dotenv>=1.0.0
+azure-cognitiveservices-speech>=1.39.0
+requests>=2.31.0
+
+# Audio et traitement vocal
+pyaudio>=0.2.14
+websockets>=12.0
+speechbrain>=0.5.18
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+
+# Interface graphique
+customtkinter>=5.2.0
+Pillow>=10.0.0
+
+# Multimédia
+pygame>=2.5.0
+
+# Analyse d'écran et OCR
+mss>=9.0.1
+pytesseract>=0.3.10
+pyautogui>=0.9.54
+pywin32>=306; sys_platform == "win32"
+opencv-python>=4.8.0; extra == "vision"
+easyocr>=1.7.0; extra == "vision"
+psutil>=5.9.0
+
+# Navigation web
+playwright>=1.40.0
+
+# Base de données vectorielle (RAG)
+chromadb>=0.4.22
+
+# Utilitaires
+python-dateutil>=2.8.2
+

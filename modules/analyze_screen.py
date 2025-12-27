@@ -79,6 +79,40 @@ try:
 except ImportError:
     NUMPY_AVAILABLE = False
 
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+    print("⚠️ [SCREEN] opencv-python non installé - pip install opencv-python (pour détection visuelle avancée)")
+
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    print("⚠️ [SCREEN] easyocr non installé - pip install easyocr (OCR amélioré optionnel)")
+
+try:
+    from google import genai
+    from dotenv import load_dotenv
+    load_dotenv()
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    GEMINI_VISION_AVAILABLE = bool(GEMINI_API_KEY)
+    if GEMINI_VISION_AVAILABLE:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+except ImportError:
+    GEMINI_VISION_AVAILABLE = False
+    gemini_client = None
+    print("⚠️ [SCREEN] google-genai non installé - pip install google-genai (pour analyse vision IA)")
+
+# Import pour hash d'images (cache)
+try:
+    import hashlib
+    HASH_AVAILABLE = True
+except ImportError:
+    HASH_AVAILABLE = False
+
 
 # ============================================================================
 # DATACLASSES
@@ -234,16 +268,52 @@ class ScreenAnalyzer:
         self._ocr_lang = "fra+eng"  # Français + Anglais par défaut
         self.sct = mss.mss() if MSS_AVAILABLE else None
         
+        # Cache intelligent
+        self._screenshot_cache: Dict[str, Tuple[Image.Image, float]] = {}  # hash -> (image, timestamp)
+        self._cache_timeout = 2.0  # secondes
+        
+        # OCR amélioré (EasyOCR)
+        self._easyocr_reader = None
+        if EASYOCR_AVAILABLE:
+            try:
+                print("🔄 [SCREEN] Initialisation EasyOCR (première fois, peut prendre du temps)...")
+                self._easyocr_reader = easyocr.Reader(['fr', 'en'], gpu=False)
+                print("✅ [SCREEN] EasyOCR initialisé")
+            except Exception as e:
+                print(f"⚠️ [SCREEN] Erreur initialisation EasyOCR: {e}")
+                self._easyocr_reader = None
+        
     # ========================================================================
     # CAPTURE D'ÉCRAN
     # ========================================================================
     
-    def capture_screen(self, monitor: int = 0, region: Optional[ScreenRegion] = None) -> Optional[Image.Image]:
+    def capture_screen(self, monitor: int = 0, region: Optional[ScreenRegion] = None, 
+                       use_cache: bool = True) -> Optional[Image.Image]:
+        """
+        Capture l'écran avec cache intelligent.
+        
+        Args:
+            monitor: Index du moniteur (0=tous, 1=principal)
+            region: Région spécifique à capturer
+            use_cache: Utiliser le cache si disponible (< 2 secondes)
+        """
         if not MSS_AVAILABLE or not self.sct:
             print("❌ [SCREEN] mss non disponible")
             return None
             
         try:
+            # Générer une clé de cache
+            cache_key = f"{monitor}_{region.left if region else None}_{region.top if region else None}_{region.width if region else None}_{region.height if region else None}"
+            
+            # Vérifier le cache
+            if use_cache and cache_key in self._screenshot_cache:
+                cached_img, cached_time = self._screenshot_cache[cache_key]
+                if time.time() - cached_time < self._cache_timeout:
+                    print(f"📸 [SCREEN] Capture (cache): {cached_img.width}x{cached_img.height}")
+                    self.last_screenshot = cached_img
+                    return cached_img
+            
+            # Capturer
             if region:
                 capture_area = {
                     "left": region.left,
@@ -260,12 +330,33 @@ class ScreenAnalyzer:
             sct_img = self.sct.grab(capture_area)
             img = Image.frombytes('RGB', (sct_img.width, sct_img.height), sct_img.rgb)
             self.last_screenshot = img
+            
+            # Mettre en cache (limiter à 10 entrées)
+            if use_cache:
+                if len(self._screenshot_cache) >= 10:
+                    # Supprimer la plus ancienne
+                    oldest_key = min(self._screenshot_cache.keys(), 
+                                   key=lambda k: self._screenshot_cache[k][1])
+                    del self._screenshot_cache[oldest_key]
+                self._screenshot_cache[cache_key] = (img, time.time())
+            
             print(f"📸 [SCREEN] Capture: {img.width}x{img.height}")
             return img
             
         except Exception as e:
             print(f"❌ [SCREEN] Erreur capture: {e}")
             return None
+    
+    def capture_region(self, x: int, y: int, width: int, height: int) -> Optional[Image.Image]:
+        """
+        Capture une région rectangulaire spécifique de l'écran.
+        
+        Args:
+            x, y: Position du coin supérieur gauche
+            width, height: Dimensions de la région
+        """
+        region = ScreenRegion(left=x, top=y, width=width, height=height)
+        return self.capture_screen(region=region)
     
     def capture_window(self, hwnd: int = None, title_contains: str = None) -> Optional[Image.Image]:
         """
@@ -354,28 +445,43 @@ class ScreenAnalyzer:
     # OCR - EXTRACTION DE TEXTE
     # ========================================================================
     
-    def extract_text(self, image: Image.Image = None, lang: str = None) -> str:
+    def extract_text(self, image: Image.Image = None, lang: str = None, 
+                     use_easyocr: bool = False) -> str:
         """
         Extrait tout le texte visible d'une image.
         
         Args:
             image: Image source (ou dernière capture)
             lang: Langue(s) OCR (ex: "fra", "eng", "fra+eng")
+            use_easyocr: Utiliser EasyOCR si disponible (plus précis mais plus lent)
             
         Returns:
             Texte extrait
         """
-        if not TESSERACT_AVAILABLE:
-            print("❌ [SCREEN] Tesseract non disponible")
-            return ""
-            
         if image is None:
             image = self.last_screenshot
         if image is None:
             return ""
+        
+        # Essayer EasyOCR en premier si demandé
+        if use_easyocr and self._easyocr_reader:
+            try:
+                img_array = np.array(image.convert('RGB'))
+                results = self._easyocr_reader.readtext(img_array)
+                text = '\n'.join([detection[1] for detection in results])
+                text = self._clean_ocr_text(text)
+                print(f"📝 [SCREEN] OCR (EasyOCR): {len(text)} caractères extraits")
+                return text
+            except Exception as e:
+                print(f"⚠️ [SCREEN] Erreur EasyOCR, fallback Tesseract: {e}")
+                # Fallback sur Tesseract
+        
+        if not TESSERACT_AVAILABLE:
+            print("❌ [SCREEN] Tesseract non disponible")
+            return ""
             
         try:
-            # Prétraitement pour améliorer l'OCR
+            # Prétraitement amélioré pour l'OCR
             img_processed = self._preprocess_for_ocr(image)
             
             lang = lang or self._ocr_lang
@@ -383,7 +489,7 @@ class ScreenAnalyzer:
             
             # Nettoyer le texte
             text = self._clean_ocr_text(text)
-            print(f"📝 [SCREEN] OCR: {len(text)} caractères extraits")
+            print(f"📝 [SCREEN] OCR (Tesseract): {len(text)} caractères extraits")
             return text
             
         except Exception as e:
@@ -467,17 +573,36 @@ class ScreenAnalyzer:
         return results
     
     def _preprocess_for_ocr(self, image: Image.Image) -> Image.Image:
-        """Prétraite une image pour améliorer l'OCR"""
+        """Prétraite une image pour améliorer l'OCR (version améliorée)"""
         try:
             # Convertir en niveaux de gris
             img = image.convert('L')
             
-            # Augmenter le contraste
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.5)
-            
-            # Augmenter la netteté
-            img = img.filter(ImageFilter.SHARPEN)
+            # Utiliser OpenCV si disponible pour un meilleur prétraitement
+            if OPENCV_AVAILABLE and NUMPY_AVAILABLE:
+                img_array = np.array(img)
+                
+                # Binarisation adaptative (meilleure que seuil fixe)
+                img_array = cv2.adaptiveThreshold(
+                    img_array, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                    cv2.THRESH_BINARY, 11, 2
+                )
+                
+                # Dénoyautage (enlever le bruit)
+                img_array = cv2.fastNlMeansDenoising(img_array, None, 10, 7, 21)
+                
+                # Améliorer le contraste
+                img_array = cv2.convertScaleAbs(img_array, alpha=1.2, beta=10)
+                
+                img = Image.fromarray(img_array)
+            else:
+                # Fallback sur PIL
+                # Augmenter le contraste
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(1.5)
+                
+                # Augmenter la netteté
+                img = img.filter(ImageFilter.SHARPEN)
             
             # Redimensionner si trop petit
             if img.width < 1000:
@@ -486,7 +611,8 @@ class ScreenAnalyzer:
                                 Image.Resampling.LANCZOS)
             
             return img
-        except:
+        except Exception as e:
+            print(f"⚠️ [SCREEN] Erreur prétraitement OCR: {e}")
             return image
     
     def _clean_ocr_text(self, text: str) -> str:
@@ -911,26 +1037,82 @@ class ScreenAnalyzer:
         return "text"
     
     def _detect_visual_elements(self, image: Image.Image) -> List[UIElement]:
-        """Détecte les éléments visuels (rectangles, boutons...)"""
+        """Détecte les éléments visuels (rectangles, boutons...) avec OpenCV"""
         elements = []
         try:
-            if not NUMPY_AVAILABLE:
+            if not OPENCV_AVAILABLE or not NUMPY_AVAILABLE:
                 return elements
-                
-            import numpy as np
             
             # Convertir en numpy array
             img_array = np.array(image.convert('RGB'))
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
             
-            # Détecter les contours rectangulaires (simplifié)
-            # Une implémentation complète utiliserait OpenCV
-            # Ici on fait une détection basique des zones de couleur uniforme
+            # Détecter les contours
+            edges = cv2.Canny(gray, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # Pour l'instant, retourner une liste vide
-            # Cette fonction peut être étendue avec OpenCV pour une meilleure détection
+            # Filtrer les contours intéressants (rectangles approximatifs)
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 500:  # Ignorer les petits éléments
+                    continue
+                
+                # Approximation polygonale
+                peri = cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+                
+                # Si c'est un rectangle (4 points)
+                if len(approx) == 4:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Vérifier si c'est un bouton (zone colorée avec bordure)
+                    roi = img_array[y:y+h, x:x+w]
+                    if roi.size > 0:
+                        # Calculer la variance des couleurs (boutons ont souvent couleurs uniformes)
+                        mean_color = np.mean(roi, axis=(0, 1))
+                        std_color = np.std(roi, axis=(0, 1))
+                        
+                        # Si variance faible = zone uniforme = probablement bouton
+                        if np.mean(std_color) < 30:
+                            elements.append(UIElement(
+                                element_type="button",
+                                text=None,
+                                bbox={'x': x, 'y': y, 'width': w, 'height': h},
+                                confidence=0.7
+                            ))
+                
+                # Détecter les zones de texte (zones rectangulaires horizontales)
+                elif len(approx) >= 4:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    aspect_ratio = w / h if h > 0 else 0
+                    
+                    # Zones de texte sont généralement larges et basses
+                    if 2.0 < aspect_ratio < 10.0 and h > 20:
+                        elements.append(UIElement(
+                            element_type="text_area",
+                            text=None,
+                            bbox={'x': x, 'y': y, 'width': w, 'height': h},
+                            confidence=0.5
+                        ))
+            
+            # Détecter les zones cliquables (cercle/icône approximatif)
+            circles = cv2.HoughCircles(
+                gray, cv2.HOUGH_GRADIENT, dp=1, minDist=50,
+                param1=50, param2=30, minRadius=10, maxRadius=100
+            )
+            
+            if circles is not None:
+                circles = np.round(circles[0, :]).astype("int")
+                for (x, y, r) in circles:
+                    elements.append(UIElement(
+                        element_type="icon",
+                        text=None,
+                        bbox={'x': x-r, 'y': y-r, 'width': 2*r, 'height': 2*r},
+                        confidence=0.6
+                    ))
             
         except Exception as e:
-            pass
+            print(f"⚠️ [SCREEN] Erreur détection visuelle: {e}")
         
         return elements
     
@@ -957,6 +1139,128 @@ class ScreenAnalyzer:
             return True
         except:
             return False
+    
+    def scroll(self, x: int = None, y: int = None, clicks: int = 3) -> bool:
+        """Fait défiler la page/fenêtre"""
+        if not PYAUTOGUI_AVAILABLE:
+            return False
+        try:
+            if x is None or y is None:
+                x, y = pyautogui.position()
+            pyautogui.scroll(clicks, x=x, y=y)
+            print(f"🖱️ [SCREEN] Scroll {clicks} clics à ({x}, {y})")
+            return True
+        except Exception as e:
+            print(f"❌ [SCREEN] Erreur scroll: {e}")
+            return False
+    
+    def drag(self, start_x: int, start_y: int, end_x: int, end_y: int, 
+             duration: float = 1.0) -> bool:
+        """Effectue un drag & drop"""
+        if not PYAUTOGUI_AVAILABLE:
+            return False
+        try:
+            pyautogui.drag(start_x, start_y, end_x - start_x, end_y - start_y, 
+                          duration=duration, button='left')
+            print(f"🖱️ [SCREEN] Drag de ({start_x}, {start_y}) à ({end_x}, {end_y})")
+            return True
+        except Exception as e:
+            print(f"❌ [SCREEN] Erreur drag: {e}")
+            return False
+    
+    def type_text(self, text: str, x: int = None, y: int = None, 
+                  interval: float = 0.05) -> bool:
+        """Tape du texte à la position actuelle ou à une position spécifique"""
+        if not PYAUTOGUI_AVAILABLE:
+            return False
+        try:
+            if x is not None and y is not None:
+                pyautogui.click(x, y)
+                time.sleep(0.2)  # Petit délai pour s'assurer que le champ est focus
+            
+            pyautogui.write(text, interval=interval)
+            print(f"⌨️ [SCREEN] Texte tapé: '{text[:50]}...'")
+            return True
+        except Exception as e:
+            print(f"❌ [SCREEN] Erreur type_text: {e}")
+            return False
+    
+    def press_key(self, *keys) -> bool:
+        """Appuie sur une ou plusieurs touches (raccourcis clavier)"""
+        if not PYAUTOGUI_AVAILABLE:
+            return False
+        try:
+            pyautogui.hotkey(*keys)
+            print(f"⌨️ [SCREEN] Touches pressées: {'+'.join(keys)}")
+            return True
+        except Exception as e:
+            print(f"❌ [SCREEN] Erreur press_key: {e}")
+            return False
+    
+    def compare_screenshots(self, img1: Image.Image = None, 
+                           img2: Image.Image = None) -> Dict[str, Any]:
+        """
+        Compare deux screenshots et détecte les différences.
+        
+        Returns:
+            Dict avec les zones de différences
+        """
+        if img1 is None:
+            img1 = self.last_screenshot
+        if img2 is None:
+            img2 = self.capture_screen()
+        
+        if img1 is None or img2 is None:
+            return {"error": "Images manquantes"}
+        
+        try:
+            if not OPENCV_AVAILABLE or not NUMPY_AVAILABLE:
+                return {"error": "OpenCV requis pour comparaison"}
+            
+            # Redimensionner si nécessaire
+            if img1.size != img2.size:
+                img2 = img2.resize(img1.size, Image.Resampling.LANCZOS)
+            
+            # Convertir en numpy arrays
+            arr1 = np.array(img1.convert('RGB'))
+            arr2 = np.array(img2.convert('RGB'))
+            
+            # Calculer la différence
+            diff = cv2.absdiff(arr1, arr2)
+            gray_diff = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+            
+            # Seuiller pour trouver les zones de changement
+            _, thresh = cv2.threshold(gray_diff, 30, 255, cv2.THRESH_BINARY)
+            
+            # Trouver les contours des zones de changement
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filtrer les petites zones
+            changed_regions = []
+            total_changed_pixels = np.sum(thresh > 0)
+            change_percentage = (total_changed_pixels / (img1.width * img1.height)) * 100
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 100:  # Ignorer les petits changements
+                    x, y, w, h = cv2.boundingRect(contour)
+                    changed_regions.append({
+                        'x': int(x),
+                        'y': int(y),
+                        'width': int(w),
+                        'height': int(h),
+                        'area': int(area)
+                    })
+            
+            return {
+                "changed": len(changed_regions) > 0,
+                "change_percentage": round(change_percentage, 2),
+                "changed_regions": changed_regions,
+                "total_changed_pixels": int(total_changed_pixels)
+            }
+            
+        except Exception as e:
+            return {"error": str(e)}
     
     # ========================================================================
     # INFORMATIONS SYSTÈME
@@ -1029,6 +1333,151 @@ class ScreenAnalyzer:
         except:
             pass
         return False
+    
+    def analyze_with_gemini_vision(self, image: Image.Image = None, 
+                                   prompt: str = "Décris ce que tu vois à l'écran en détail. Identifie les applications, le contenu visible, et tout élément important.") -> Dict[str, Any]:
+        """
+        Analyse un screenshot avec Gemini Vision API pour une compréhension contextuelle.
+        
+        Args:
+            image: Image à analyser (ou dernière capture)
+            prompt: Prompt pour guider l'analyse
+            
+        Returns:
+            Dict avec l'analyse Gemini
+        """
+        if not GEMINI_VISION_AVAILABLE or gemini_client is None:
+            return {"error": "Gemini Vision API non disponible"}
+        
+        if image is None:
+            image = self.last_screenshot
+        if image is None:
+            return {"error": "Aucune image à analyser"}
+        
+        try:
+            # Convertir l'image en base64
+            buffer = BytesIO()
+            image.save(buffer, format='PNG')
+            img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            
+            # Préparer le contenu pour Gemini (méthode compatible avec l'API)
+            try:
+                from google.genai import types as genai_types
+                # Méthode 1: Avec types.Part (nouvelle API)
+                contents = [
+                    prompt,
+                    genai_types.Part(
+                        inline_data=genai_types.Part.InlineData(
+                            mime_type='image/png',
+                            data=img_base64
+                        )
+                    )
+                ]
+                response = gemini_client.models.generate_content(
+                    model="gemini-2.0-flash-exp",
+                    contents=contents
+                )
+            except (AttributeError, TypeError, ImportError) as e1:
+                # Méthode 2: Fallback avec dict (ancienne API)
+                try:
+                    response = gemini_client.models.generate_content(
+                        model="gemini-2.0-flash-exp",
+                        contents=[{
+                            "role": "user",
+                            "parts": [
+                                {"text": prompt},
+                                {
+                                    "inline_data": {
+                                        "mime_type": "image/png",
+                                        "data": img_base64
+                                    }
+                                }
+                            ]
+                        }]
+                    )
+                except Exception as e2:
+                    raise Exception(f"Erreur Gemini API (méthode 1: {e1}, méthode 2: {e2})")
+            
+            # Extraire le texte de la réponse
+            if hasattr(response, 'text'):
+                analysis_text = response.text
+            else:
+                analysis_text = str(response)
+            
+            return {
+                "success": True,
+                "analysis": analysis_text,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            print(f"❌ [SCREEN] Erreur Gemini Vision: {e}")
+            return {"error": str(e)}
+    
+    def extract_code_from_screen(self, image: Image.Image = None) -> Dict[str, Any]:
+        """
+        Extrait et analyse le code visible à l'écran.
+        Détecte automatiquement la syntaxe et formate le code.
+        """
+        if image is None:
+            image = self.last_screenshot
+        if image is None:
+            return {"error": "Aucune image à analyser"}
+        
+        try:
+            # Utiliser Gemini Vision pour identifier le code
+            prompt = """Identifie et extrait tout le code visible à l'écran. 
+            Indique le langage de programmation, formate le code proprement, 
+            et signale s'il y a des erreurs visibles (soulignements rouges, messages d'erreur, etc.).
+            Retourne le code dans un bloc formaté."""
+            
+            gemini_result = self.analyze_with_gemini_vision(image, prompt)
+            
+            if gemini_result.get("success"):
+                # Extraire aussi avec OCR pour avoir les deux
+                ocr_text = self.extract_text(image, use_easyocr=False)
+                
+                # Détecter le langage depuis le texte OCR
+                detected_language = self._detect_code_language(ocr_text)
+                
+                return {
+                    "success": True,
+                    "gemini_analysis": gemini_result.get("analysis", ""),
+                    "ocr_code": ocr_text,
+                    "detected_language": detected_language,
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                return gemini_result
+                
+        except Exception as e:
+            print(f"❌ [SCREEN] Erreur extraction code: {e}")
+            return {"error": str(e)}
+    
+    def _detect_code_language(self, text: str) -> str:
+        """Détecte le langage de programmation depuis le texte"""
+        text_lower = text.lower()
+        
+        # Patterns simples pour détecter les langages
+        patterns = {
+            "python": [r'\bdef\s+\w+', r'\bimport\s+\w+', r'\bfrom\s+\w+\s+import', r'\bclass\s+\w+', r'\bprint\('],
+            "javascript": [r'\bfunction\s+\w+', r'\bconst\s+\w+\s*=', r'\blet\s+\w+\s*=', r'\bvar\s+\w+\s*=', r'=>'],
+            "java": [r'public\s+class', r'@Override', r'System\.out\.print', r'import\s+java\.'],
+            "cpp": [r'#include\s*<', r'std::', r'cout\s*<<', r'\bint\s+main\('],
+            "html": [r'<!DOCTYPE', r'<html', r'<div', r'<span'],
+            "css": [r'\w+\s*\{', r'\w+:\s*[^;]+;'],
+            "sql": [r'\bSELECT\s+', r'\bFROM\s+', r'\bWHERE\s+', r'\bINSERT\s+INTO'],
+        }
+        
+        scores = {}
+        for lang, lang_patterns in patterns.items():
+            score = sum(1 for pattern in lang_patterns if re.search(pattern, text_lower))
+            if score > 0:
+                scores[lang] = score
+        
+        if scores:
+            return max(scores.items(), key=lambda x: x[1])[0]
+        return "unknown"
     
     # ========================================================================
     # ANALYSE COMPLÈTE
@@ -1252,10 +1701,25 @@ def analyze_screen_tool(action: str, **kwargs) -> str:
         
         # === OCR ===
         elif action == "extract_text":
-            text = analyzer.extract_text()
+            use_easyocr = kwargs.get("use_easyocr", False)
+            text = analyzer.extract_text(use_easyocr=use_easyocr)
             result["success"] = True
             result["text"] = text
             result["length"] = len(text)
+        
+        elif action == "capture_region":
+            x = kwargs.get("x", 0)
+            y = kwargs.get("y", 0)
+            width = kwargs.get("width", 100)
+            height = kwargs.get("height", 100)
+            img = analyzer.capture_region(x, y, width, height)
+            if img:
+                result["success"] = True
+                result["size"] = {"width": img.width, "height": img.height}
+                if kwargs.get("include_base64", False):
+                    result["screenshot_base64"] = analyzer.get_screenshot_base64(
+                        img, kwargs.get("quality", 70)
+                    )
         
         elif action == "extract_text_blocks":
             blocks = analyzer.extract_text_blocks(min_confidence=kwargs.get("min_confidence", 60))
@@ -1362,6 +1826,57 @@ def analyze_screen_tool(action: str, **kwargs) -> str:
             else:
                 result["error"] = "text requis"
         
+        # === ACTIONS INTERACTIVES AVANCÉES ===
+        elif action == "scroll":
+            x = kwargs.get("x")
+            y = kwargs.get("y")
+            clicks = kwargs.get("clicks", 3)
+            result["success"] = analyzer.scroll(x, y, clicks)
+        
+        elif action == "drag":
+            start_x = kwargs.get("start_x", 0)
+            start_y = kwargs.get("start_y", 0)
+            end_x = kwargs.get("end_x", 0)
+            end_y = kwargs.get("end_y", 0)
+            duration = kwargs.get("duration", 1.0)
+            result["success"] = analyzer.drag(start_x, start_y, end_x, end_y, duration)
+        
+        elif action == "type_text":
+            text = kwargs.get("text", "")
+            x = kwargs.get("x")
+            y = kwargs.get("y")
+            interval = kwargs.get("interval", 0.05)
+            if text:
+                result["success"] = analyzer.type_text(text, x, y, interval)
+            else:
+                result["error"] = "text requis"
+        
+        elif action == "press_key":
+            keys = kwargs.get("keys", [])
+            if keys:
+                if isinstance(keys, str):
+                    keys = keys.split("+")
+                result["success"] = analyzer.press_key(*keys)
+            else:
+                result["error"] = "keys requis (ex: ['ctrl', 'c'])"
+        
+        # === COMPARAISON SCREENSHOTS ===
+        elif action == "compare_screenshots":
+            comparison = analyzer.compare_screenshots()
+            result["success"] = True
+            result["comparison"] = comparison
+        
+        # === GEMINI VISION ===
+        elif action == "analyze_with_gemini":
+            prompt = kwargs.get("prompt", "Décris ce que tu vois à l'écran en détail.")
+            gemini_result = analyzer.analyze_with_gemini_vision(prompt=prompt)
+            result.update(gemini_result)
+        
+        # === ANALYSE DE CODE ===
+        elif action == "extract_code":
+            code_result = analyzer.extract_code_from_screen()
+            result.update(code_result)
+        
         # === SYSTÈME ===
         elif action == "get_monitor_info":
             result["success"] = True
@@ -1413,7 +1928,7 @@ def analyze_screen_tool(action: str, **kwargs) -> str:
         else:
             result["error"] = f"Action inconnue: {action}"
             result["available_actions"] = [
-                "capture_screen", "capture_window", "capture_active_window",
+                "capture_screen", "capture_window", "capture_active_window", "capture_region",
                 "extract_text", "extract_text_blocks", "find_text",
                 "get_windows", "get_active_window", "focus_window", 
                 "minimize_window", "maximize_window", "close_window",
@@ -1422,7 +1937,9 @@ def analyze_screen_tool(action: str, **kwargs) -> str:
                 "detect_ui_elements", "find_element", "click_element",
                 "get_monitor_info", "get_cursor_position", 
                 "get_clipboard", "set_clipboard",
-                "full_analysis", "quick_look", "describe"
+                "full_analysis", "quick_look", "describe",
+                "scroll", "drag", "type_text", "press_key",
+                "compare_screenshots", "analyze_with_gemini", "extract_code"
             ]
     
     except Exception as e:
@@ -1498,9 +2015,21 @@ SYSTÈME:
 ANALYSE:
 - full_analysis: Analyse complète de l'écran
 - quick_look: Aperçu rapide (sans OCR)
-- describe: Description textuelle de l'écran""",
+- describe: Description textuelle de l'écran
+- analyze_with_gemini: Analyse avec Gemini Vision API (params: prompt)
+- extract_code: Extrait et analyse le code visible (détection langage, formatage)
+
+INTERACTIONS AVANCÉES:
+- scroll: Fait défiler (params: x, y, clicks)
+- drag: Drag & drop (params: start_x, start_y, end_x, end_y, duration)
+- type_text: Tape du texte (params: text, x, y, interval)
+- press_key: Raccourcis clavier (params: keys=['ctrl', 'c'])
+
+AUTRES:
+- capture_region: Capture une zone rectangulaire (params: x, y, width, height)
+- compare_screenshots: Compare deux screenshots pour détecter changements""",
                 "enum": [
-                    "capture_screen", "capture_window", "capture_active_window",
+                    "capture_screen", "capture_window", "capture_active_window", "capture_region",
                     "extract_text", "extract_text_blocks", "find_text",
                     "get_windows", "get_active_window", "focus_window",
                     "minimize_window", "maximize_window", "close_window",
@@ -1509,7 +2038,9 @@ ANALYSE:
                     "detect_ui_elements", "find_element", "click_element",
                     "get_monitor_info", "get_cursor_position",
                     "get_clipboard", "set_clipboard",
-                    "full_analysis", "quick_look", "describe"
+                    "full_analysis", "quick_look", "describe",
+                    "scroll", "drag", "type_text", "press_key",
+                    "compare_screenshots", "analyze_with_gemini", "extract_code"
                 ]
             },
             "monitor": {
@@ -1559,6 +2090,63 @@ ANALYSE:
             "detailed_ocr": {
                 "type": "boolean",
                 "description": "Extraction OCR détaillée (blocs avec positions)"
+            },
+            "use_easyocr": {
+                "type": "boolean",
+                "description": "Utiliser EasyOCR au lieu de Tesseract (plus précis mais plus lent)"
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Prompt pour l'analyse Gemini Vision"
+            },
+            "x": {
+                "type": "integer",
+                "description": "Position X (pour capture_region, scroll, type_text)"
+            },
+            "y": {
+                "type": "integer",
+                "description": "Position Y (pour capture_region, scroll, type_text)"
+            },
+            "width": {
+                "type": "integer",
+                "description": "Largeur (pour capture_region)"
+            },
+            "height": {
+                "type": "integer",
+                "description": "Hauteur (pour capture_region)"
+            },
+            "start_x": {
+                "type": "integer",
+                "description": "Position X de départ (pour drag)"
+            },
+            "start_y": {
+                "type": "integer",
+                "description": "Position Y de départ (pour drag)"
+            },
+            "end_x": {
+                "type": "integer",
+                "description": "Position X de fin (pour drag)"
+            },
+            "end_y": {
+                "type": "integer",
+                "description": "Position Y de fin (pour drag)"
+            },
+            "duration": {
+                "type": "number",
+                "description": "Durée en secondes (pour drag)"
+            },
+            "clicks": {
+                "type": "integer",
+                "description": "Nombre de clics de scroll (pour scroll)"
+            },
+            "interval": {
+                "type": "number",
+                "description": "Intervalle entre chaque caractère en secondes (pour type_text)"
+            },
+            "keys": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Liste des touches à presser (pour press_key, ex: ['ctrl', 'c'])"
             }
         },
         "required": ["action"]

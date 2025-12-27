@@ -63,10 +63,12 @@ DESKTOP_PATH = os.path.join(ONEDRIVE_BASE, "Desktop")
 DOCUMENTS_PATH = os.path.join(ONEDRIVE_BASE, "Documents")
 
 # Fichiers de persistance
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MEMORY_FILE = os.path.join(BASE_DIR, "expert_coder_memory.json")
-CACHE_FILE = os.path.join(BASE_DIR, "expert_coder_cache.json")
-TEMPLATES_FILE = os.path.join(BASE_DIR, "expert_coder_templates.json")
+# Chemins vers les fichiers de cache (dans data/cache/)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Racine du projet
+CACHE_BASE = os.path.join(BASE_DIR, "data", "cache")
+MEMORY_FILE = os.path.join(CACHE_BASE, "expert_coder_memory.json")
+CACHE_FILE = os.path.join(CACHE_BASE, "expert_coder_cache.json")
+TEMPLATES_FILE = os.path.join(CACHE_BASE, "expert_coder_templates.json")
 
 # Config retry
 MAX_RETRIES = 3

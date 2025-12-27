@@ -22,12 +22,32 @@ import requests
 import azure.cognitiveservices.speech as speechsdk
 import queue
 import threading
-from gui import CypherGUI
 import pygame
 # OpenWakeWord supprimé - on utilise uniquement SpeechBrain
 import numpy as np
 import torch
-from speechbrain.inference import EncoderClassifier
+
+# PATCH pour torchaudio 2.9+ qui n'a plus list_audio_backends()
+# Ce patch doit être fait AVANT l'import de SpeechBrain
+try:
+    import torchaudio
+    if not hasattr(torchaudio, 'list_audio_backends'):
+        # Ajouter une fonction factice pour SpeechBrain
+        def _fake_list_audio_backends():
+            return ['soundfile']  # Backend par défaut
+        torchaudio.list_audio_backends = _fake_list_audio_backends
+except ImportError:
+    pass
+
+# Import optionnel de SpeechBrain (peut échouer avec torchaudio sur certaines versions)
+try:
+    from speechbrain.inference import EncoderClassifier
+    SPEECHBRAIN_AVAILABLE = True
+except (ImportError, OSError, AttributeError, Exception) as e:
+    SPEECHBRAIN_AVAILABLE = False
+    EncoderClassifier = None
+    print(f"⚠️ [WARNING] SpeechBrain non disponible: {type(e).__name__}: {e}")
+    print("⚠️ La détection du wake word ne fonctionnera pas. Le système continuera quand même.")
 from collections import deque
 
 
@@ -37,10 +57,25 @@ from dotenv import load_dotenv
 # --- Load Environment Variables ---
 load_dotenv()
 
-from expert_coder import expert_coder_tool, EXPERT_CODER_TOOL_DECLARATION, expert_stats, get_expert
+# Import des modules core
+from core.config import get_config
+from core.logger import get_logger
+from core.wake_word_detector import WakeWordDetector
+from core.tool_executor import ToolExecutor
+from core.sound_manager import get_sound_manager
+from core.learning_system import get_learning_system
+from core.paths import get_project_root, get_sounds_dir, get_models_dir, get_vocab_dir, get_memory_dir, get_rag_db_dir
+
+# Import des modules fonctionnels
+from modules.expert_coder import expert_coder_tool, EXPERT_CODER_TOOL_DECLARATION, expert_stats, get_expert
 from google import genai
-from spotify_controller import spotify_tool, SPOTIFY_TOOL_DECLARATION
-from analyze_screen import analyze_screen_tool, SCREEN_ANALYZER_TOOL_DECLARATION
+from modules.spotify_controller import spotify_tool, SPOTIFY_TOOL_DECLARATION
+from modules.analyze_screen import analyze_screen_tool, SCREEN_ANALYZER_TOOL_DECLARATION
+from modules.web_navigator import web_navigator_tool, WEB_NAVIGATOR_TOOL_DECLARATION, get_navigator
+from modules.gui import CypherGUI
+
+# Logger principal
+logger = get_logger("main")
 
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -78,8 +113,10 @@ if not os.path.exists(IMAGES_REAL):
     IMAGES_REAL = os.path.join(USER_HOME, "Images")
 
 if not GEMINI_API_KEY:
+    logger.critical("GEMINI_API_KEY not found. Please set it in your .env file.")
     sys.exit("Error: GEMINI_API_KEY not found. Please set it in your .env file.")
 if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+    logger.critical("AZURE keys not found. Please set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file.")
     sys.exit("Error: AZURE keys not found. Please set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file.")
 
 if sys.version_info < (3, 11, 0):
@@ -170,26 +207,54 @@ class AudioLoop:
         self.is_busy = False
         self._interrupted_flag = False  # Flag pour annuler les tool calls en cours
         self.client = genai.Client(api_key=GEMINI_API_KEY)
-
-        pygame.mixer.init() # On allume le moteur audio
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.wake_sound_path = os.path.join(script_dir, "wake.mp3")
-        self.end_sound_path = os.path.join(script_dir, "end_listening.mp3")
+        
+        # Charger la configuration Cypher
+        self.cypher_config = get_config()
+        
+        # Initialiser le gestionnaire de sons (utilise maintenant assets/sounds/)
+        self.sound_manager = get_sound_manager()
+        
+        # Initialiser le WebNavigator avec la gui_queue
+        try:
+            navigator = get_navigator(gui_queue=gui_queue)
+            logger.info("WebNavigator initialisé avec gui_queue")
+        except Exception as e:
+            logger.warning(f"Impossible d'initialiser WebNavigator: {e}")
+        
+        # Sons principaux (pour compatibilité avec code existant)
+        pygame.mixer.init() # On allume le moteur audio (déjà fait par sound_manager mais gardé pour compatibilité)
+        sounds_dir = get_sounds_dir()
+        self.wake_sound_path = str(sounds_dir / "wake.mp3")
+        self.end_sound_path = str(sounds_dir / "end_listening.mp3")
 
         # Chargement du modèle SpeechBrain pour la détection du wake word "Sayfeure"
-        self.sb_classifier = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cpu"}  # Change en "cuda" si tu as une GPU
-        )
-
-        # Charger l'embedding du wake word (généré par train_wakeword.py)
-        embedding_path = os.path.join(script_dir, "wakeword_embedding.npy")
-        if not os.path.exists(embedding_path):
-            print(f">>> [ERREUR] Fichier wakeword_embedding.npy introuvable dans {script_dir}")
-            print(">>> Exécute train_wakeword.py pour générer l'embedding à partir des fichiers vocab/")
-            sys.exit(1)
-        
-        self.sb_target = np.load(embedding_path).astype(np.float32)
+        if not SPEECHBRAIN_AVAILABLE or EncoderClassifier is None:
+            self.sb_classifier = None
+            self.sb_target = None
+            print("⚠️ [WARNING] SpeechBrain non disponible - la détection du wake word est désactivée")
+            print("⚠️ Tu peux utiliser le module wake_word_detector.py comme alternative")
+        else:
+            try:
+                self.sb_classifier = EncoderClassifier.from_hparams(
+                    source="speechbrain/spkrec-ecapa-voxceleb",
+                    run_opts={"device": "cpu"}  # Change en "cuda" si tu as une GPU
+                )
+                
+                # Charger l'embedding du wake word (dans data/models/)
+                models_dir = get_models_dir()
+                embedding_path = models_dir / "wakeword_embedding.npy"
+                if not embedding_path.exists():
+                    vocab_dir = get_vocab_dir()
+                    print(f">>> [ERREUR] Fichier wakeword_embedding.npy introuvable dans {models_dir}")
+                    print(f">>> Exécute train_wakeword.py pour générer l'embedding à partir des fichiers {vocab_dir}/")
+                    self.sb_classifier = None
+                    self.sb_target = None
+                else:
+                    self.sb_target = np.load(str(embedding_path)).astype(np.float32)
+            except Exception as e:
+                print(f"⚠️ [WARNING] Erreur lors du chargement de SpeechBrain: {e}")
+                self.sb_classifier = None
+                self.sb_target = None
 
         # paramètres detection (à peaufiner)
         self.sb_sr = 16000
@@ -207,13 +272,19 @@ class AudioLoop:
         
         # Variables d'état pour la détection du wake word
         self._wake_hit_count = 0
-        self.WAKE_THRESHOLD = 0.42  # Seuil de similitude cosine (abaissé pour meilleure détection)
+        self.WAKE_THRESHOLD = 0.5  # Seuil de similitude cosine (abaissé pour meilleure détection)
         self.WAKE_MIN_RMS = 0.020   # Seuil minimum de volume (légèrement abaissé)
 
         # Variables d'état pour la conversation
         self.conversation_active = False
         self.last_interaction_time = 0
-        self.CONVERSATION_TIMEOUT = 15.0 
+        self.CONVERSATION_TIMEOUT = self.cypher_config.conversation_timeout
+        
+        # Initialiser le tool executor (sera initialisé après avoir chargé FUNCTION_MAP)
+        self.tool_executor = None
+        
+        # Charger FUNCTION_MAP et initialiser tool_executor
+        # Note: FUNCTION_MAP est défini plus bas dans le fichier, donc on le fera après 
         
         self._boost_microphone_gain()
         
@@ -634,6 +705,22 @@ class AudioLoop:
             }
         }
 
+        user_preferences_tool = {
+            "name": "user_preferences",
+            "description": "Consulte les préférences et habitudes apprises par Cypher pour personnaliser l'interaction.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action à effectuer: 'view' pour voir les préférences, 'reset' pour réinitialiser",
+                        "enum": ["view", "reset"]
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+
         agenda_tool = {
             "name": "manage_agenda",
             "description": "Gère l'agenda personnel : ajouter, consulter ou supprimer des événements.",
@@ -774,33 +861,43 @@ class AudioLoop:
                 expert_coder_write_file,
                 SPOTIFY_TOOL_DECLARATION,
                 SCREEN_ANALYZER_TOOL_DECLARATION,
+                WEB_NAVIGATOR_TOOL_DECLARATION,
+                user_preferences_tool,
             ]},
             google_search_tool
         ]
 
         # --- CHARGEMENT DU CERVEAU AU DÉMARRAGE ---
         memory_content = ""
+        memory_dir = get_memory_dir()
+        mem_path = memory_dir / "cypher_memory_cortex.json" 
         
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        mem_path = os.path.join(script_dir, "cypher_memory_cortex.json") 
-        
-        if os.path.exists(mem_path):
+        if mem_path.exists():
             try:
-                with open(mem_path, 'r', encoding='utf-8') as f:
+                with open(str(mem_path), 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     memory_str = json.dumps(data, ensure_ascii=False, indent=2)
                     memory_content = f"\n\n[MEMOIRE LONGUE DURÉE - CONTEXTE PERMANENT] :\n{memory_str}\nUtilise ces informations pour personnaliser tes réponses."
             except:
                 print(">>> [WARNING] Impossible de lire la mémoire au démarrage.")
 
-
+        # --- CHARGEMENT DU SYSTÈME D'APPRENTISSAGE ---
+        self.learning_system = get_learning_system()
+        learning_preferences = self.learning_system.get_preferences_summary()
+        
         now = datetime.now()
         current_context = f"NOUS SOMMES LE {now.strftime('%d/%m/%Y')} à {now.strftime('%H:%M')}."
+        
+        # Variables pour capturer l'interaction en cours (pour l'apprentissage)
+        self._current_user_input = ""
+        self._current_tools_used = []
+        self._current_response = ""
 
         self.config = {
             "response_modalities": ["TEXT"],
             "system_instruction": f"""
 {current_context}
+{learning_preferences}
 
 ⚠️ CONFIGURATION SYSTÈME CRITIQUE :
 Le dossier "Documents" réel de l'utilisateur est : {DOCUMENTS_REAL}
@@ -1172,8 +1269,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         from chromadb.utils import embedding_functions
 
         # Chemin de la base de données vectorielle (mémoire documentaire)
-        script_dir = os.getcwd()
-        DB_PATH = os.path.join(script_dir, "cypher_rag_db")
+        DB_PATH = str(get_rag_db_dir())
         
         # Initialisation de ChromaDB (Persistant sur le disque)
         client = chromadb.PersistentClient(path=DB_PATH)
@@ -1451,8 +1547,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         import os
         from datetime import datetime
 
-        script_dir = os.getcwd()
-        AGENDA_FILE = os.path.join(script_dir, "cypher_agenda.json")
+        AGENDA_FILE = str(get_memory_dir() / "cypher_agenda.json")
 
         print(">>> [INFO] Agenda Watcher activé.")
 
@@ -1505,8 +1600,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         import os
         from datetime import datetime, timedelta
 
-        script_dir = os.getcwd()
-        AGENDA_FILE = os.path.join(script_dir, "cypher_agenda.json")
+        AGENDA_FILE = str(get_memory_dir() / "cypher_agenda.json")
 
         # Charger l'agenda
         if os.path.exists(AGENDA_FILE):
@@ -1584,10 +1678,83 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         return "Action agenda inconnue."
     
     @staticmethod
+    def _user_preferences(action: str) -> str:
+        """Gère les préférences utilisateur apprises par le système d'apprentissage"""
+        from core.learning_system import get_learning_system
+        
+        learning = get_learning_system()
+        
+        if action == "view":
+            prefs = learning.preferences
+            
+            result = ["📊 PRÉFÉRENCES APPRISES PAR CYPHER\n"]
+            
+            # Outils préférés
+            preferred_tools = prefs.get("preferred_tools", {})
+            if preferred_tools:
+                result.append("\n🔧 Outils fréquemment utilisés:")
+                for tool, freq in sorted(preferred_tools.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    percentage = freq * 100
+                    result.append(f"  - {tool}: {percentage:.1f}%")
+            
+            # Commandes fréquentes
+            frequent = prefs.get("frequent_commands", {})
+            if frequent:
+                result.append("\n💬 Types de commandes fréquentes:")
+                for pattern, freq in sorted(frequent.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    percentage = freq * 100
+                    pattern_name = {
+                        "music": "Musique/Spotify",
+                        "file_management": "Gestion de fichiers",
+                        "coding": "Développement de code",
+                        "time_queries": "Questions sur l'heure/date",
+                        "weather": "Météo"
+                    }.get(pattern, pattern)
+                    result.append(f"  - {pattern_name}: {percentage:.1f}%")
+            
+            # Comportements appris
+            learned = prefs.get("learned_behaviors", {})
+            if learned:
+                result.append("\n🧠 Comportements appris:")
+                for key, behavior in list(learned.items())[:5]:
+                    if isinstance(behavior, dict):
+                        desc = behavior.get("description", key)
+                        conf = behavior.get("confidence", 0)
+                        result.append(f"  - {desc} (confiance: {conf*100:.0f}%)")
+            
+            # Statistiques générales
+            total_interactions = len(learning.interactions)
+            if total_interactions > 0:
+                result.append(f"\n📈 Total d'interactions enregistrées: {total_interactions}")
+            
+            if len(result) == 1:
+                return "Aucune préférence apprise pour le moment. Continuez à utiliser Cypher pour qu'il apprenne vos habitudes."
+            
+            return "\n".join(result)
+        
+        elif action == "reset":
+            # Réinitialiser les préférences (garder l'historique)
+            learning.preferences = {
+                "preferred_tools": {},
+                "communication_style": "neutre",
+                "frequent_commands": {},
+                "time_patterns": {},
+                "contextual_hints": {},
+                "learned_behaviors": {},
+                "custom_shortcuts": {},
+                "suggestions_enabled": True,
+                "last_updated": datetime.now().isoformat()
+            }
+            learning._save_preferences()
+            learning._analyze_interactions()  # Réanalyser
+            return "Préférences réinitialisées. Le système va réapprendre à partir de l'historique existant."
+        
+        return "Action inconnue. Utilisez 'view' ou 'reset'."
+    
+    @staticmethod
     def _error_history(source: str | None = None) -> str:
         import os, json
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        error_file = os.path.join(script_dir, "cypher_memory_cortex.json")
+        error_file = str(get_memory_dir() / "cypher_memory_cortex.json")
 
         if not os.path.exists(error_file):
             return "Je n'ai encore enregistré aucune erreur importante, Monsieur."
@@ -1628,8 +1795,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         from datetime import datetime
 
         
-        script_dir = os.getcwd() 
-        MEMORY_FILE = os.path.join(script_dir, "cypher_memory_cortex.json")
+        MEMORY_FILE = str(get_memory_dir() / "cypher_memory_cortex.json")
         
         # 1. Chargement de la mémoire
         if os.path.exists(MEMORY_FILE):
@@ -2696,8 +2862,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             import hashlib
 
             try:
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                error_file = os.path.join(script_dir, "cypher_memory_cortex.json")
+                error_file = str(get_memory_dir() / "cypher_memory_cortex.json")
 
                 # Charger l'existant
                 if os.path.exists(error_file):
@@ -3016,19 +3181,65 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 print(f">>> [ERROR in timer_watcher]: {e}")
                 await asyncio.sleep(1)
     
+    # Note: _sb_cosine déplacé dans wake_word_detector.py - gardé pour compatibilité temporaire
     def _sb_cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         a = a.astype(np.float32)
         b = b.astype(np.float32)
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
+    async def _handle_goodbye(self):
+        """Gère la mise en veille quand l'utilisateur dit au revoir"""
+        logger.info("Au revoir détecté - Mise en veille")
+        
+        # 1. Arrêter toute réponse en cours
+        self.conversation_active = False
+        self.is_busy = False
+        
+        # 2. Notifier le tool executor si interruption
+        if self.tool_executor:
+            self.tool_executor.set_interrupted(True)
+        
+        # 3. Arrêter la parole de Cypher
+        if self.is_speaking:
+            # Vider la file d'attente du TTS
+            if self.response_queue_tts:
+                while not self.response_queue_tts.empty():
+                    try: self.response_queue_tts.get_nowait()
+                    except asyncio.QueueEmpty: break
+            
+            # Vider la file d'attente du Player
+            if self.audio_in_queue_player:
+                while not self.audio_in_queue_player.empty():
+                    try: self.audio_in_queue_player.get_nowait()
+                    except asyncio.QueueEmpty: break
+            
+            # Arrêter le son pygame
+            try: pygame.mixer.music.stop()
+            except Exception as e:
+                logger.debug(f"Erreur lors de l'arrêt pygame: {e}")
+            
+            self.is_speaking = False
+        
+        # 4. Jouer le son end_listening
+        self.sound_manager.play("end_listening", volume=0.35)
+        
+        # 5. Mettre à jour le statut GUI
+        self.gui_queue.put(("STATUS", "idle"))
+        
+        logger.info("Cypher est maintenant en veille")
+
     def _interrupt_playback(self):
         """KILL SWITCH : Coupe la parole instantanément et FORCE l'écoute."""
+        logger.info("Interruption demandée (barge-in)")
         # --- FIX CRITIQUE : On débloque le cerveau immédiatement ---
         self.is_busy = False
-        self._interrupted_flag = True  # Marquer qu'on a été interrompu
+        
+        # Notifier le tool executor
+        if self.tool_executor:
+            self.tool_executor.set_interrupted(True)
         
         if self.is_speaking:
-            print(">>> [INTERRUPTION] Wake word détecté - Cypher se tait !")
+            logger.info("Wake word détecté - Cypher se tait !")
             
             # 1. On vide la file d'attente du TTS
             if self.response_queue_tts:
@@ -3044,7 +3255,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             
             # 3. On arrête le son pygame
             try: pygame.mixer.music.stop()
-            except: pass
+            except Exception as e:
+                logger.debug(f"Erreur lors de l'arrêt pygame: {e}")
             
             # 4. On force l'état silencieux
             self.is_speaking = False
@@ -3167,6 +3379,18 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 # Calculer le RMS (volume moyen)
                 rms = float(np.sqrt(np.mean(np_data ** 2) + 1e-12))
                 
+                # Envoyer le niveau audio au GUI pour l'animation de l'orb (seulement en listening)
+                if self.conversation_active and not self.is_speaking:
+                    # Normaliser le RMS (typiquement 0.0-0.1, mais on peut aller plus haut)
+                    # On utilise une fonction logarithmique pour une meilleure visualisation
+                    normalized_level = min(1.0, rms * 10.0)  # Scale pour avoir 0.0-1.0
+                    # Appliquer une courbe pour rendre les variations plus visibles
+                    normalized_level = normalized_level ** 0.5  # Racine carrée pour étaler les faibles volumes
+                    try:
+                        self.gui_queue.put_nowait(("AUDIO_LEVEL", str(normalized_level)))
+                    except queue.Full:
+                        pass  # Si la queue est pleine, on ignore (pas critique)
+                
                 # Si Cypher parle, on utilise un seuil RMS plus élevé pour éviter les faux positifs
                 # (sa propre voix ne doit pas déclencher le wake word)
                 min_rms_threshold = self.WAKE_MIN_RMS * 2.0 if self.is_speaking else self.WAKE_MIN_RMS
@@ -3175,29 +3399,38 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 if rms < min_rms_threshold:
                     score = 0.0
                     is_detected = False
+                elif self.sb_classifier is None or self.sb_target is None:
+                    # SpeechBrain non disponible - désactiver la détection
+                    score = 0.0
+                    is_detected = False
                 else:
                     # Convertir en tensor pour SpeechBrain
                     audio_tensor = torch.tensor(live_audio, dtype=torch.float32).unsqueeze(0)  # [1, T]
                     
-                    # Générer l'embedding avec SpeechBrain
-                    with torch.no_grad():
-                        emb = self.sb_classifier.encode_batch(audio_tensor).squeeze().cpu().numpy()
-                    
-                    # Calculer la similarité cosine avec l'embedding cible
-                    score = self._sb_cosine(emb, self.sb_target)
-                    
-                    # Détection plus réactive : 1 seul hit suffit (au lieu de 2)
-                    # Cela rend la détection plus immédiate et fiable
-                    if score >= self.WAKE_THRESHOLD:
-                        self._wake_hit_count = 1  # On met directement à 1 pour déclencher
-                        is_detected = True
-                    else:
-                        self._wake_hit_count = 0
+                    try:
+                        # Générer l'embedding avec SpeechBrain
+                        with torch.no_grad():
+                            emb = self.sb_classifier.encode_batch(audio_tensor).squeeze().cpu().numpy()
+                        
+                        # Calculer la similarité cosine avec l'embedding cible
+                        score = self._sb_cosine(emb, self.sb_target)
+                        
+                        # Détection plus réactive : 1 seul hit suffit (au lieu de 2)
+                        # Cela rend la détection plus immédiate et fiable
+                        if score >= self.WAKE_THRESHOLD:
+                            self._wake_hit_count = 1  # On met directement à 1 pour déclencher
+                            is_detected = True
+                        else:
+                            self._wake_hit_count = 0
+                            is_detected = False
+                        
+                        # Debug : afficher les scores élevés pour calibration
+                        if score > 0.35:  # Afficher seulement les scores intéressants
+                            print(f">>> [WAKE-DEBUG] Score: {score:.3f}, RMS: {rms:.3f}, Threshold: {self.WAKE_THRESHOLD}")
+                    except Exception as e:
+                        print(f">>> [WARNING] Erreur lors de la détection du wake word: {e}")
+                        score = 0.0
                         is_detected = False
-                    
-                    # Debug : afficher les scores élevés pour calibration
-                    if score > 0.35:  # Afficher seulement les scores intéressants
-                        print(f">>> [WAKE-DEBUG] Score: {score:.3f}, RMS: {rms:.3f}, Threshold: {self.WAKE_THRESHOLD}")
                 
                 current_time = time.time()
                 
@@ -3211,39 +3444,20 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         self.conversation_active = True
                         self.last_interaction_time = time.time()
                         last_detection_time = current_time
-                        # Son de confirmation
-                        if os.path.exists(self.wake_sound_path):
-                            try:
-                                pygame.mixer.music.load(self.wake_sound_path)
-                                pygame.mixer.music.play()
-                            except:
-                                pass
-                        # Envoyer l'audio actuel à Gemini (après l'interruption, is_busy est False)
-                        pcm_buffer = (live_audio * 32767).astype(np.int16).tobytes()
-                        await self.out_queue_gemini.put({
-                            "data": pcm_buffer, 
-                            "mime_type": "audio/pcm"
-                        })
-                        # On vide le buffer pour repartir proprement
+                        # Son de confirmation (barge-in)
+                        self.sound_manager.play("wake", volume=0.4)
+                        # NE PAS envoyer l'audio du wake word - vider le buffer
                         audio_deque.clear()
+                        # Pas besoin d'envoyer de réponse texte pour le barge-in, 
+                        # l'utilisateur va continuer à parler
                         continue
                     
                     # Activation normale (quand Cypher ne parle pas)
                     if not self.conversation_active:
                         print(f">>> [WAKE] Sayfeure détecté ! (Score: {score:.3f}, RMS: {rms:.3f})")
                         
-                        # Son de confirmation
-                        if os.path.exists(self.wake_sound_path):
-                            try:
-                                pygame.mixer.music.load(self.wake_sound_path)
-                                pygame.mixer.music.play()
-                            except:
-                                pass
-                        else:
-                            try:
-                                winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
-                            except:
-                                pass
+                        # Son de confirmation (wake word)
+                        self.sound_manager.play("wake", volume=0.4)
                         
                         # Activer la conversation
                         self.gui_queue.put(("STATUS", "listening"))
@@ -3251,13 +3465,22 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         self.last_interaction_time = time.time()
                         last_detection_time = current_time
                         
-                        # Envoyer l'audio actuel à Gemini (qui contient le wake word)
-                        pcm_buffer = (live_audio * 32767).astype(np.int16).tobytes()
-                        if not self.is_busy:
-                            await self.out_queue_gemini.put({
-                                "data": pcm_buffer, 
-                                "mime_type": "audio/pcm"
-                            })
+                        # NE PAS envoyer l'audio du wake word à Gemini
+                        # Vider le buffer pour repartir proprement
+                        audio_deque.clear()
+                        
+                        # Envoyer une réponse simple de confirmation (texte)
+                        if not self.is_busy and self.out_queue_gemini:
+                            # Réponse simple et naturelle
+                            wake_responses = [
+                                "Oui, je suis là. Comment puis-je t'aider ?",
+                                "Je t'écoute.",
+                                "Oui, je suis prêt. Que veux-tu ?",
+                                "Je suis là, que puis-je faire pour toi ?"
+                            ]
+                            import random
+                            response = random.choice(wake_responses)
+                            await self.out_queue_gemini.put(response)
                 
                 # Gestion de la conversation active
                 if self.conversation_active:
@@ -3266,15 +3489,10 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     if vol > 0.01:
                         self.last_interaction_time = time.time()
                     
-                    # Timeout après silence
-                    if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy:
+                    # Timeout après silence (mais PAS si Cypher est en train de parler ou de travailler)
+                    if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy and not self.is_speaking:
                         print(">>> [SLEEP] Silence détecté, retour en veille.")
-                        if os.path.exists(self.end_sound_path):
-                            try:
-                                pygame.mixer.music.load(self.end_sound_path)
-                                pygame.mixer.music.play()
-                            except:
-                                pass
+                        self.sound_manager.play("end_listening", volume=0.35)
                         self.gui_queue.put(("STATUS", "idle"))
                         self.conversation_active = False
                         audio_deque.clear()
@@ -3320,11 +3538,25 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
         while True:
             try:
+                # Réinitialiser les variables d'interaction pour ce tour
+                self._current_tools_used = []
+                self._current_response = ""
 
                 turn = self.session.receive()
 
                 tool_responses = []
                 web_search_urls = set()
+                goodbye_detected = False  # Flag pour détecter les au revoir
+                
+                # Capturer l'input utilisateur depuis le turn si disponible
+                if hasattr(turn, 'model_request') or hasattr(turn, 'user_input'):
+                    try:
+                        # Essayer de récupérer l'input utilisateur (selon l'API Gemini)
+                        # Note: L'API Gemini Live ne retourne pas toujours la transcription utilisateur directement
+                        # On essaie de capturer depuis les chunks si disponibles
+                        pass
+                    except:
+                        pass
 
                 async for chunk in turn:
                     # [BLOC TOOLS ET SERVER CONTENT INCHANGÉ - GARDER LE TIEN ICI SI BESOIN]
@@ -3342,6 +3574,10 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 fname = fc.name
                                 args = dict(fc.args or {})
                                 
+                                # Enregistrer l'utilisation de l'outil pour l'apprentissage
+                                if fname not in self._current_tools_used:
+                                    self._current_tools_used.append(fname)
+                                
                                 # Vérifier si on a été interrompu avant même de commencer
                                 if self._interrupted_flag:
                                     print(f">>> [INTERRUPTION] Tool {fname} annulé avant exécution (interruption en cours)")
@@ -3351,6 +3587,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 # 1. FEEDBACK VISUEL
                                 if fname in ["execute_python", "document_manager", "google_search", "file_manager"]:
                                     self.gui_queue.put(("STATUS", "processing"))
+
+                                # 1.5. FEEDBACK SONORE (processing)
+                                self.sound_manager.play("processing", volume=0.25)
 
                                 # 2. FEEDBACK AUDIO (NOUVEAU !!)
                                 # On vérifie si on a des phrases pour cet outil
@@ -3377,7 +3616,12 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                         tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
                                     else:
                                         tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
+                                        # Son de succès pour tool exécuté avec succès
+                                        self.sound_manager.play("success", volume=0.2)
                                 except Exception as e:
+                                    # Son d'erreur si erreur non interrompue
+                                    if not self._interrupted_flag:
+                                        self.sound_manager.play("error", volume=0.25)
                                     # Même si une exception se produit, on ajoute l'erreur (sauf si interrompu)
                                     if not self._interrupted_flag:
                                         tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
@@ -3428,7 +3672,42 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         
                         text_buffer += current_text
                         
+                        # 🔍 DÉTECTION DES AU REVOIR PENDANT LE STREAMING (AMÉLIORÉE)
                         import re
+                        text_lower_check = text_buffer.lower()
+                        
+                        # Liste étendue des mots-clés d'au revoir (plus de variantes)
+                        goodbye_patterns = [
+                            r"\bau\s+revoir\b",
+                            r"\bà\s+plus\b",
+                            r"\ba\s+plus\b",
+                            r"\bbye\b",
+                            r"\bà\s+bientôt\b",
+                            r"\ba\s+bientot\b",
+                            r"\bbonne\s+nuit\b",
+                            r"\bsalut\s*$",  # "salut" à la fin d'une phrase
+                            r"\bciao\b",
+                            r"\bsee\s+you\b",
+                            r"\bgoodbye\b",
+                            r"\bfarewell\b",
+                            r"\bà\s+la\s+prochaine\b",
+                            r"\bprochainement\b"
+                        ]
+                        
+                        # Vérifier si un pattern d'au revoir est détecté dans le buffer
+                        for pattern in goodbye_patterns:
+                            if re.search(pattern, text_lower_check):
+                                logger.info(f"Au revoir détecté dans la réponse: '{pattern}'")
+                                await self._handle_goodbye()
+                                text_buffer = ""  # Vider le buffer
+                                goodbye_detected = True
+                                break
+                        
+                        # Si on a détecté un au revoir, on ignore le reste du texte
+                        if goodbye_detected:
+                            continue
+                        
+                        # Traitement normal du texte (split par phrases)
                         split_pattern = r'([.?!;])\s+'
                         parts = re.split(split_pattern, text_buffer)
                         
@@ -3440,6 +3719,19 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 
                                 raw_sentence = parts[i] + parts[i+1]
                                 
+                                # Vérifier aussi chaque phrase individuellement
+                                sentence_lower = raw_sentence.lower()
+                                for pattern in goodbye_patterns:
+                                    if re.search(pattern, sentence_lower):
+                                        logger.info(f"Au revoir détecté dans une phrase: '{pattern}'")
+                                        await self._handle_goodbye()
+                                        text_buffer = ""
+                                        goodbye_detected = True
+                                        break
+                                
+                                if goodbye_detected:  # Si on a détecté un au revoir, on arrête
+                                    break
+                                
                                 # === LE FIX EST ICI ===
                                 # On nettoie AVANT d'envoyer à la voix
                                 clean_sentence = self._clean_text_for_tts(raw_sentence)
@@ -3448,21 +3740,46 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                     self.is_speaking = True
                                     await self.response_queue_tts.put(clean_sentence)
                             
-                            text_buffer = parts[-1]
+                            if not goodbye_detected:
+                                text_buffer = parts[-1]
+                            else:
+                                text_buffer = ""
 
                 # --- FIN DU TOUR ---
-                if text_buffer.strip():
+                if text_buffer.strip() and not goodbye_detected:
                     text_lower = text_buffer.lower()
                     
-                    # LISTE DES MOTS QUI DÉCLENCHENT LA VEILLE
-                    stop_words = ["au revoir", "bonne nuit", "à plus", "a plus", "bye", "à bientôt", "a bientot"]
+                    # DERNIÈRE VÉRIFICATION À LA FIN DU TOUR
+                    import re
+                    goodbye_patterns_final = [
+                        r"\bau\s+revoir\b",
+                        r"\bà\s+plus\b",
+                        r"\ba\s+plus\b",
+                        r"\bbye\b",
+                        r"\bà\s+bientôt\b",
+                        r"\ba\s+bientot\b",
+                        r"\bbonne\s+nuit\b",
+                        r"\bciao\b",
+                        r"\bsee\s+you\b",
+                        r"\bgoodbye\b"
+                    ]
                     
-                    if any(word in text_lower for word in stop_words):
-                         self.conversation_active = False
-                         # Optionnel : Forcer le statut GUI en 'idle' tout de suite
-                         self.gui_queue.put(("STATUS", "idle"))
+                    for pattern in goodbye_patterns_final:
+                        if re.search(pattern, text_lower):
+                            logger.info(f"Au revoir détecté à la fin du tour: '{pattern}'")
+                            await self._handle_goodbye()
+                            text_buffer = ""
+                            goodbye_detected = True  # CRITIQUE: Mettre à jour le flag
+                            break
+                    
+                    # Si on a détecté un au revoir, on ne continue pas avec le TTS
+                    if goodbye_detected or not text_buffer:
+                        continue
 
                     self.is_speaking = True
+                    
+                    # Sauvegarder la réponse pour l'apprentissage
+                    self._current_response = text_buffer.strip()
                     
                     # 1. On envoie le texte BRUT (avec *) au GUI pour qu'il soit joli
                     self.gui_queue.put(("ASSISTANT_TEXT", text_buffer.strip()))
@@ -3472,6 +3789,34 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     await self.response_queue_tts.put(clean_buffer)
                     
                     text_buffer = "" 
+                
+                # Si un au revoir a été détecté, on arrête complètement le traitement
+                if goodbye_detected:
+                    # On ne continue pas avec l'enregistrement ni le reste du traitement
+                    await self.response_queue_tts.put(None)  # Signal de fin pour le TTS
+                    continue  # Retourner au début de la boucle principale
+                
+                # Enregistrer l'interaction pour l'apprentissage (à la fin du tour)
+                if hasattr(self, 'learning_system') and self._current_response:
+                    # Essayer de récupérer l'input utilisateur depuis le contexte
+                    # (Pour l'instant on utilise un placeholder, idéalement on devrait capturer le texte transcrit)
+                    user_input = self._current_user_input if hasattr(self, '_current_user_input') and self._current_user_input else "conversation_audio"
+                    
+                    # Enregistrer l'interaction
+                    try:
+                        self.learning_system.record_interaction(
+                            user_input=user_input,
+                            cypher_response=self._current_response,
+                            tools_used=self._current_tools_used.copy() if self._current_tools_used else [],
+                            context={"timestamp": datetime.now().isoformat()}
+                        )
+                    except Exception as e:
+                        logger.debug(f"Erreur lors de l'enregistrement de l'interaction: {e}")
+                    
+                    # Réinitialiser pour la prochaine interaction
+                    self._current_user_input = ""
+                    self._current_tools_used = []
+                    self._current_response = ""
                 
                 await self.response_queue_tts.put(None)
                 self.last_interaction_time = time.time()
@@ -3716,6 +4061,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 
                 async with self.client.aio.live.connect(model=MODEL, config=self.config) as session:
                     self.session = session
+                    # Son de connexion réussie
+                    self.sound_manager.play("connect", volume=0.25)
                     self.out_queue_gemini = asyncio.Queue(maxsize=20)
                     
                     if self.response_queue_tts is None:
@@ -3725,18 +4072,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
                     print(">>> [INFO] ✅ Connecté !")
                     self.gui_queue.put(("STATUS", "idle"))
-                    print(">>> [INIT] Lancement du briefing de démarrage...")
                     
-                    # On construit un prompt invisible pour forcer le briefing
-                    boot_prompt = (
-                        "Système initialisé. Tu viens de démarrer. "
-                        "Fais un accueil très court et stylé (style J.A.R.V.I.S). "
-                        "Donne l'heure actuelle, la météo locale rapide, et vérifie s'il y a des mails non lus ou des RDV aujourd'hui. "
-                        "Sois concis et efficace."
-                    )
-                    
-                    # On l'injecte directement dans le cerveau
-                    await self.out_queue_gemini.put({"data": boot_prompt, "mime_type": "text/plain"})
                     reconnect_delay = 2
 
                     try:
@@ -3765,6 +4101,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     websockets.exceptions.ConnectionClosedError,
                     ConnectionResetError) as e:
                 print(f"\n>>> [RECONNECT] Connexion perdue: {e}")
+                self.sound_manager.play("disconnect", volume=0.25)
                 self.needs_reconnect = True
             
             except Exception as e:
@@ -3822,6 +4159,8 @@ FUNCTION_MAP = {
     "expert_stats": expert_stats,
     "spotify_control": spotify_tool,
     "analyze_screen": analyze_screen_tool,
+    "web_navigator": web_navigator_tool,
+    "user_preferences": AudioLoop._user_preferences,
 }
 
 def run_backend(gui_queue):
@@ -3854,7 +4193,7 @@ def run_backend(gui_queue):
 if __name__ == "__main__":
     import queue
     import threading
-    from gui import CypherGUI 
+    from modules.gui import CypherGUI 
 
     print(">>> [INIT] Lancement de l'interface graphique...")
 

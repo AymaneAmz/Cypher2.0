@@ -1,0 +1,16 @@
+# Normaliser les fins de ligne
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+
+# Binaires
+*.mp3 binary
+*.wav binary
+*.npy binary
+*.pkl binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+

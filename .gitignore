@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+
+# Environnement et secrets
+.env
+.env.local
+*.key
+*.pem
+secrets/
+
+# Configuration personnelle
+data/config/cypher_config.json
+data/config/*.json
+
+# Logs
+data/logs/
+*.log
+
+# Cache et données temporaires
+data/cache/
+*.cache
+
+# Mémoire et historique
+data/memory/
+data/rag_db/
+
+# Modèles (trop volumineux pour Git)
+data/models/
+*.npy
+*.pkl
+*.h5
+*.pt
+*.onnx
+
+# Assets personnels (sons, vocabs peuvent être volumineux)
+# Décommentez si vous voulez les exclure aussi :
+# assets/sounds/
+# assets/vocab/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Fichiers de documentation temporaires
+*.tmp
+*.bak
+*~
+
+# Playwright (navigateur web)
+.playwright/
+
+# Autres
+*.db
+*.sqlite
+*.sqlite3
+
