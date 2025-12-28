@@ -47,6 +47,7 @@ try:
 except (ImportError, OSError, AttributeError, Exception) as e:
     SPEECHBRAIN_AVAILABLE = False
     EncoderClassifier = None
+    # Logger pas encore disponible ici (import en cours), on garde print pour les erreurs d'import
     print(f"⚠️ [WARNING] SpeechBrain non disponible: {type(e).__name__}: {e}")
     print("⚠️ La détection du wake word ne fonctionnera pas. Le système continuera quand même.")
 from collections import deque
@@ -241,8 +242,8 @@ class AudioLoop:
         if not SPEECHBRAIN_AVAILABLE or EncoderClassifier is None:
             self.sb_classifier = None
             self.sb_target = None
-            print("⚠️ [WARNING] SpeechBrain non disponible - la détection du wake word est désactivée")
-            print("⚠️ Tu peux utiliser le module wake_word_detector.py comme alternative")
+            logger.warning("SpeechBrain non disponible - la détection du wake word est désactivée")
+            logger.warning("Tu peux utiliser le module wake_word_detector.py comme alternative")
         else:
             try:
                 self.sb_classifier = EncoderClassifier.from_hparams(
@@ -255,8 +256,8 @@ class AudioLoop:
                 embedding_path = models_dir / "wakeword_embedding.npy"
                 if not embedding_path.exists():
                     vocab_dir = get_vocab_dir()
-                    print(f">>> [ERREUR] Fichier wakeword_embedding.npy introuvable dans {models_dir}")
-                    print(f">>> Exécute train_wakeword.py pour générer l'embedding à partir des fichiers {vocab_dir}/")
+                    logger.error(f"Fichier wakeword_embedding.npy introuvable dans {models_dir}")
+                    logger.error(f"Exécute train_wakeword.py pour générer l'embedding à partir des fichiers {vocab_dir}/")
                     self.sb_classifier = None
                     self.sb_target = None
                 else:
@@ -268,9 +269,9 @@ class AudioLoop:
                         self.sb_target_normalized = self.sb_target / target_norm
                     else:
                         self.sb_target_normalized = self.sb_target
-                    print(">>> [OPTIM] Embedding wake word chargé et pré-normalisé (cache activé)")
+                    logger.info("Embedding wake word chargé et pré-normalisé (cache activé)")
             except Exception as e:
-                print(f"⚠️ [WARNING] Erreur lors du chargement de SpeechBrain: {e}")
+                logger.warning(f"Erreur lors du chargement de SpeechBrain: {e}")
                 self.sb_classifier = None
                 self.sb_target = None
                 self.sb_target_normalized = None
@@ -304,7 +305,7 @@ class AudioLoop:
         # Tenter de restaurer l'état précédent
         saved_state = self.state_manager.load_state()
         if saved_state:
-            print(">>> [RESTORE] État précédent trouvé. Utilise 'restore_state' pour le restaurer si besoin.")
+            logger.info("État précédent trouvé. Utilise 'restore_state' pour le restaurer si besoin.")
         
         # Initialiser le TaskManager pour la gestion de tâches professionnelle
         from modules.task_manager import get_task_manager
@@ -312,7 +313,7 @@ class AudioLoop:
         # Les tâches sont automatiquement chargées depuis cypher_tasks.json au démarrage
         task_count = len(self.task_manager.tasks)
         if task_count > 0:
-            print(f">>> [TASKS] {task_count} tâche(s) chargée(s) depuis le fichier de persistance")
+            logger.info(f"{task_count} tâche(s) chargée(s) depuis le fichier de persistance")
         
         # Initialiser le tool executor (sera initialisé après avoir chargé FUNCTION_MAP)
         self.tool_executor = None
@@ -337,7 +338,7 @@ class AudioLoop:
                     memory_str = json.dumps(data, ensure_ascii=False, indent=2)
                     memory_content = f"\n\n[MEMOIRE LONGUE DURÉE - CONTEXTE PERMANENT] :\n{memory_str}\nUtilise ces informations pour personnaliser tes réponses."
             except:
-                print(">>> [WARNING] Impossible de lire la mémoire au démarrage.")
+                logger.warning("Impossible de lire la mémoire au démarrage.")
 
         # --- CHARGEMENT DU SYSTÈME D'APPRENTISSAGE ---
         self.learning_system = get_learning_system()
@@ -702,292 +703,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 'powershell', '-Command',
                 "Get-AudioDevice -RecordingMute | Set-AudioDevice -RecordingMute 0"
             ], capture_output=True)
-            print(">>> [AUDIO] Gain du microphone optimisé")
+            logger.info("Gain du microphone optimisé")
         except:
-            print(">>> [WARNING] Impossible d'ajuster le gain automatiquement")
-
-    @staticmethod
-    def _document_manager(action: str, query: str | None = None, source_folder: str | None = None, source_file: str | None = None ) -> str:
-        """
-        Système RAG (Chat with Data) : Indexe et interroge vos documents locaux (PDF, MD, DOCX, TXT).
-        Action: 'index' (scanner un dossier) ou 'search' (poser une question).
-        """
-        import os
-        import fitz  
-        import docx
-        import chromadb
-        from chromadb.utils import embedding_functions
-
-        # Chemin de la base de données vectorielle (mémoire documentaire)
-        DB_PATH = str(get_rag_db_dir())
-        
-        # Initialisation de ChromaDB (Persistant sur le disque)
-        client = chromadb.PersistentClient(path=DB_PATH)
-        
-        # Fonction d'embedding par défaut (utilise un modèle léger local)
-        # Note: Au premier lancement, ça téléchargera un petit modèle (~80MB)
-        emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        
-        # Création/Récupération de la collection
-        collection = client.get_or_create_collection(name="cypher_knowledge", embedding_function=emb_fn)
-
-        action = action.lower()
-
-        # --- 1. INDEXATION (APPRENDRE) ---
-        if action == "index":
-            if not source_folder:
-                return "Quel dossier dois-je lire et apprendre ?"
-            
-            # Correction chemin OneDrive si tilde
-            if "~" in source_folder:
-                source_folder = os.path.expanduser(source_folder)
-            
-            if not os.path.exists(source_folder):
-                return f"Le dossier '{source_folder}' n'existe pas."
-
-            print(f">>> [RAG] Indexation en cours de : {source_folder} ...")
-            
-            files_processed = 0
-            chunks_added = 0
-            
-            # Formats supportés
-            supported_ext = ['.pdf', '.md', '.txt', '.docx', '.py']
-
-            for root, dirs, files in os.walk(source_folder):
-                for file in files:
-                    ext = os.path.splitext(file)[1].lower()
-                    if ext in supported_ext:
-                        filepath = os.path.join(root, file)
-                        text_content = ""
-                        
-                        try:
-                            # Extraction du texte selon le format
-                            if ext == '.pdf':
-                                try:
-                                    with fitz.open(filepath) as doc:
-                                        for page in doc:
-                                            text_content += page.get_text() + "\n"
-                                except fitz.fitz.FileDataError:
-                                    print(f"   -> PDF corrompu : {file}")
-                                    continue
-                                except Exception as e:
-                                    print(f"   -> Erreur PDF {file}: {e}")
-                                    continue
-                            elif ext == '.docx':
-                                doc = docx.Document(filepath)
-                                text_content = "\n".join([p.text for p in doc.paragraphs])
-                            else: # MD, TXT, PY
-                                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                                    text_content = f.read()
-                            
-                            if not text_content.strip(): continue
-
-                            # Découpage en chunks (morceaux) de 1000 caractères
-                            # Pour éviter de saturer le contexte
-                            chunk_size = 1000
-                            overlap = 100 # On garde 100 char du chunk précédent
-                            chunks = []
-                            for i in range(0, len(text_content), chunk_size - overlap):
-                                chunks.append(text_content[i:i+chunk_size])
-                            
-                            # Préparation pour ChromaDB
-                            ids = [f"{file}_{i}" for i in range(len(chunks))]
-                            metadatas = [{"source": file, "path": filepath} for _ in chunks]
-                            
-                            # Ajout à la base (Upsert = met à jour si existe déjà)
-                            collection.upsert(
-                                documents=chunks,
-                                ids=ids,
-                                metadatas=metadatas
-                            )
-                            
-                            files_processed += 1
-                            chunks_added += len(chunks)
-                            print(f"   -> Lu : {file} ({len(chunks)} fragments)")
-                            
-                        except Exception as e:
-                            print(f"   -> Erreur sur {file}: {e}")
-                            continue
-
-            return f"Indexation terminée ! J'ai lu {files_processed} fichiers et mémorisé {chunks_added} fragments de connaissances."
-
-        # --- 2. RECHERCHE (RÉPONDRE) ---
-        if action == "search":
-            if not query: return "Quelle est votre question sur les documents ?"
-            
-            # On cherche les 5 morceaux les plus pertinents sémantiquement
-            results = collection.query(
-                query_texts=[query],
-                n_results=5
-            )
-            
-            if not results['documents'][0]:
-                return "Je n'ai trouvé aucune information pertinente dans vos documents indexés."
-            
-            # Construction du contexte pour Gemini
-            context_text = "Voici les informations extraites de vos documents :\n\n"
-            for i, doc in enumerate(results['documents'][0]):
-                source = results['metadatas'][0][i]['source']
-                context_text += f"--- Source : {source} ---\n{doc}\n\n"
-            
-            return context_text
-
-        # --- 3. RESET (OUBLIER) ---
-        if action == "reset":
-            client.delete_collection("cypher_knowledge")
-            return "J'ai effacé toute ma base de connaissances documentaires."
-    
-
-        if action == "summary":
-            if not source_file:
-                return "Quel fichier dois-je résumer, Monsieur ?"
-
-            # Expansion du chemin si besoin (~, etc.)
-            if "~" in source_file:
-                source_file = os.path.expanduser(source_file)
-
-            if not os.path.exists(source_file):
-                return f"Le fichier '{source_file}' n'existe pas, Monsieur."
-
-            ext = os.path.splitext(source_file)[1].lower()
-            text_content = ""
-
-            try:
-                if ext == ".pdf":
-                    try:
-                        with fitz.open(source_file) as doc:
-                            for page in doc:
-                                text_content += page.get_text() + "\n"
-                    except Exception as e:
-                        return f"Impossible de lire le PDF, Monsieur : {e}"
-
-                elif ext == ".docx":
-                    try:
-                        d = docx.Document(source_file)
-                        text_content = "\n".join([p.text for p in d.paragraphs])
-                    except Exception as e:
-                        return f"Impossible de lire le document Word, Monsieur : {e}"
-
-                elif ext in [".md", ".txt", ".py"]:
-                    with open(source_file, "r", encoding="utf-8", errors="ignore") as f:
-                        text_content = f.read()
-
-                else:
-                    return f"Je ne sais pas encore résumer les fichiers de type '{ext}', Monsieur."
-
-                if not text_content.strip():
-                    return "Le fichier est vide ou illisible, Monsieur."
-
-                # On limite la taille renvoyée pour ne pas exploser le contexte de Gemini
-                max_chars = 4000
-                snippet = text_content[:max_chars]
-                if len(text_content) > max_chars:
-                    snippet += "\n\n[Texte tronqué pour le résumé, Monsieur.]"
-
-                # L'idée : tu renvoies le texte brut, et Gemini se charge de faire un beau résumé
-                return (
-                    f"Voici le contenu brut extrait de '{os.path.basename(source_file)}', "
-                    f"prêt à être résumé :\n\n{snippet}"
-                )
-
-            except Exception as e:
-                return f"Erreur lors de la lecture du fichier, Monsieur : {e}"
-
-        return "Action RAG inconnue."
-        
-        
-
-    @staticmethod
-    def _email_manager(action: str, recipient: str | None = None, subject: str | None = None, body: str | None = None, query: str | None = None) -> str:
-        """
-        Gère l'application locale Outlook (Lecture, Recherche, Envoi).
-        Nécessite qu'Outlook soit installé et configuré sur le PC.
-        """
-        import win32com.client
-        import pythoncom
-        
-        # Initialisation du contexte COM (nécessaire pour le multithreading)
-        pythoncom.CoInitialize()
-
-        try:
-            # Connexion à Outlook
-            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-            # 6 = Inbox (Boîte de réception)
-            inbox = outlook.GetDefaultFolder(6)
-        except Exception as e:
-            return f"Erreur de connexion à Outlook. Est-il installé ? Erreur : {e}"
-
-        action = action.lower()
-
-        # --- LIRE LES NON-LUS ---
-        if action == "read_recent":
-            messages = inbox.Items
-            messages.Sort("[ReceivedTime]", True) # Plus récents d'abord
-            
-            unread_messages = []
-            count = 0
-            
-            # On scanne les 50 derniers pour trouver les non-lus
-            for message in messages:
-                if count >= 5: break # On s'arrête à 5 résumés
-                try:
-                    if message.UnRead:
-                        sender = message.SenderName
-                        subj = message.Subject
-                        # On nettoie un peu le corps
-                        preview = message.Body[:100].replace('\r', ' ').replace('\n', ' ')
-                        unread_messages.append(f"- De {sender} | Objet : {subj} | Aperçu : {preview}...")
-                        count += 1
-                    if count >= 50: break # Sécurité pour ne pas scanner 10k mails
-                except:
-                    continue
-            
-            if not unread_messages:
-                return "Vous n'avez aucun nouvel e-mail non lu dans les 50 derniers reçus."
-            
-            return "Voici vos derniers e-mails non lus :\n" + "\n".join(unread_messages)
-
-        # --- RECHERCHER ---
-        if action == "search":
-            if not query: return "Que dois-je chercher ?"
-            
-            messages = inbox.Items
-            messages.Sort("[ReceivedTime]", True)
-            
-            found_messages = []
-            count = 0
-            
-            # Recherche simple dans les 100 derniers mails
-            for message in messages:
-                try:
-                    if query.lower() in message.Subject.lower() or query.lower() in message.SenderName.lower():
-                        found_messages.append(f"- [{message.ReceivedTime}] De {message.SenderName} : {message.Subject}")
-                        count += 1
-                    if count >= 5: break
-                    if count >= 100: break
-                except: continue
-                
-            if not found_messages:
-                return f"Je n'ai rien trouvé pour '{query}' dans les 100 derniers e-mails."
-            return f"Résultats pour '{query}' :\n" + "\n".join(found_messages)
-
-        # --- ENVOYER ---
-        if action == "send":
-            if not recipient or not subject or not body:
-                return "Pour envoyer un mail, il me faut : destinataire, objet et corps du message."
-            
-            try:
-                # 0 = MailItem
-                mail = win32com.client.Dispatch("Outlook.Application").CreateItem(0)
-                mail.To = recipient
-                mail.Subject = subject
-                mail.Body = body
-                mail.Send()
-                return f"E-mail envoyé avec succès à {recipient}."
-            except Exception as e:
-                return f"Erreur lors de l'envoi : {e}"
-
-        return "Action Outlook inconnue."
+            logger.warning("Impossible d'ajuster le gain automatiquement")
 
     async def agenda_watcher(self):
         """
@@ -999,7 +717,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
         AGENDA_FILE = str(get_memory_dir() / "cypher_agenda.json")
 
-        print(">>> [INFO] Agenda Watcher activé.")
+        logger.info("Agenda Watcher activé.")
 
         while True:
             try:
@@ -1020,7 +738,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     if event.get("alarm") and event["date"] == now_str and event.get("status") == "pending":
                         
                         # 🔔 DÉCLENCHEMENT DE L'ALARME
-                        print(f">>> [ALARM] {event['description']}")
+                        logger.info(f"Alarme agenda : {event['description']}")
                         
                         # Message vocal prioritaire
                         alert_text = f"Monsieur ! Rappel agenda : {event['description']}."
@@ -1038,7 +756,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         json.dump(agenda, f, indent=4, ensure_ascii=False)
 
             except Exception as e:
-                print(f">>> [ERROR Agenda Watcher] : {e}")
+                logger.error(f"Erreur dans agenda_watcher : {e}")
 
     def _manage_tasks(
         self,
@@ -1369,116 +1087,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         return "\n".join(rep)
 
     @staticmethod
-    def _memory_manager(action: str, category: str, key: str | None = None, value: str | None = None) -> str:
-        """
-        Gère la MÉMOIRE LONGUE DURÉE.
-        """
-        import json
-        import os
-        from datetime import datetime
-
-        
-        MEMORY_FILE = str(get_memory_dir() / "cypher_memory_cortex.json")
-        
-        # 1. Chargement de la mémoire
-        if os.path.exists(MEMORY_FILE):
-            try:
-                with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-                    memory = json.load(f)
-            except json.JSONDecodeError:
-                memory = {}
-        else:
-            memory = {}
-
-        action = action.lower()
-        
-        # Liste des catégories valides pour guider (mais on accepte les nouvelles)
-        VALID_CATEGORIES = [
-            "profil_utilisateur", "gouts_et_preferences", "projets_actifs", 
-            "environnement_systeme", "entourage", "base_de_connaissances", "journal_evenements"
-        ]
-
-        # --- ACTION : MÉMORISER (Remember) ---
-        if action == "remember":
-            if not key or not value:
-                return "Erreur : Pour mémoriser, il me faut un sujet (key) et une information (value)."
-            
-            # Normalisation
-            category_slug = category.lower().replace(" ", "_")
-            
-            if category_slug not in memory:
-                memory[category_slug] = {}
-            
-            # Ajout d'un timestamp pour savoir quand on a appris ça
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            memory_entry = {
-                "value": value,
-                "updated_at": timestamp
-            }
-            
-            memory[category_slug][key.lower()] = memory_entry
-            
-            # Sauvegarde atomique
-            with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(memory, f, indent=4, ensure_ascii=False)
-            
-            return f"🧠 Mémoire enregistrée dans [{category_slug}] : J'ai noté que '{key}' est '{value}'."
-
-        # --- ACTION : SE RAPPELER (Recall) ---
-        if action == "recall":
-            category_slug = category.lower().replace(" ", "_")
-            
-            # Si on veut tout savoir sur une catégorie
-            if not key:
-                if category_slug not in memory:
-                    return f"Je n'ai aucune information dans la catégorie '{category}'."
-                
-                content = []
-                for k, v in memory[category_slug].items():
-                    # On gère le format ancien (juste str) et nouveau (dict avec timestamp)
-                    val = v["value"] if isinstance(v, dict) and "value" in v else v
-                    content.append(f"- **{k.title()}** : {val}")
-                
-                return f"📂 **Contenu de la mémoire '{category}'** :\n" + "\n".join(content)
-
-            # Si on cherche une clé précise
-            key_lower = key.lower()
-            if category_slug in memory and key_lower in memory[category_slug]:
-                data = memory[category_slug][key_lower]
-                val = data["value"] if isinstance(data, dict) and "value" in data else data
-                return f"💡 **Souvenir retrouvé** ({category}) : {val}"
-            else:
-                return f"Je n'ai pas de mémoire précise pour '{key}' dans '{category}'."
-
-        # --- ACTION : OUBLIER (Forget) ---
-        if action == "forget":
-            category_slug = category.lower().replace(" ", "_")
-            if category_slug in memory:
-                if key:
-                    if key.lower() in memory[category_slug]:
-                        del memory[category_slug][key.lower()]
-                        save = True
-                    else:
-                        return f"Je ne connaissais pas '{key}' dans cette catégorie."
-                else:
-                    # Oublier toute la catégorie
-                    del memory[category_slug]
-                    save = True
-                
-                if save:
-                    with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-                        json.dump(memory, f, indent=4, ensure_ascii=False)
-                    return f"🗑️ Mémoire effacée avec succès."
-            return "Rien à effacer."
-
-        # --- ACTION : LISTER LES CATÉGORIES (Map) ---
-        if action == "list_categories":
-            cats = list(memory.keys())
-            return f"🗂️ Catégories actuelles de mon cerveau : {', '.join(cats)}"
-
-        return "Action mémoire inconnue."
-
-    @staticmethod
     def _expert_coder_write_file(target_path: str) -> str:
         """
         Écrit dans un fichier le DERNIER code généré par l'outil expert_coder,
@@ -1512,7 +1120,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 now = datetime.now()
                 remaining = (timer_end - now).total_seconds()
                 if remaining <= 0 and not get_timer_alert_triggered():
-                    print(">>> [DEBUG] Timer finished, sending auto alert.")
+                    logger.debug("Timer finished, sending auto alert.")
                     set_timer_alert_triggered(True)
                     set_timer_end(None)  # Réinitialiser le timer après l'alerte
 
@@ -1522,7 +1130,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     await self.response_queue_tts.put(message)
                     await self.response_queue_tts.put(None)
             except Exception as e:
-                print(f">>> [ERROR in timer_watcher]: {e}")
+                logger.error(f"Erreur dans timer_watcher : {e}")
                 await asyncio.sleep(1)
     
     # Note: _sb_cosine déplacé dans wake_word_detector.py - gardé pour compatibilité temporaire
@@ -1665,7 +1273,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         sample_rate = 16000
         chunk_size = 4000  # ~250ms à 16kHz
         
-        print(">>> [AUDIO] Initialisation du micro pour la détection du wake word...")
+        logger.info("Initialisation du micro pour la détection du wake word...")
         
         try:
             self.audio_stream = await asyncio.to_thread(
@@ -1678,7 +1286,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 frames_per_buffer=chunk_size
             )
         except Exception as e:
-            print(f">>> [ERREUR AUDIO] Impossible d'ouvrir le micro : {e}")
+            logger.error(f"Impossible d'ouvrir le micro : {e}")
             return
         
         # Buffer audio pour accumuler ~1 seconde d'audio
@@ -1687,7 +1295,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         cooldown_sec = 1.0  # Temps minimum entre deux détections (réduit pour plus de réactivité)
         barge_in_skip_counter = 0  # Compteur pour traiter moins souvent pendant que Cypher parle
         
-        print(">>> [READY] Écoute active - dis 'Sayfeure' pour activer (barge-in activé)")
+        logger.info("Écoute active - dis 'Sayfeure' pour activer (barge-in activé)")
         
         while True:
             try:
@@ -1780,9 +1388,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         
                         # Debug : afficher les scores élevés pour calibration
                         if score > 0.35:  # Afficher seulement les scores intéressants
-                            print(f">>> [WAKE-DEBUG] Score: {score:.3f}, RMS: {rms:.3f}, Threshold: {self.WAKE_THRESHOLD}")
+                            logger.debug(f"Wake word debug - Score: {score:.3f}, RMS: {rms:.3f}, Threshold: {self.WAKE_THRESHOLD}")
                     except Exception as e:
-                        print(f">>> [WARNING] Erreur lors de la détection du wake word: {e}")
+                        logger.warning(f"Erreur lors de la détection du wake word: {e}")
                         score = 0.0
                         is_detected = False
                 
@@ -1792,7 +1400,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 if is_detected and (current_time - last_detection_time > cooldown_sec):
                     # BARGE-IN : Si Cypher parle ou travaille, on l'interrompt immédiatement
                     if self.is_speaking or self.is_busy:
-                        print(f">>> [BARGE-IN] Sayfeure détecté pendant la parole/travail - Interruption ! (Score: {score:.3f})")
+                        logger.info(f"BARGE-IN: Sayfeure détecté pendant la parole/travail - Interruption ! (Score: {score:.3f})")
                         self._interrupt_playback()
                         # Activer la conversation immédiatement
                         self.conversation_active = True
@@ -1808,7 +1416,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     
                     # Activation normale (quand Cypher ne parle pas)
                     if not self.conversation_active:
-                        print(f">>> [WAKE] Sayfeure détecté ! (Score: {score:.3f}, RMS: {rms:.3f})")
+                        logger.info(f"WAKE: Sayfeure détecté ! (Score: {score:.3f}, RMS: {rms:.3f})")
                         
                         # Son de confirmation (wake word)
                         self.sound_manager.play("wake", volume=0.4)
@@ -1845,7 +1453,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     
                     # Timeout après silence (mais PAS si Cypher est en train de parler ou de travailler)
                     if (time.time() - self.last_interaction_time > self.CONVERSATION_TIMEOUT) and not self.is_busy and not self.is_speaking:
-                        print(">>> [SLEEP] Silence détecté, retour en veille.")
+                        logger.info("SLEEP: Silence détecté, retour en veille.")
                         self.sound_manager.play("end_listening", volume=0.35)
                         self.gui_queue.put(("STATUS", "idle"))
                         self.conversation_active = False
@@ -1861,7 +1469,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             
             except Exception as e:
                 # En cas d'erreur, on continue pour éviter de planter
-                print(f">>> [ERREUR dans listen_audio] : {e}")
+                logger.error(f"Erreur dans listen_audio : {e}")
                 await asyncio.sleep(0.1)
                 continue
 
@@ -1929,7 +1537,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 
                                 # Vérifier si on a été interrompu avant même de commencer
                                 if self._interrupted_flag:
-                                    print(f">>> [INTERRUPTION] Tool {fname} annulé avant exécution (interruption en cours)")
+                                    logger.info(f"INTERRUPTION: Tool {fname} annulé avant exécution (interruption en cours)")
                                     tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
                                     continue
                                 
@@ -1965,7 +1573,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                     
                                     # Si on a été interrompu pendant l'exécution, on annule l'envoi
                                     if self._interrupted_flag:
-                                        print(f">>> [INTERRUPTION] Tool {fname} annulé suite à l'interruption pendant l'exécution")
+                                        logger.info(f"INTERRUPTION: Tool {fname} annulé suite à l'interruption pendant l'exécution")
                                         tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
                                     else:
                                         tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
@@ -1986,7 +1594,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             if self._interrupted_flag:
                                 # Si interrompu, on remplace toutes les réponses par des annulations
                                 final_responses = [{"id": fc.id, "name": fc.name, "response": {"error": "Operation cancelled by user interruption"}} for fc in function_calls]
-                                print(f">>> [INTERRUPTION] Envoi de {len(final_responses)} réponse(s) d'annulation à Gemini pour débloquer la session")
+                                logger.info(f"INTERRUPTION: Envoi de {len(final_responses)} réponse(s) d'annulation à Gemini pour débloquer la session")
                             else:
                                 final_responses = tool_responses
                             
@@ -1994,9 +1602,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             if final_responses:
                                 try:
                                     await self.session.send_tool_response(function_responses=final_responses)
-                                    print(f">>> [TOOL] Réponse(s) envoyée(s) à Gemini ({len(final_responses)} tool(s)) - Session débloquée")
+                                    logger.info(f"TOOL: Réponse(s) envoyée(s) à Gemini ({len(final_responses)} tool(s)) - Session débloquée")
                                 except Exception as e:
-                                    print(f">>> [ERREUR] Impossible d'envoyer la réponse tool à Gemini: {e}")
+                                    logger.error(f"Impossible d'envoyer la réponse tool à Gemini: {e}")
                             
                             # 🔓 ON DEVERROUILLE : Cypher a fini ce tool (ou a été interrompu)
                             self.is_busy = False
@@ -2005,7 +1613,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             # Si on a été interrompu, on reset le flag pour la prochaine fois
                             # IMPORTANT: On reset le flag APRÈS avoir envoyé la réponse pour éviter les race conditions
                             if was_interrupted:
-                                print(f">>> [INTERRUPTION] Reset du flag d'interruption - prêt pour nouvelle interaction")
+                                logger.info("INTERRUPTION: Reset du flag d'interruption - prêt pour nouvelle interaction")
                                 self._interrupted_flag = False
                                 
                                 # Forcer un petit délai pour s'assurer que Gemini a bien reçu la réponse
@@ -2189,11 +1797,11 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             except Exception as e:
                 error_str = str(e).lower()
                 if "1011" in error_str or "unavailable" in error_str or "connection" in error_str or "deadline" in error_str:
-                    print(f"\n>>> [WARN] Session expirée: {e}")
+                    logger.warning(f"Session expirée: {e}")
                     self.needs_reconnect = True
                     return  # Sortir proprement au lieu de raise
                 
-                print(f"\n>>> [ERROR in receive_text]: {e}")
+                logger.error(f"Erreur dans receive_text: {e}")
                 traceback.print_exc()
                 self.needs_reconnect = True
                 return  # Sortir proprement
@@ -2210,7 +1818,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         )
         synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
     
-        print(f">>> [INIT] Azure TTS (SSML) prêt ({AZURE_VOICE_NAME} | Vitesse: {TTS_RATE})")
+        logger.info(f"Azure TTS (SSML) prêt ({AZURE_VOICE_NAME} | Vitesse: {TTS_RATE})")
     
         while True:
             full_text = await self.response_queue_tts.get()
@@ -2238,13 +1846,13 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 
                 elif result.reason == speechsdk.ResultReason.Canceled:
                     cancellation_details = result.cancellation_details
-                    print(f">>> [ERREUR AZURE] : {cancellation_details.reason}")
+                    logger.error(f"Erreur Azure TTS : {cancellation_details.reason}")
                     if cancellation_details.reason == speechsdk.CancellationReason.Error:
-                        print(f"Code erreur: {cancellation_details.error_code}")
-                        print(f"Détails: {cancellation_details.error_details}")
+                        logger.error(f"Code erreur: {cancellation_details.error_code}")
+                        logger.error(f"Détails: {cancellation_details.error_details}")
     
             except Exception as e:
-                print(f">>> [EXCEPTION TTS] : {e}")
+                logger.error(f"Exception TTS : {e}")
             
             finally:
                 self.response_queue_tts.task_done()
@@ -2266,9 +1874,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 output=True,
                 frames_per_buffer=CHUNK_SIZE
             )
-            print(">>> [INFO] Audio output stream is open.")
+            logger.info("Audio output stream is open.")
         except Exception as e:
-            print(f">>> [FATAL ERROR] Could not open PyAudio stream: {e}")
+            logger.error(f"FATAL: Could not open PyAudio stream: {e}")
             return
 
         while True:
@@ -2289,7 +1897,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     else:
                         self.gui_queue.put(("STATUS", "idle"))
                         
-                    print(f">>> [INFO] ✅ Micro libéré (active={self.conversation_active})")
+                    logger.info(f"Micro libéré (active={self.conversation_active})")
                     self.audio_in_queue_player.task_done()
                     continue
 
@@ -2302,7 +1910,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             await asyncio.to_thread(stream.write, bytestream)
                         else:
                             # Stream fermé, on le réouvre
-                            print(">>> [WARNING] Stream audio fermé, réouverture...")
+                            logger.warning("Stream audio fermé, réouverture...")
                             if stream:
                                 try:
                                     stream.close()
@@ -2324,7 +1932,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     except OSError as e:
                         # Gestion spécifique des erreurs PyAudio
                         if e.errno in [-9999, -9988, -9981]:
-                            print(f">>> [ERROR AUDIO] Erreur PyAudio {e.errno}, tentative de récupération...")
+                            logger.error(f"Erreur PyAudio {e.errno}, tentative de récupération...")
                             
                             # Fermer et rouvrir le stream
                             if stream:
@@ -2347,9 +1955,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                     output=True,
                                     frames_per_buffer=CHUNK_SIZE
                                 )
-                                print(">>> [INFO] Stream audio récupéré.")
+                                logger.info("Stream audio récupéré.")
                             except Exception as e2:
-                                print(f">>> [FATAL] Impossible de récupérer le stream : {e2}")
+                                logger.error(f"FATAL: Impossible de récupérer le stream : {e2}")
                                 self.is_speaking = False
                                 break
                         else:
@@ -2358,10 +1966,10 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 self.audio_in_queue_player.task_done()
                 
             except asyncio.CancelledError:
-                print(">>> [INFO] play_audio task cancelled")
+                logger.info("play_audio task cancelled")
                 break
             except Exception as e:
-                print(f">>> [ERROR] Error in audio playback loop: {e}")
+                logger.error(f"Erreur dans la boucle de lecture audio: {e}")
                 self.is_speaking = False
                 await asyncio.sleep(0.5)
         
@@ -2371,13 +1979,13 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 if stream.is_active():
                     stream.stop_stream()
                 stream.close()
-                print(">>> [INFO] Audio stream closed cleanly.")
+                logger.info("Audio stream closed cleanly.")
             except:
                 pass
 
     def _cleanup_queues(self):
         """Vide toutes les queues pour repartir sur une base propre après reconnexion"""
-        print(">>> [CLEANUP] Nettoyage des queues audio...")
+        logger.info("CLEANUP: Nettoyage des queues audio...")
         
         # Vider la queue TTS
         if self.response_queue_tts:
@@ -2410,7 +2018,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         self.is_speaking = False
         self.is_busy = False
         
-        print(">>> [CLEANUP] ✅ Queues vidées, prêt pour reconnexion")
+        logger.info("CLEANUP: Queues vidées, prêt pour reconnexion")
 
     async def run(self):
         import websockets
@@ -2421,7 +2029,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             self.needs_reconnect = False
             
             try:
-                print(f">>> [CONNEXION] Tentative de connexion à Gemini...")
+                logger.info("Tentative de connexion à Gemini...")
                 self.session = None
                 
                 async with self.client.aio.live.connect(model=MODEL, config=self.config) as session:
@@ -2435,7 +2043,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     if self.audio_in_queue_player is None:
                         self.audio_in_queue_player = asyncio.Queue()
 
-                    print(">>> [INFO] ✅ Connecté !")
+                    logger.info("Connecté !")
                     self.gui_queue.put(("STATUS", "idle"))
                     
                     reconnect_delay = 2
@@ -2457,25 +2065,25 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     except* (websockets.exceptions.ConnectionClosed,
                             websockets.exceptions.ConnectionClosedError,
                             ConnectionResetError) as eg:
-                        print(f"\n>>> [RECONNECT] Connexion perdue (group): {eg}")
+                        logger.warning(f"RECONNECT: Connexion perdue (group): {eg}")
                         self.needs_reconnect = True
                     except* Exception as eg:
-                        print(f"\n>>> [RECONNECT] Erreur TaskGroup: {eg}")
+                        logger.error(f"RECONNECT: Erreur TaskGroup: {eg}")
                         self.needs_reconnect = True
 
             except asyncio.CancelledError:
-                print("\n>>> [INFO] Arrêt manuel.")
+                logger.info("Arrêt manuel.")
                 break
             
             except (websockets.exceptions.ConnectionClosed, 
                     websockets.exceptions.ConnectionClosedError,
                     ConnectionResetError) as e:
-                print(f"\n>>> [RECONNECT] Connexion perdue: {e}")
+                logger.warning(f"RECONNECT: Connexion perdue: {e}")
                 self.sound_manager.play("disconnect", volume=0.25)
                 self.needs_reconnect = True
             
             except Exception as e:
-                print(f"\n>>> [ERROR] Erreur inattendue: {e}")
+                logger.error(f"Erreur inattendue: {e}")
                 traceback.print_exc()
                 self.needs_reconnect = True
             
@@ -2491,7 +2099,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             
             # Reconnexion si nécessaire
             if self.needs_reconnect:
-                print(f">>> [RECONNECT] Reconnexion dans {reconnect_delay}s...")
+                logger.info(f"RECONNECT: Reconnexion dans {reconnect_delay}s...")
                 self._cleanup_queues()
                 self.gui_queue.put(("STATUS", "reconnecting"))
                 await asyncio.sleep(reconnect_delay)
@@ -2519,11 +2127,11 @@ FUNCTION_MAP = {
     "power_control": power_control,
     "system_optimize": system_optimize,
     "network_manager": network_manager,
-    "memory_manager": AudioLoop._memory_manager,
+    "memory_manager": memory_manager,
     "error_history_tool": AudioLoop._error_history,
     "manage_agenda": manage_agenda,
-    "email_manager": AudioLoop._email_manager,
-    "document_manager": AudioLoop._document_manager,
+    "email_manager": email_manager,
+    "document_manager": document_manager,
     "manage_tasks": AudioLoop._manage_tasks,
     "expert_coder": expert_coder_tool,
     "expert_coder_write_file": AudioLoop._expert_coder_write_file,
@@ -2566,7 +2174,7 @@ if __name__ == "__main__":
     import threading
     from modules.gui import CypherGUI 
 
-    print(">>> [INIT] Lancement de l'interface graphique...")
+    logger.info("Lancement de l'interface graphique...")
 
     # 1. Création du canal de communication (Le Tuyau)
     gui_queue = queue.Queue()
@@ -2581,11 +2189,11 @@ if __name__ == "__main__":
         app = CypherGUI(data_queue=gui_queue)
         app.mainloop()
     except Exception as e:
-        print(f">>> [CRASH GUI] : {e}")
+        logger.error(f"CRASH GUI: {e}")
     finally:
         # Nettoyage final
         try:
             pya.terminate()
         except:
             pass
-        print(">>> [INFO] Application fermée.")
+        logger.info("Application fermée.")
