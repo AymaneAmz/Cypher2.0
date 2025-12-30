@@ -7,6 +7,7 @@ from modules.spotify_controller import SPOTIFY_TOOL_DECLARATION
 from modules.analyze_screen import SCREEN_ANALYZER_TOOL_DECLARATION
 from modules.web_navigator import WEB_NAVIGATOR_TOOL_DECLARATION
 from modules.expert_coder import EXPERT_CODER_TOOL_DECLARATION
+from modules.n8n_integration import N8N_WORKFLOW_TOOL_DECLARATION
 
 
 def get_all_tool_declarations():
@@ -499,35 +500,6 @@ def get_all_tool_declarations():
         }
     }
 
-    agenda_tool = {
-        "name": "manage_agenda",
-        "description": "Gère l'agenda personnel : ajouter, consulter ou supprimer des événements.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["add", "list", "delete"],
-                    "description": "Action à effectuer."
-                },
-                "date_iso": {
-                    "type": "string",
-                    "description": "Date et heure de l'événement au format EXACT 'YYYY-MM-DD HH:MM'. Calcule-la toi-même par rapport à la date actuelle."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Description de l'événement."
-                },
-                "alarm": {
-                    "type": "boolean",
-                    "description": "Si True, Cypher parlera vocalement à l'heure dite.",
-                    "default": False
-                }
-            },
-            "required": ["action"]
-        }
-    }
-
     email_tool = {
         "name": "email_manager",
         "description": "Gère l'application Outlook locale : lire les mails non lus, chercher un mail, ou envoyer un e-mail.",
@@ -633,7 +605,6 @@ def get_all_tool_declarations():
             network_manager,
             memory_manager,
             error_history_tool,
-            agenda_tool,
             email_tool,
             document_manager,
             EXPERT_CODER_TOOL_DECLARATION,
@@ -643,6 +614,7 @@ def get_all_tool_declarations():
             WEB_NAVIGATOR_TOOL_DECLARATION,
             user_preferences_tool,
             manage_tasks_tool,
+            N8N_WORKFLOW_TOOL_DECLARATION,
         ]},
         google_search_tool
     ]

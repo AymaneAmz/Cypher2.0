@@ -75,6 +75,7 @@ from google import genai
 from modules.spotify_controller import spotify_tool, SPOTIFY_TOOL_DECLARATION
 from modules.analyze_screen import analyze_screen_tool, SCREEN_ANALYZER_TOOL_DECLARATION
 from modules.web_navigator import web_navigator_tool, WEB_NAVIGATOR_TOOL_DECLARATION, get_navigator
+from modules.n8n_integration import n8n_workflow_tool
 from modules.gui import CypherGUI
 
 # Import des nouveaux modules refactorisés
@@ -93,7 +94,6 @@ from modules.time_management import (
     format_duration,
     manage_stopwatch,
     manage_timer,
-    manage_agenda,
     get_timer_end,
     get_timer_alert_triggered,
     set_timer_alert_triggered,
@@ -201,6 +201,11 @@ LOADING_PHRASES = {
         "Je demande à l'architecte logiciel de générer ce code...",
         "Conception du programme en cours avec le modèle haute précision...",
         "Je rédige un code propre et optimisé, patientez..."
+    ],
+    "n8n_workflow": [
+        "Je déclenche le workflow d'automatisation, un instant...",
+"Exécution en cours...",
+        "Orchestration des tâches automatisées..."
     ],
 }
 
@@ -356,7 +361,7 @@ class AudioLoop:
         # Note: Le résumé sera injecté dynamiquement dans la conversation si nécessaire
         context_summary = self.state_manager.get_context_summary()
         context_summary_text = f"\n{context_summary}" if context_summary else ""
-        
+
         self.config = {
             "response_modalities": ["TEXT"],
             "system_instruction": f"""
@@ -594,8 +599,11 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     • Pour les contenu textuels que tu me propose je veux toujours qu'il soit dans un format tres beau visuellement avec des titres, sous titres, listes a puces, etc.
 
 
-    Règle pour manage_agenda :
-    - Utilise cet outil dès que je parle de temps, de rendez-vous, de rappel, de planning ou d'emploi du temps.
+    Règle pour n8n_workflow (Google Calendar) :
+    - Dès que je parle de "rendez-vous", "événement", "ajoute dans mon calendrier", "Google Calendar" → utilise n8n_workflow.
+    - Utilise TOUJOURS webhook_path='google-calendar' (ne pose JAMAIS de question sur le workflow ou le chemin).
+    - Calcule les dates au format ISO 8601 avec fuseau horaire (ex: '2025-01-20T15:00:00+01:00').
+    - Inclus TOUJOURS 'title', 'start' et 'end' dans les données.
     - CALCUL OBLIGATOIRE : L'outil attend une `date_iso` au format strict 'YYYY-MM-DD HH:MM'. Tu DOIS calculer cette date toi-même en te basant sur la date et l'heure actuelles fournies dans le contexte ({current_context}).
     - RAPPELS : Si je dis "Rappelle-moi de [faire X] dans [Y] minutes/heures", calcule l'heure future et appelle l'outil avec `action='add'`, la description et `alarm=True`.
     - CONSULTATION : Si je demande "Qu'est-ce que j'ai de prévu ?", utilise `action='list'`.
@@ -655,9 +663,18 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
         
         e.  DERNIER RECOURS/LOGIQUE : Utilise `execute_python` uniquement si les outils ci-dessus échouent ou si la tâche nécessite une logique de programmation complexe ou une librairie externe (fpdf, pandas, etc.).
 
-        f. AGENDA :
-       - Pour ajouter un événement, tu DOIS calculer la date future au format 'YYYY-MM-DD HH:MM' en te basant sur la date actuelle ({current_context}).
-       - Si je dis "Rappelle-moi de sortir les poubelles ce soir à 20h", tu calcules la date d'aujourd'hui + 20:00 et tu appelles manage_agenda avec alarm=True.
+        f. AGENDA ET RENDEZ-VOUS :
+       - Pour Google Calendar : Utilise TOUJOURS n8n_workflow avec webhook_path='google-calendar'. 
+         Calcule les dates au format ISO 8601 avec fuseau horaire (ex: '2025-01-20T15:00:00+01:00').
+         Pour CRÉER: data={{'title': 'Titre', 'start': '2025-01-20T15:00:00+01:00', 'end': '2025-01-20T16:00:00+01:00'}}.
+         Pour LISTER: OBLIGATOIREMENT n8n_workflow(action='trigger', webhook_path='google-calendar', data={{'time_min': '2025-01-20T00:00:00+01:00', 'time_max': '2025-01-20T23:59:59+01:00'}}).
+         Si je demande "quels rendez-vous", "planning", "événements de demain", "liste mes rendez-vous" → TU DOIS appeler n8n_workflow avec list_events.
+         Pour SUPPRIMER: D'abord liste les événements. La réponse contient l'event_id au format "| ID: xxx". 
+         Extrais l'event_id (la partie après "| ID: ") et envoie data={{'event_id': 'xxx'}}.
+       - Si je dis "rendez-vous", "événement", "ajoute dans mon calendrier", "Google Calendar", "planning", "agenda" → utilise n8n_workflow avec webhook_path='google-calendar'.
+       - ⚠️ INTERDICTION: N'utilise JAMAIS expert_coder pour Google Calendar. Utilise UNIQUEMENT n8n_workflow.
+       - ⚠️ OBLIGATOIRE: Pour TOUTE demande de listage/consultation d'événements, appelle n8n_workflow. Ne réponds JAMAIS "aucun événement" sans avoir appelé n8n_workflow d'abord.
+       - Sois CONCIS. Réponds directement avec le résultat, sans expliquer le processus. Exemple: "Rendez-vous ajouté" ou "3 événements trouvés: ..."
 
        g. GESTION EMAILS (Outlook) :
        - Utilise `email_manager` pour lire, chercher ou envoyer des mails.
@@ -706,57 +723,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             logger.info("Gain du microphone optimisé")
         except:
             logger.warning("Impossible d'ajuster le gain automatiquement")
-
-    async def agenda_watcher(self):
-        """
-        Vérifie chaque minute si un événement de l'agenda avec alarme est arrivé.
-        """
-        import json
-        import os
-        from datetime import datetime
-
-        AGENDA_FILE = str(get_memory_dir() / "cypher_agenda.json")
-
-        logger.info("Agenda Watcher activé.")
-
-        while True:
-            try:
-                # Vérification toutes les 30 secondes
-                await asyncio.sleep(30)
-                
-                if not os.path.exists(AGENDA_FILE):
-                    continue
-
-                with open(AGENDA_FILE, 'r', encoding='utf-8') as f:
-                    agenda = json.load(f)
-
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                modified = False
-
-                for event in agenda:
-                    # Si l'heure correspond ET qu'il y a une alarme ET qu'elle n'a pas déjà sonné
-                    if event.get("alarm") and event["date"] == now_str and event.get("status") == "pending":
-                        
-                        # 🔔 DÉCLENCHEMENT DE L'ALARME
-                        logger.info(f"Alarme agenda : {event['description']}")
-                        
-                        # Message vocal prioritaire
-                        alert_text = f"Monsieur ! Rappel agenda : {event['description']}."
-                        self.is_speaking = True
-                        await self.response_queue_tts.put(alert_text)
-                        await self.response_queue_tts.put(None)
-                        
-                        # Marquer comme "notified" pour ne pas répéter en boucle
-                        event["status"] = "notified"
-                        modified = True
-
-                # Sauvegarder si on a notifié quelqu'un
-                if modified:
-                    with open(AGENDA_FILE, 'w', encoding='utf-8') as f:
-                        json.dump(agenda, f, indent=4, ensure_ascii=False)
-
-            except Exception as e:
-                logger.error(f"Erreur dans agenda_watcher : {e}")
 
     def _manage_tasks(
         self,
@@ -1104,7 +1070,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
         # On délègue toute la logique de chemin à file_manager
         return file_manager(action="create_file", source_path=target_path, content=code)
-
+    
     async def timer_watcher(self):
         """
         Surveille en tâche de fond le compte à rebours.
@@ -1186,6 +1152,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         # --- FIX CRITIQUE : On débloque le cerveau immédiatement ---
         self.is_busy = False
         
+        # 🔥 FIX CRITIQUE : Mettre le flag d'interruption à True pour annuler les tools en cours
+        self._interrupted_flag = True
+        
         # Notifier le tool executor
         if self.tool_executor:
             self.tool_executor.set_interrupted(True)
@@ -1213,6 +1182,12 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
             # 4. On force l'état silencieux
             self.is_speaking = False
             self.gui_queue.put(("STATUS", "listening"))
+        
+        # 🔥 FIX CRITIQUE : S'assurer que conversation_active est True pour permettre à l'utilisateur de parler
+        # (sera géré dans la boucle de barge-in, mais on le met ici aussi pour être sûr)
+        if not self.conversation_active:
+            self.conversation_active = True
+            self.last_interaction_time = time.time()
 
     async def send_realtime(self):
         import base64
@@ -1297,8 +1272,33 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         
         logger.info("Écoute active - dis 'Sayfeure' pour activer (barge-in activé)")
         
+        # Envoyer l'état initial "sleeping" au GUI (Cypher démarre en veille)
+        try:
+            self.gui_queue.put(("STATUS", "sleeping"))
+        except:
+            pass
+        
         while True:
             try:
+                # Vérifier les commandes GUI (non-bloquant)
+                try:
+                    while True:  # Traiter tous les messages en attente
+                        msg_type, command = self.gui_queue.get_nowait()
+                        if msg_type == "GUI_COMMAND":
+                            if command == "WAKE":
+                                logger.info("Commande WAKE reçue du GUI - Réveil de Cypher")
+                                self.conversation_active = True
+                                self.last_interaction_time = time.time()
+                                self.gui_queue.put(("STATUS", "awake"))
+                            elif command == "SLEEP":
+                                logger.info("Commande SLEEP reçue du GUI - Mise en veille de Cypher")
+                                await self._handle_goodbye()
+                                self.gui_queue.put(("STATUS", "sleeping"))
+                except queue.Empty:
+                    pass  # Pas de message dans la queue, continuer
+                except Exception as e:
+                    logger.debug(f"Erreur lors de la lecture de la queue GUI: {e}")
+                
                 # Lecture du micro
                 data = await asyncio.to_thread(
                     self.audio_stream.read, 
@@ -1410,6 +1410,9 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         self.sound_manager.play("wake", volume=0.4)
                         # NE PAS envoyer l'audio du wake word - vider le buffer
                         audio_deque.clear()
+                        # 🔥 FIX CRITIQUE : S'assurer que le micro est prêt à écouter
+                        # Réinitialiser le flag d'interruption après un court délai pour permettre au tool de se terminer proprement
+                        # (le flag sera réinitialisé dans receive_text après l'envoi de la réponse d'annulation)
                         # Pas besoin d'envoyer de réponse texte pour le barge-in, 
                         # l'utilisateur va continuer à parler
                         continue
@@ -1616,8 +1619,22 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 logger.info("INTERRUPTION: Reset du flag d'interruption - prêt pour nouvelle interaction")
                                 self._interrupted_flag = False
                                 
+                                # 🔥 FIX CRITIQUE : S'assurer que l'état est correctement réinitialisé pour permettre à l'utilisateur de parler
+                                self.is_busy = False
+                                self.conversation_active = True
+                                self.last_interaction_time = time.time()
+                                
+                                # Notifier le tool executor aussi
+                                if self.tool_executor:
+                                    self.tool_executor.reset_interrupted()
+                                
+                                # Mettre à jour le statut GUI
+                                self.gui_queue.put(("STATUS", "listening"))
+                                
                                 # Forcer un petit délai pour s'assurer que Gemini a bien reçu la réponse
                                 await asyncio.sleep(0.1)
+                                
+                                logger.info("INTERRUPTION: État réinitialisé - prêt à écouter l'utilisateur")
                         continue
 
                     if hasattr(chunk, "server_content") and chunk.server_content:
@@ -2056,7 +2073,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             tg.create_task(self.tts())
                             tg.create_task(self.play_audio())
                             tg.create_task(self.timer_watcher())
-                            tg.create_task(self.agenda_watcher())
                             # AMÉLIORATION 4: Auto-sauvegarde périodique
                             tg.create_task(self.state_manager.auto_save_loop(
                                 learning_system=self.learning_system,
@@ -2129,7 +2145,6 @@ FUNCTION_MAP = {
     "network_manager": network_manager,
     "memory_manager": memory_manager,
     "error_history_tool": AudioLoop._error_history,
-    "manage_agenda": manage_agenda,
     "email_manager": email_manager,
     "document_manager": document_manager,
     "manage_tasks": AudioLoop._manage_tasks,
@@ -2140,6 +2155,7 @@ FUNCTION_MAP = {
     "analyze_screen": analyze_screen_tool,
     "web_navigator": web_navigator_tool,
     "user_preferences": AudioLoop._user_preferences,
+    "n8n_workflow": n8n_workflow_tool,
 }
 
 def run_backend(gui_queue):
