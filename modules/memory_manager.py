@@ -1,18 +1,71 @@
 # -*- coding: utf-8 -*-
 """
-Module de gestion de mémoire pour Cypher
-Gère la mémoire longue durée (mémoire persistante)
+Module de gestion de mémoire pour Cypher (OPTIMISÉ - IN-MEMORY)
+Gère la mémoire longue durée avec cache RAM et flush périodique
 """
 
 import json
 import os
 from datetime import datetime
+from typing import Dict, Any, Optional
 from core.paths import get_memory_dir
 from core.logger import get_logger
 
 logger = get_logger("memory_manager")
 
 MEMORY_FILE = str(get_memory_dir() / "cypher_memory_cortex.json")
+
+
+class MemoryManager:
+    """Gestionnaire de mémoire optimisé - Singleton en RAM"""
+    
+    def __init__(self):
+        self._memory: Dict[str, Any] = {}
+        self._dirty = False  # Indique si la mémoire a été modifiée
+        self._load_from_disk()
+    
+    def _load_from_disk(self):
+        """Charge la mémoire depuis le disque (UNE SEULE FOIS au démarrage)"""
+        if os.path.exists(MEMORY_FILE):
+            try:
+                with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
+                    self._memory = json.load(f)
+                logger.info(f"🧠 Mémoire chargée depuis le disque ({len(self._memory)} catégories)")
+            except json.JSONDecodeError:
+                logger.warning("Fichier mémoire corrompu, initialisation d'une mémoire vide")
+                self._memory = {}
+        else:
+            self._memory = {}
+            logger.info("🧠 Mémoire initialisée (vide)")
+    
+    def save_to_disk(self):
+        """Sauvegarde la mémoire sur disque (appelé périodiquement ou à la fermeture)"""
+        if not self._dirty:
+            return  # Pas de changements, pas besoin de sauvegarder
+        
+        try:
+            with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._memory, f, indent=4, ensure_ascii=False)
+            self._dirty = False
+            logger.debug("🧠 Mémoire sauvegardée sur disque")
+        except Exception as e:
+            logger.error(f"Erreur lors de la sauvegarde mémoire: {e}")
+    
+    def is_dirty(self) -> bool:
+        """Retourne True si la mémoire a été modifiée depuis la dernière sauvegarde"""
+        return self._dirty
+
+
+# Instance globale singleton
+_memory_instance: Optional[MemoryManager] = None
+
+
+def get_memory_instance() -> MemoryManager:
+    """Retourne l'instance globale du gestionnaire de mémoire"""
+    global _memory_instance
+    if _memory_instance is None:
+        _memory_instance = MemoryManager()
+    return _memory_instance
 
 
 def memory_manager(
@@ -22,17 +75,11 @@ def memory_manager(
     value: str | None = None
 ) -> str:
     """
-    Gère la MÉMOIRE LONGUE DURÉE.
+    Gère la MÉMOIRE LONGUE DURÉE (OPTIMISÉE - IN-MEMORY).
     """
-    # 1. Chargement de la mémoire
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-                memory = json.load(f)
-        except json.JSONDecodeError:
-            memory = {}
-    else:
-        memory = {}
+    # 🚀 OPTIMISATION : Utiliser l'instance singleton en RAM
+    mem_instance = get_memory_instance()
+    memory = mem_instance._memory
 
     action = action.lower()
     
@@ -62,9 +109,8 @@ def memory_manager(
         
         memory[category_slug][key.lower()] = memory_entry
         
-        # Sauvegarde atomique
-        with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(memory, f, indent=4, ensure_ascii=False)
+        # 🚀 OPTIMISATION : Marquer comme modifié (sauvegarde périodique)
+        mem_instance._dirty = True
         
         return f"🧠 Mémoire enregistrée dans [{category_slug}] : J'ai noté que '{key}' est '{value}'."
 
@@ -110,8 +156,8 @@ def memory_manager(
                 save = True
             
             if save:
-                with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(memory, f, indent=4, ensure_ascii=False)
+                # 🚀 OPTIMISATION : Marquer comme modifié
+                mem_instance._dirty = True
                 return f"🗑️ Mémoire effacée avec succès."
         return "Rien à effacer."
 

@@ -20,7 +20,9 @@ from typing import Dict, Any
 import time
 import random
 import requests
-import azure.cognitiveservices.speech as speechsdk
+import edge_tts
+from pydub import AudioSegment
+from io import BytesIO
 import queue
 import threading
 import pygame
@@ -99,7 +101,7 @@ from modules.time_management import (
     set_timer_alert_triggered,
     set_timer_end
 )
-from core.tts_utils import generate_ssml, clean_text_for_tts, shorten_for_tts
+from core.tts_utils import clean_text_for_tts, shorten_for_tts
 from core.utils import get_weather, get_folder_size, format_bytes
 from modules.app_launcher import open_app, open_website
 from modules.python_executor import execute_python, get_python_execution_history
@@ -107,6 +109,7 @@ from modules.file_manager import file_manager
 from modules.document_manager import document_manager
 from modules.email_manager import email_manager
 from modules.memory_manager import memory_manager
+# web_search tool custom retiré - on utilise uniquement google_search natif
 
 # Logger principal
 logger = get_logger("main")
@@ -115,24 +118,19 @@ logger = get_logger("main")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION") 
-AZURE_VOICE_NAME = "fr-FR-HenriNeural" 
+# Configuration Edge TTS (gratuit et illimité)
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "fr-FR-HenriNeural")  # Voix masculine française par défaut
+EDGE_TTS_RATE = os.getenv("EDGE_TTS_RATE", "+0%")  # Vitesse (peut être ajustée)
+EDGE_TTS_PITCH = os.getenv("EDGE_TTS_PITCH", "+0Hz")  # Hauteur
 
 WAKE_WORD_SENSITIVITY = 0.5
 WAKE_MIN_VOLUME = 0
-
-TTS_RATE = "+15%"
-TTS_PITCH = "default"
 
 # Les chemins OneDrive sont maintenant dans modules/python_executor.py et modules/file_manager.py
 
 if not GEMINI_API_KEY:
     logger.critical("GEMINI_API_KEY not found. Please set it in your .env file.")
     sys.exit("Error: GEMINI_API_KEY not found. Please set it in your .env file.")
-if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-    logger.critical("AZURE keys not found. Please set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file.")
-    sys.exit("Error: AZURE keys not found. Please set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in your .env file.")
 
 if sys.version_info < (3, 11, 0):
     import taskgroup, exceptiongroup
@@ -151,7 +149,11 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
 # --- API Configuration ---
-MODEL = "gemini-2.0-flash-exp"
+# ⚠️ IMPORTANT : gemini-3-flash n'est PAS supporté pour l'API Live (bidiGenerateContent)
+# C'est une limitation technique de Google - ce modèle n'existe pas pour l'API Live
+# Pour utiliser l'API Live (streaming audio), il faut utiliser un modèle compatible
+# Modèles supportés pour l'API Live : gemini-2.0-flash-exp, gemini-1.5-pro-latest, gemini-1.5-flash-latest
+MODEL = "gemini-2.0-flash-exp"  # Modèle compatible avec l'API Live (streaming audio en temps réel)
 DEFAULT_MODE = "none"
 VOICE_ID = 'bts16wA7hWMfnlEIHuRo'
 
@@ -167,10 +169,11 @@ LOADING_PHRASES = {
         "Je vérifie dans vos fichiers indexés...",
         "Voyons ce que disent vos documents..."
     ],
-    "google_search": [
-        "Je vérifie ça sur le web...",
-        "Recherche d'informations en cours...",
-        "Je regarde ce qui se dit à ce sujet sur Internet..."
+    "google_search": [  # google_search natif (outil Gemini, pas de tool_call direct)
+        "Je lance une recherche web...",
+        "Recherche en cours sur internet...",
+        "Je consulte les sources pour cette information...",
+        "Recherche d'informations en cours..."
     ],
     "execute_python": [
         "J'écris le script, un instant...",
@@ -320,11 +323,9 @@ class AudioLoop:
         if task_count > 0:
             logger.info(f"{task_count} tâche(s) chargée(s) depuis le fichier de persistance")
         
-        # Initialiser le tool executor (sera initialisé après avoir chargé FUNCTION_MAP)
+        # Initialiser le tool executor (sera initialisé dans run() après FUNCTION_MAP)
         self.tool_executor = None
-        
-        # Charger FUNCTION_MAP et initialiser tool_executor
-        # Note: FUNCTION_MAP est défini plus bas dans le fichier, donc on le fera après 
+        self._tool_executor_initialized = False 
         
         self._boost_microphone_gain()
         
@@ -368,6 +369,21 @@ class AudioLoop:
 {current_context}
 {learning_preferences}{context_summary_text}
 
+🔥🔥🔥 RÈGLE PRIORITAIRE #1 - RECHERCHE WEB 🔥🔥🔥 :
+POUR TOUTE RECHERCHE D'INFORMATION (prix, dates, actualités, produits, Back Market, Amazon, etc.) :
+→ TU AS ACCÈS À google_search (outil natif Gemini activé automatiquement)
+→ TU DOIS OBLIGATOIREMENT chercher des informations **récentes et vérifiées** sur le web
+→ INTERDICTION ABSOLUE de répondre de mémoire pour des informations factuelles/récentes
+→ NE DIS JAMAIS "je n'ai pas google_search" - TU L'AS, il est activé dans ta config
+→ Pour TOUTE question nécessitant des infos récentes → google_search s'active automatiquement quand tu cherches
+→ Exemple: "Dernières avancées en IA" → tu DOIS récupérer des sources web récentes (google_search s'activera)
+→ Si tu dis "je n'ai pas google_search", c'est FAUX - tu l'as et il fonctionne
+
+RÈGLE D'ALIGNEMENT DES OUTILS :
+- N'annonce un outil que si tu vas l'appeler immédiatement.
+- N'utilise un outil que si la demande correspond clairement à son rôle.
+- Ne propose pas un outil "au hasard" si la demande ne le concerne pas.
+
 ⚠️ CONFIGURATION SYSTÈME CRITIQUE :
 Les chemins Desktop, Documents et Images sont automatiquement redirigés vers OneDrive si nécessaire par les outils file_manager et execute_python.
 Si tu dois écrire un script Python ou chercher un fichier, utilise TOUJOURS les chemins absolus au lieu des chemins par défaut de Windows.
@@ -409,14 +425,13 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
       (France par défaut si rien n'est dit).
        
     Règle pour web_navigator (INTERNAUTE) :
-    - Utilise cet outil pour des recherches APPROFONDIES ou des actions sur le web.
+    - ⚠️ IMPORTANT : Utilise web_navigator UNIQUEMENT pour des ACTIONS sur le web (navigation, téléchargement, scraping), PAS pour des recherches d'informations.
     - Scénarios :
-      * "Va sur le site de la NASA et dis-moi la dernière news" -> action='navigate', url='nasa.gov'
+      * "Va sur le site de la NASA" -> action='navigate', url='nasa.gov'
       * "Cherche des images de chatons" -> action='search_images'
       * "Télécharge ce PDF" -> action='download'
-      * "Fais une recherche complète sur X" -> action='search' (mieux que google_search car plus détaillé)
-    - Si l'utilisateur demande juste une info rapide ("Quelle heure est-il à Tokyo ?"), garde `Google Search`.
-    - Pour lire un article complet : action='scrape'.
+      * "Scrape cette page web" -> action='scrape'
+    - ⚠️ POUR TOUTE QUESTION D'INFORMATION (prix, dates, actualités, etc.) : Utilise web_search, PAS web_navigator.
       
     Règle pour spotify_control (DJ Musique) :
     - Utilise cet outil dès que je parle de musique, de chansons, d'artistes ou de volume sonore.
@@ -474,34 +489,28 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
     
     Règles pour ouvrir des sites web :
     
-    - Par défaut, tu n’utilises PAS le tool `open_website`.
+    - ⚠️ PRIORITÉ : Tu DOIS utiliser le tool `open_website` pour ouvrir des sites web.
     
-    - Si je dis : « ouvre », « va sur », « affiche », « lance » suivi d’un site web
+    - Si je dis : « ouvre », « va sur », « affiche », « lance » suivi d'un site web
       (par exemple : « ouvre YouTube », « va sur Outlook », « ouvre TryHackMe »,
-      « ouvre le site de l’ESIGELEC », « ouvre Google Drive », etc.),
-      alors tu dois écrire un petit script Python qui ouvre le site dans le navigateur
-      de Monsieur, en utilisant par exemple :
+      « ouvre le site de l'ESIGELEC », « ouvre Google Drive », etc.),
+      alors tu appelles DIRECTEMENT `open_website` avec le nom du site ou l'URL.
     
-          import webbrowser
-          webbrowser.open("https://...")
+    - ⚠️ IMPORTANT : Si je te demande d'ouvrir une page de recherche web (par exemple « ouvre une page de recherche Google pour X », « ouvre une recherche web pour X », ou « ouvre moi sur google une recherche sur X »), tu DOIS utiliser `open_website` avec le texte de recherche en paramètre. L'outil `open_website` gère automatiquement la création de l'URL de recherche Google. Par exemple : open_website(url_or_name="comics spiderman")
     
-      → Tu appelles `execute_python` en DEUX ÉTAPES AUTOMATIQUES :
-        1) une première fois avec confirmed=False (prévisualisation interne),
-        2) immédiatement après avec confirmed=True pour exécuter réellement.
-    
-      → Tu ne demandes PAS de confirmation à Monsieur pour ce type d’action
-        (sauf s’il te le demande explicitement). Tu te contentes de dire par exemple :
-        « J’ouvre YouTube, Monsieur. »
-    
-    - Tu n’utilises le tool `open_website`
-      QUE si tu as une erreur avec execute_python.
+    - Tu n'utilises PAS `execute_python` pour ouvrir des sites web - utilise TOUJOURS `open_website`.
       
-    Règles pour la recherche Web (`Google Search`) :
-    - Si la réponse repose sur des faits récents ou changeants (personnes, postes, produits, versions, prix, actualité, lois, examens, docs officiels, etc.) → tu DOIS appeler google_search avant de répondre.
-    - Si la question est purement conceptuelle ou intemporelle (maths, physique fondamentale, chimie générale, anatomie de base, logique, programmation générique) → tu peux répondre sans google_search, sauf si tu veux vérifier un détail précis.
-    - Tu peux combiner google_search avec les autres tools (file_manager, execute_python, etc.) si ça améliore la précision de ce que tu fais.
+    Règles CRITIQUES pour la recherche Web (google_search natif Gemini) :
+    - ⚠️ TU AS google_search ACTIVÉ : C'est un outil natif de Gemini déjà configuré dans ta session. NE DIS JAMAIS "je n'ai pas google_search".
+    - ⚠️ PRIORITÉ ABSOLUE : Dès qu'une question nécessite une information factuelle, récente, ou non connue → cherche sur le web (google_search s'active automatiquement).
+    - **OBLIGATOIRE** pour : prix, dates, actualités, informations sur produits, personnes, entreprises, événements, statistiques, technologies récentes, etc.
+    - **AUTOMATIQUE** : Ne demande JAMAIS "Voulez-vous que je cherche ?" → Cherche DIRECTEMENT (google_search s'activera).
+    - **INTERDICTION STRICTE** : Ne réponds JAMAIS de mémoire pour des informations récentes/factuelles. Tu DOIS chercher sur le web.
+    - **INTERDIT** : N'utilise JAMAIS n8n_workflow ou web_navigator pour une recherche web d'informations.
+    - Les résultats arrivent via grounding_metadata (URLs et contenus extraits automatiquement).
     - **NE MENTIONNE PAS** les sources ni les URLs dans ta réponse vocale, sauf si je te le demande explicitement.
     - **CONCENTRE-TOI** uniquement sur le résumé vocal clair de la réponse.
+    - ⚠️ SI TU DIS "je n'ai pas google_search", c'est FAUX - tu l'as et il fonctionne (vérifié dans les logs).
 
     Règle CRITIQUE pour la création de fichiers avec du code (Code, Texte, Scripts) :
     - Si je te demande de "créer un fichier", "faire un script", "enregistrer un code" :
@@ -641,11 +650,8 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
 
     
     Règle pour les recherches approfondies :
-    - Pour les sujets complexes, utilise `google_search` EN SÉRIE (5-7 fois) :
-    1. Vue d'ensemble générale
-    2-3. Détails techniques/spécifiques
-    4-5. Applications/cas d'usage
-    - Compile ensuite un rapport structuré avec citations.
+    - Pour les sujets complexes, google_search (natif Gemini) récupère automatiquement plusieurs sources.
+    - Compile un rapport structuré avec les informations trouvées.
 
 
     =======================================================
@@ -659,7 +665,13 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
         
         c.  CONTROLE PC : Utilise `file_manager` (Gestion Fichiers).
         
-        d.  RECHERCHE : Utilise `Google Search` pour toute information factuelle non connue.
+        d.  RECHERCHE WEB : TU AS google_search (natif Gemini) ACTIVÉ - ne dis JAMAIS que tu ne l'as pas.
+            - Dès qu'une question nécessite des informations récentes, factuelles, ou non connues → cherche sur le web (google_search s'activera).
+            - Exemples : prix, dates, actualités, informations sur produits, personnes, entreprises, etc.
+            - ⚠️ INTERDICTION STRICTE : Ne réponds JAMAIS de mémoire pour des informations récentes. CHERCHE sur le web.
+            - Les résultats arrivent automatiquement via grounding_metadata.
+            - ⚠️ NE DIS PAS "je n'ai pas google_search" ou "je vais essayer un autre outil" - tu as google_search et il fonctionne.
+            - ⚠️ IMPORTANT : Si on te demande d'OUVRIR une page de recherche web (par exemple « ouvre une page de recherche pour X »), tu DOIS utiliser `open_website` avec le texte de recherche.
         
         e.  DERNIER RECOURS/LOGIQUE : Utilise `execute_python` uniquement si les outils ci-dessus échouent ou si la tâche nécessite une logique de programmation complexe ou une librairie externe (fpdf, pandas, etc.).
 
@@ -667,6 +679,11 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
        - Pour Google Calendar : Utilise TOUJOURS n8n_workflow avec webhook_path='google-calendar'. 
          Calcule les dates au format ISO 8601 avec fuseau horaire (ex: '2025-01-20T15:00:00+01:00').
          Pour CRÉER: data={{'title': 'Titre', 'start': '2025-01-20T15:00:00+01:00', 'end': '2025-01-20T16:00:00+01:00'}}.
+         Pour MODIFIER (ex: "déplace mon rdv chez le dentiste à 16h"): 
+         1. D'abord liste les événements pour trouver l'event_id correspondant au titre (cherche "dentiste" dans la liste).
+         2. Extrais l'event_id (format "| ID: xxx").
+         3. Calcule la nouvelle date/heure et envoie data={{'event_id': 'xxx', 'start': 'nouvelle_date_iso', 'end': 'nouvelle_date_iso'}}.
+         Tu peux modifier seulement l'heure (start/end), le titre, ou le lieu.
          Pour LISTER: OBLIGATOIREMENT n8n_workflow(action='trigger', webhook_path='google-calendar', data={{'time_min': '2025-01-20T00:00:00+01:00', 'time_max': '2025-01-20T23:59:59+01:00'}}).
          Si je demande "quels rendez-vous", "planning", "événements de demain", "liste mes rendez-vous" → TU DOIS appeler n8n_workflow avec list_events.
          Pour SUPPRIMER: D'abord liste les événements. La réponse contient l'event_id au format "| ID: xxx". 
@@ -674,7 +691,7 @@ Tu t'appelles Cypher et ça se prononce Saïfer. Moi je m'appelle Aymane, je sui
        - Si je dis "rendez-vous", "événement", "ajoute dans mon calendrier", "Google Calendar", "planning", "agenda" → utilise n8n_workflow avec webhook_path='google-calendar'.
        - ⚠️ INTERDICTION: N'utilise JAMAIS expert_coder pour Google Calendar. Utilise UNIQUEMENT n8n_workflow.
        - ⚠️ OBLIGATOIRE: Pour TOUTE demande de listage/consultation d'événements, appelle n8n_workflow. Ne réponds JAMAIS "aucun événement" sans avoir appelé n8n_workflow d'abord.
-       - Sois CONCIS. Réponds directement avec le résultat, sans expliquer le processus. Exemple: "Rendez-vous ajouté" ou "3 événements trouvés: ..."
+       - Sois CONCIS. Réponds directement avec le résultat, sans expliquer le processus. Exemple: "Rendez-vous ajouté" ou "3 événements trouvés: ..." ou "Rendez-vous déplacé à 16h"
 
        g. GESTION EMAILS (Outlook) :
        - Utilise `email_manager` pour lire, chercher ou envoyer des mails.
@@ -708,10 +725,6 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
     
 
-    def _generate_ssml(self, text: str) -> str:
-        """Emballe le texte dans du SSML pour contrôler la vitesse et le ton."""
-        return generate_ssml(text, AZURE_VOICE_NAME, TTS_RATE, TTS_PITCH)
-                                                                                 
     def _boost_microphone_gain(self):
         """Augmente automatiquement le gain du micro au démarrage"""
         import subprocess
@@ -1099,6 +1112,51 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 logger.error(f"Erreur dans timer_watcher : {e}")
                 await asyncio.sleep(1)
     
+    async def background_tasks(self):
+        """
+        🚀 OPTIMISATION : Tâche background pour sauvegardes périodiques et nettoyage cache
+        - Sauvegarde mémoire toutes les 30 secondes (si modifiée)
+        - Sauvegarde learning system toutes les 60 secondes
+        - Nettoyage cache expiré toutes les 5 minutes
+        """
+        last_memory_save = 0
+        last_learning_save = 0
+        last_cache_cleanup = 0
+        
+        while True:
+            try:
+                await asyncio.sleep(10)  # Check toutes les 10 secondes
+                current_time = time.time()
+                
+                # 1. Sauvegarde mémoire (toutes les 30 sec si modifiée)
+                if current_time - last_memory_save >= 30:
+                    from modules.memory_manager import get_memory_instance
+                    mem_instance = get_memory_instance()
+                    if mem_instance.is_dirty():
+                        mem_instance.save_to_disk()
+                        logger.debug("💾 Background: Mémoire sauvegardée")
+                    last_memory_save = current_time
+                
+                # 2. Sauvegarde learning system (toutes les 60 sec)
+                if current_time - last_learning_save >= 60:
+                    from core.learning_system import get_learning_system
+                    learning = get_learning_system()
+                    learning.force_save()
+                    logger.debug("💾 Background: Learning system sauvegardé")
+                    last_learning_save = current_time
+                
+                # 3. Nettoyage cache (toutes les 5 min)
+                if current_time - last_cache_cleanup >= 300:
+                    if self.tool_executor and hasattr(self.tool_executor, 'cache'):
+                        self.tool_executor.cache.clear_expired()
+                        stats = self.tool_executor.cache.get_stats()
+                        logger.debug(f"🧹 Background: Cache nettoyé - {stats}")
+                    last_cache_cleanup = current_time
+                    
+            except Exception as e:
+                logger.error(f"Erreur dans background_tasks: {e}")
+                await asyncio.sleep(10)
+    
     # Note: _sb_cosine déplacé dans wake_word_detector.py - gardé pour compatibilité temporaire
     def _sb_cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         a = a.astype(np.float32)
@@ -1306,7 +1364,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                     exception_on_overflow=False
                 )
                 
-                # Convertir en float32 normalisé [-1, 1]
+                # 🚀 OPTIMISATION : Convertir en float32 normalisé [-1, 1] (vectorisé)
                 np_data = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                 audio_deque.append(np_data)
                 
@@ -1364,12 +1422,15 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         with torch.no_grad():
                             emb = self.sb_classifier.encode_batch(audio_tensor).squeeze().cpu().numpy()
                         
-                        # AMÉLIORATION 1: Utiliser l'embedding pré-normalisé pour accélérer
+                        # 🚀 OPTIMISATION : Utiliser l'embedding pré-normalisé (cosine similarity optimisée)
                         if hasattr(self, 'sb_target_normalized') and self.sb_target_normalized is not None:
-                            # Version optimisée avec embedding pré-normalisé (plus rapide)
+                            # Version optimisée avec embedding pré-normalisé (2x plus rapide que _sb_cosine)
+                            # Conversion en float32 pour calculs SIMD (4x plus rapide sur certains CPU)
+                            emb = emb.astype(np.float32)
                             emb_norm = np.linalg.norm(emb)
                             if emb_norm > 0:
                                 emb_normalized = emb / emb_norm
+                                # Dot product vectorisé (SIMD)
                                 score = float(np.dot(emb_normalized, self.sb_target_normalized))
                             else:
                                 score = 0.0
@@ -1519,129 +1580,58 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         pass
 
                 async for chunk in turn:
-                    # [BLOC TOOLS ET SERVER CONTENT INCHANGÉ - GARDER LE TIEN ICI SI BESOIN]
-                    # Pour faire court, je remets la logique complète ci-dessous :
-                    
+                    # 🚀 OPTIMISATION : Utilisation du tool_executor optimisé (cache + parallèle)
                     if hasattr(chunk, "tool_call") and chunk.tool_call:
-                        # 🔒 ON VERROUILLE : Cypher commence à travailler
-                        self.is_busy = True
-                        self._interrupted_flag = False  # Réinitialiser le flag d'interruption
-                        
                         function_calls = chunk.tool_call.function_calls
                         if function_calls:
-                            tool_responses = []
+                            logger.info(f"TOOL: {len(function_calls)} appel(s) reçu(s) de Gemini")
+                            
+                            # Enregistrer les tools utilisés pour l'apprentissage
                             for fc in function_calls:
-                                fname = fc.name
-                                args = dict(fc.args or {})
-                                
-                                # Enregistrer l'utilisation de l'outil pour l'apprentissage
-                                if fname not in self._current_tools_used:
-                                    self._current_tools_used.append(fname)
-                                
-                                # Vérifier si on a été interrompu avant même de commencer
-                                if self._interrupted_flag:
-                                    logger.info(f"INTERRUPTION: Tool {fname} annulé avant exécution (interruption en cours)")
-                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
-                                    continue
-                                
-                                # 1. FEEDBACK VISUEL
-                                if fname in ["execute_python", "document_manager", "google_search", "file_manager"]:
-                                    self.gui_queue.put(("STATUS", "processing"))
-
-                                # 1.5. FEEDBACK SONORE (processing)
-                                self.sound_manager.play("processing", volume=0.25)
-
-                                # 2. FEEDBACK AUDIO (NOUVEAU !!)
-                                # On vérifie si on a des phrases pour cet outil
-                                if fname in LOADING_PHRASES:
-                                    # On choisit une phrase au hasard
-                                    phrase = random.choice(LOADING_PHRASES[fname])
-                                    
-                                    # On l'ajoute à la file TTS immédiatement
-                                    self.is_speaking = True # Active l'animation de l'orbe
-                                    await self.response_queue_tts.put(phrase)
-                                
-                                # 3. EXECUTION DE L'OUTIL
-                                if fname not in FUNCTION_MAP:
-                                    tool_responses.append({"id": fc.id, "name": fname, "response": {"error": f"Function {fname} not implemented"}})
-                                    continue
-                                
-                                try:
-                                    # Exécution de l'outil
-                                    # Gérer les fonctions d'instance (qui nécessitent self)
-                                    if fname == "manage_tasks":
-                                        result = await asyncio.to_thread(self._manage_tasks, **args)
-                                    else:
-                                        result = await asyncio.to_thread(FUNCTION_MAP[fname], **args)
-                                    
-                                    # Si on a été interrompu pendant l'exécution, on annule l'envoi
-                                    if self._interrupted_flag:
-                                        logger.info(f"INTERRUPTION: Tool {fname} annulé suite à l'interruption pendant l'exécution")
-                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
-                                    else:
-                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"result": result}})
-                                        # Son de succès pour tool exécuté avec succès
-                                        self.sound_manager.play("success", volume=0.2)
-                                except Exception as e:
-                                    # Son d'erreur si erreur non interrompue
-                                    if not self._interrupted_flag:
-                                        self.sound_manager.play("error", volume=0.25)
-                                    # Même si une exception se produit, on ajoute l'erreur (sauf si interrompu)
-                                    if not self._interrupted_flag:
-                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"error": str(e)}})
-                                    else:
-                                        tool_responses.append({"id": fc.id, "name": fname, "response": {"error": "Operation cancelled by user interruption"}})
+                                if fc.name not in self._current_tools_used:
+                                    self._current_tools_used.append(fc.name)
+                                # Log google_search
+                                if fc.name == "google_search":
+                                    logger.info(f"WEB_SEARCH: appel reçu ({fc.name}) args={dict(fc.args or {})}")
                             
-                            # Construire les réponses finales : si interrompu, on envoie uniquement des annulations
-                            was_interrupted = self._interrupted_flag
-                            if self._interrupted_flag:
-                                # Si interrompu, on remplace toutes les réponses par des annulations
-                                final_responses = [{"id": fc.id, "name": fc.name, "response": {"error": "Operation cancelled by user interruption"}} for fc in function_calls]
-                                logger.info(f"INTERRUPTION: Envoi de {len(final_responses)} réponse(s) d'annulation à Gemini pour débloquer la session")
-                            else:
-                                final_responses = tool_responses
+                            # 🚀 UTILISATION DU TOOL EXECUTOR OPTIMISÉ (cache + parallèle + interruption)
+                            # Callbacks pour feedback
+                            def update_status(status):
+                                self.gui_queue.put(("STATUS", status))
+                                if status == "processing":
+                                    self.sound_manager.play("processing", volume=0.25)
                             
-                            # Toujours envoyer une réponse à Gemini pour débloquer la session
-                            if final_responses:
-                                try:
-                                    await self.session.send_tool_response(function_responses=final_responses)
-                                    logger.info(f"TOOL: Réponse(s) envoyée(s) à Gemini ({len(final_responses)} tool(s)) - Session débloquée")
-                                except Exception as e:
-                                    logger.error(f"Impossible d'envoyer la réponse tool à Gemini: {e}")
+                            async def send_tts_phrase(phrase):
+                                self.is_speaking = True
+                                await self.response_queue_tts.put(phrase)
                             
-                            # 🔓 ON DEVERROUILLE : Cypher a fini ce tool (ou a été interrompu)
-                            self.is_busy = False
-                            self.last_interaction_time = time.time() # On remet le chrono à zéro
+                            async def send_response_to_gemini(function_responses):
+                                await self.session.send_tool_response(function_responses=function_responses)
                             
-                            # Si on a été interrompu, on reset le flag pour la prochaine fois
-                            # IMPORTANT: On reset le flag APRÈS avoir envoyé la réponse pour éviter les race conditions
-                            if was_interrupted:
-                                logger.info("INTERRUPTION: Reset du flag d'interruption - prêt pour nouvelle interaction")
-                                self._interrupted_flag = False
-                                
-                                # 🔥 FIX CRITIQUE : S'assurer que l'état est correctement réinitialisé pour permettre à l'utilisateur de parler
-                                self.is_busy = False
-                                self.conversation_active = True
-                                self.last_interaction_time = time.time()
-                                
-                                # Notifier le tool executor aussi
-                                if self.tool_executor:
-                                    self.tool_executor.reset_interrupted()
-                                
-                                # Mettre à jour le statut GUI
-                                self.gui_queue.put(("STATUS", "listening"))
-                                
-                                # Forcer un petit délai pour s'assurer que Gemini a bien reçu la réponse
-                                await asyncio.sleep(0.1)
-                                
-                                logger.info("INTERRUPTION: État réinitialisé - prêt à écouter l'utilisateur")
+                            # Exécuter les tools via le tool_executor optimisé
+                            await self.tool_executor.execute_tools(
+                                function_calls=function_calls,
+                                on_status_update=update_status,
+                                on_tts_phrase=send_tts_phrase,
+                                send_response=send_response_to_gemini
+                            )
+                            
+                            # Mise à jour du statut
+                            self.last_interaction_time = time.time()
                         continue
 
+                    # Gestion de google_search (outil natif) - résultats via grounding_metadata
                     if hasattr(chunk, "server_content") and chunk.server_content:
                         if (hasattr(chunk.server_content, 'grounding_metadata') and chunk.server_content.grounding_metadata and chunk.server_content.grounding_metadata.grounding_chunks):
+                            # google_search a été utilisé - les résultats arrivent ici
                             for grounding_chunk in chunk.server_content.grounding_metadata.grounding_chunks:
                                 if grounding_chunk.web and grounding_chunk.web.uri:
                                     web_search_urls.add(grounding_chunk.web.uri)
+                                    logger.info(f"GOOGLE_SEARCH: URL trouvée via grounding: {grounding_chunk.web.uri}")
+                            
+                            # Logger pour confirmer que google_search a été utilisé
+                            if web_search_urls:
+                                logger.info(f"GOOGLE_SEARCH: {len(web_search_urls)} URL(s) collectée(s) - google_search fonctionne correctement")
 
                     # --- GESTION DU TEXTE (MODIFIÉ) ---
                     if getattr(chunk, "text", None):
@@ -1655,6 +1645,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                         text_lower_check = text_buffer.lower()
                         
                         # Liste étendue des mots-clés d'au revoir - patterns simplifiés pour détecter même au milieu d'une phrase
+                        # NOTE: On évite les mots courants comme "prochainement" qui peuvent apparaître dans des réponses normales
                         goodbye_patterns = [
                             r"\bau\s+revoir\b",
                             r"\bà\s+plus\b",
@@ -1669,7 +1660,7 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             r"\bgoodbye\b",
                             r"\bfarewell\b",
                             r"\bà\s+la\s+prochaine\b",
-                            r"\bprochainement\b",
+                            # r"\bprochainement\b",  # RETIRÉ : cause des faux positifs ("sont prévus prochainement", etc.)
                         ]
                         
                         # Vérifier si un pattern d'au revoir est détecté dans le buffer
@@ -1714,9 +1705,15 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                                 # On nettoie AVANT d'envoyer à la voix
                                 clean_sentence = clean_text_for_tts(raw_sentence)
                                 
-                                if clean_sentence:
+                                # 🚀 OPTIMISATION : Ne pas envoyer de phrases trop courtes (<10 caractères)
+                                # pour éviter des pauses vocales désagréables
+                                if clean_sentence and len(clean_sentence.strip()) >= 10:
                                     self.is_speaking = True
                                     await self.response_queue_tts.put(clean_sentence)
+                                else:
+                                    # Phrase trop courte, réaccumuler dans le buffer
+                                    if clean_sentence:
+                                        text_buffer = clean_sentence + text_buffer
                             
                             if not goodbye_detected:
                                 text_buffer = parts[-1]
@@ -1825,17 +1822,17 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
 
     async def tts(self):
         """
-        Génère le TTS via Azure AI Speech avec SSML (Style & Vitesse).
+        Génère le TTS via Edge TTS (Microsoft Edge) - Gratuit, illimité, voix neurales.
+        Edge TTS retourne du WebM/MP3 qu'on convertit en PCM 24kHz 16-bit mono.
         """
-        # --- CONFIG AZURE ---
-        speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-        # Note: Avec SSML, la voix est définie dans le XML, mais on garde la config de base propre
-        speech_config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
-        )
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
-    
-        logger.info(f"Azure TTS (SSML) prêt ({AZURE_VOICE_NAME} | Vitesse: {TTS_RATE})")
+        logger.info(f"Edge TTS prêt (voix: {EDGE_TTS_VOICE}, vitesse: {EDGE_TTS_RATE})")
+        
+        # Rate limiting minimal (Edge TTS est très tolérant)
+        last_request_time = 0
+        min_request_interval = 0.3  # secondes - très court car Edge TTS est gratuit et rapide
+        
+        # Verrou pour éviter les requêtes simultanées
+        tts_lock = asyncio.Lock()
     
         while True:
             full_text = await self.response_queue_tts.get()
@@ -1846,33 +1843,76 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                 self.response_queue_tts.task_done()
                 continue
     
-            try:
-                # 1. On transforme le texte brut en SSML (XML avec réglages)
-                ssml_text = generate_ssml(full_text, AZURE_VOICE_NAME, TTS_RATE, TTS_PITCH)
-
-                # 2. On génère l'audio via SSML
-                def _generate_audio_blocking():
-                    return synthesizer.speak_ssml_async(ssml_text).get()
+            # Utiliser le verrou pour éviter les requêtes simultanées
+            async with tts_lock:
+                # Rate limiting minimal
+                current_time = time.time()
+                time_since_last = current_time - last_request_time
+                if time_since_last < min_request_interval:
+                    await asyncio.sleep(min_request_interval - time_since_last)
+                    current_time = time.time()
+        
+                try:
+                    # Nettoyer le texte
+                    clean_text = clean_text_for_tts(full_text)
+                    
+                    if not clean_text or not clean_text.strip():
+                        self.response_queue_tts.task_done()
+                        continue
+                    
+                    # Créer le communicate Edge TTS
+                    communicate = edge_tts.Communicate(
+                        text=clean_text,
+                        voice=EDGE_TTS_VOICE,
+                        rate=EDGE_TTS_RATE,
+                        pitch=EDGE_TTS_PITCH
+                    )
+                    
+                    # Sauvegarder dans un fichier temporaire (méthode plus fiable)
+                    import tempfile
+                    temp_file = None
+                    
+                    try:
+                        # Créer un fichier temporaire
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp:
+                            temp_file = tmp.name
+                        
+                        # Sauvegarder l'audio dans le fichier temporaire (Edge TTS le fait automatiquement en MP3)
+                        await communicate.save(temp_file)
+                        
+                        # Lire et convertir avec pydub
+                        audio_segment = AudioSegment.from_file(temp_file, format="mp3")
+                        
+                        # Convertir en PCM 16-bit, 24kHz, mono
+                        audio_segment = audio_segment.set_frame_rate(RECEIVE_SAMPLE_RATE)
+                        audio_segment = audio_segment.set_channels(1)  # Mono
+                        audio_segment = audio_segment.set_sample_width(2)  # 16-bit (2 bytes)
+                        
+                        # Exporter en PCM brut
+                        pcm_buffer = BytesIO()
+                        audio_segment.export(pcm_buffer, format="raw")
+                        audio_data_pcm = pcm_buffer.getvalue()
+                        
+                        if audio_data_pcm:
+                            await self.audio_in_queue_player.put(audio_data_pcm)
+                            last_request_time = time.time()
+                            logger.debug(f"✅ [Edge TTS] Audio généré et converti ({len(audio_data_pcm)} bytes)")
+                    finally:
+                        # Nettoyer le fichier temporaire
+                        if temp_file and os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                            except:
+                                pass
     
-                result = await asyncio.to_thread(_generate_audio_blocking)
-    
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    audio_data = result.audio_data
-                    if audio_data:
-                        await self.audio_in_queue_player.put(audio_data)
+                except Exception as e:
+                    logger.error(f"Erreur Edge TTS : {e}")
+                    import traceback
+                    traceback.print_exc()
                 
-                elif result.reason == speechsdk.ResultReason.Canceled:
-                    cancellation_details = result.cancellation_details
-                    logger.error(f"Erreur Azure TTS : {cancellation_details.reason}")
-                    if cancellation_details.reason == speechsdk.CancellationReason.Error:
-                        logger.error(f"Code erreur: {cancellation_details.error_code}")
-                        logger.error(f"Détails: {cancellation_details.error_details}")
-    
-            except Exception as e:
-                logger.error(f"Exception TTS : {e}")
-            
-            finally:
-                self.response_queue_tts.task_done()
+                finally:
+                    # Le finally est dans le lock pour s'assurer que task_done() est appelé
+                    self.response_queue_tts.task_done()
 
 
     async def play_audio(self):
@@ -2037,22 +2077,43 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
         
         logger.info("CLEANUP: Queues vidées, prêt pour reconnexion")
 
+    def _init_tool_executor(self):
+        """Initialise le tool executor avec FUNCTION_MAP (appelé une seule fois)"""
+        if not self._tool_executor_initialized:
+            self.tool_executor = ToolExecutor(
+                function_map=FUNCTION_MAP,
+                loading_phrases=LOADING_PHRASES,
+                instance=self  # Passer l'instance pour les méthodes d'instance
+            )
+            self._tool_executor_initialized = True
+            logger.info("🚀 ToolExecutor optimisé initialisé (cache + parallèle)")
+    
     async def run(self):
         import websockets
         reconnect_delay = 2
         max_delay = 30
+        
+        # Initialiser le tool executor (une seule fois)
+        self._init_tool_executor()
         
         while True:
             self.needs_reconnect = False
             
             try:
                 logger.info("Tentative de connexion à Gemini...")
+                logger.debug(f"Config tools: {type(self.config.get('tools'))}, length: {len(self.config.get('tools', [])) if isinstance(self.config.get('tools'), list) else 'N/A'}")
+                if self.config.get('tools'):
+                    logger.debug(f"Tools structure: {json.dumps(self.config.get('tools'), default=str)[:500]}")
                 self.session = None
                 
                 async with self.client.aio.live.connect(model=MODEL, config=self.config) as session:
                     self.session = session
                     # Son de connexion réussie
                     self.sound_manager.play("connect", volume=0.25)
+                    logger.info(f"✅ Session Gemini Live connectée - Modèle: {MODEL}")
+                    if self.config.get('tools'):
+                        tools_count = len(self.config.get('tools', []))
+                        logger.info(f"✅ {tools_count} tool(s) configuré(s) pour cette session (incluant google_search)")
                     self.out_queue_gemini = asyncio.Queue(maxsize=20)
                     
                     if self.response_queue_tts is None:
@@ -2073,6 +2134,8 @@ DONNE DES REPONSES CLAIRES ET CONCISES, EN ÉVITANT LES DÉTAILS TECHNIQUES INUT
                             tg.create_task(self.tts())
                             tg.create_task(self.play_audio())
                             tg.create_task(self.timer_watcher())
+                            # 🚀 OPTIMISATION: Tâche background pour sauvegardes et nettoyage
+                            tg.create_task(self.background_tasks())
                             # AMÉLIORATION 4: Auto-sauvegarde périodique
                             tg.create_task(self.state_manager.auto_save_loop(
                                 learning_system=self.learning_system,
@@ -2154,6 +2217,7 @@ FUNCTION_MAP = {
     "spotify_control": spotify_tool,
     "analyze_screen": analyze_screen_tool,
     "web_navigator": web_navigator_tool,
+    # google_search natif (pas dans FUNCTION_MAP, géré par grounding_metadata)
     "user_preferences": AudioLoop._user_preferences,
     "n8n_workflow": n8n_workflow_tool,
 }

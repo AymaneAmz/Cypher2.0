@@ -8,6 +8,7 @@ from modules.analyze_screen import SCREEN_ANALYZER_TOOL_DECLARATION
 from modules.web_navigator import WEB_NAVIGATOR_TOOL_DECLARATION
 from modules.expert_coder import EXPERT_CODER_TOOL_DECLARATION
 from modules.n8n_integration import N8N_WORKFLOW_TOOL_DECLARATION
+# WEB_SEARCH_TOOL_DECLARATION retiré - on utilise uniquement google_search natif
 
 
 def get_all_tool_declarations():
@@ -15,7 +16,7 @@ def get_all_tool_declarations():
     Retourne la liste complète de toutes les déclarations de tools pour Gemini.
     
     Returns:
-        list: Liste contenant un dictionnaire avec function_declarations et google_search_tool
+        list: Liste contenant les dictionnaires de tools (function_declarations)
     """
     
     # Déclarations de tools locales (définies dans main.py)
@@ -166,14 +167,18 @@ def get_all_tool_declarations():
             "Ouvre un site web dans le navigateur par défaut. "
             "Tu DOIS appeler ce tool pour des phrases comme "
             "« ouvre YouTube », « va sur TryHackMe », « ouvre Outlook », "
-            "« ouvre le site de l'ESIGELEC », etc."
+            "« ouvre le site de l'ESIGELEC », etc. "
+            "⚠️ IMPORTANT : Si on te demande d'ouvrir une page de recherche Google "
+            "(par exemple « ouvre moi sur google une recherche sur X »), "
+            "tu DOIS utiliser cet outil avec le texte de recherche en paramètre. "
+            "L'outil gère automatiquement la création de l'URL de recherche Google."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "url_or_name": {
                     "type": "string",
-                    "description": "Nom du site ou URL. Ex: 'youtube', 'tryhackme', 'outlook'."
+                    "description": "Nom du site, URL complète, ou texte de recherche Google. Ex: 'youtube', 'tryhackme', 'outlook', 'https://www.google.com', 'comics spiderman' (pour une recherche Google)."
                 }
             },
             "required": ["url_or_name"],
@@ -583,11 +588,16 @@ def get_all_tool_declarations():
         },
     }
 
-    google_search_tool = {"google_search": {}}
-
-    # Liste complète de tous les tools
-    tools = [
-        {"function_declarations": [
+    # ========================================
+    # 🔥 FIX CRITIQUE : STRUCTURE CORRECTE DES TOOLS
+    # ========================================
+    
+    # IMPORTANT : On combine function_declarations + google_search natif
+    # (malgré la doc, ça fonctionnait dans les anciens logs avec 2 tools)
+    
+    # Liste complète de tous les tools custom (function_declarations)
+    function_declarations_dict = {
+        "function_declarations": [
             open_app,
             file_manager,
             execute_python,
@@ -615,8 +625,16 @@ def get_all_tool_declarations():
             user_preferences_tool,
             manage_tasks_tool,
             N8N_WORKFLOW_TOOL_DECLARATION,
-        ]},
-        google_search_tool
+        ]
+    }
+    
+    # 🔥 GOOGLE_SEARCH NATIF UNIQUEMENT (outil natif Gemini via grounding_metadata)
+    google_search_dict = {"google_search": {}}
+    
+    # 🔥 STRUCTURE FINALE : function_declarations + google_search natif UNIQUEMENT
+    tools = [
+        function_declarations_dict,  # Dict avec clé "function_declarations" (SANS web_search custom)
+        google_search_dict,  # Google Search natif (résultats via grounding_metadata)
     ]
     
     return tools

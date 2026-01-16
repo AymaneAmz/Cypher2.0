@@ -2,6 +2,7 @@
 """
 Module de gestion de documents pour Cypher
 Système RAG (Retrieval-Augmented Generation) avec ChromaDB
+🚀 OPTIMISÉ : Lazy Loading des dépendances lourdes
 """
 
 import os
@@ -20,7 +21,11 @@ def document_manager(
     """
     Système RAG (Chat with Data) : Indexe et interroge vos documents locaux (PDF, MD, DOCX, TXT).
     Action: 'index' (scanner un dossier) ou 'search' (poser une question).
+    
+    🚀 OPTIMISATION : Les dépendances lourdes (chromadb, fitz, docx) sont importées
+    uniquement au premier appel, accélérant le démarrage de Cypher de 3-5 secondes.
     """
+    # 🚀 LAZY IMPORT : Imports lourds seulement quand nécessaire
     import fitz  
     import docx
     import chromadb

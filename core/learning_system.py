@@ -62,12 +62,12 @@ class LearningSystem:
             return self._load_preferences()  # Retourne les valeurs par défaut
     
     def _save_preferences(self):
-        """Sauvegarde les préférences"""
+        """Sauvegarde les préférences (appelé périodiquement ou à la fermeture)"""
         try:
             self.preferences["last_updated"] = datetime.now().isoformat()
             with open(self.preferences_file, 'w', encoding='utf-8') as f:
                 json.dump(self.preferences, f, ensure_ascii=False, indent=2)
-            logger.debug("Préférences sauvegardées")
+            logger.debug("✅ Préférences sauvegardées sur disque")
         except Exception as e:
             logger.error(f"Erreur lors de la sauvegarde des préférences: {e}")
     
@@ -85,7 +85,7 @@ class LearningSystem:
             return []
     
     def _save_interactions(self):
-        """Sauvegarde l'historique des interactions"""
+        """Sauvegarde l'historique des interactions (appelé périodiquement)"""
         try:
             # Limiter à 1000 dernières interactions
             if len(self.interactions) > 1000:
@@ -97,7 +97,7 @@ class LearningSystem:
             }
             with open(self.interactions_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.debug(f"Interactions sauvegardées ({len(self.interactions)} entrées)")
+            logger.debug(f"✅ Interactions sauvegardées sur disque ({len(self.interactions)} entrées)")
         except Exception as e:
             logger.error(f"Erreur lors de la sauvegarde des interactions: {e}")
     
@@ -116,10 +116,11 @@ class LearningSystem:
         self.interactions.append(interaction)
         self._analyze_interaction(interaction)
         
-        # Sauvegarder périodiquement (toutes les 10 interactions)
+        # 🚀 OPTIMISATION : Ne plus sauvegarder automatiquement
+        # La sauvegarde se fera via la tâche background périodique
+        # Mise à jour des préférences en RAM uniquement
         if len(self.interactions) % 10 == 0:
-            self._save_interactions()
-            self._update_preferences()
+            self._update_preferences()  # Mise à jour RAM seulement
     
     def _analyze_interaction(self, interaction: Dict[str, Any]):
         """Analyse une interaction pour extraire des patterns"""

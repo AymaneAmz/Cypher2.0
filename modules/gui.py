@@ -20,19 +20,35 @@ from io import BytesIO
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# Couleurs JARVIS améliorées avec gradients
-JARVIS_BG = "#0a1628"
-JARVIS_PANEL_BG = "#0d1f35"
-JARVIS_CYAN = "#00d4ff"
-JARVIS_CYAN_DIM = "#0a3d4d"
-JARVIS_TEXT = "#ffffff"
-JARVIS_TEXT_DIM = "#6b8fa3"
-JARVIS_BORDER = "#1a4a5c"
-JARVIS_GREEN = "#00ff88"
-JARVIS_ORANGE = "#ff6b35"
-JARVIS_RED = "#ff3333"
-JARVIS_PURPLE = "#a855f7"
-JARVIS_YELLOW = "#fbbf24"
+# Couleurs CYPHER - Fond noir + Bleu doux
+CYPHER_BG = "#000000"  # Fond noir pur
+CYPHER_PANEL_BG = "#0a0a0a"  # Panneaux légèrement plus clairs
+CYPHER_NEON_BLUE = "#00bfff"  # Bleu cyan doux (Sky Blue)
+CYPHER_NEON_BLUE_BRIGHT = "#40d9ff"  # Bleu cyan plus clair mais doux
+CYPHER_NEON_BLUE_DIM = "#0080cc"  # Bleu atténué
+CYPHER_NEON_BLUE_DARK = "#002244"  # Bleu foncé pour backgrounds
+CYPHER_TEXT = "#ffffff"  # Texte blanc
+CYPHER_TEXT_DIM = "#888888"  # Texte gris
+CYPHER_BORDER = "#1a1a1a"  # Bordures subtiles
+CYPHER_GREEN = "#00ff88"  # Vert néon
+CYPHER_ORANGE = "#ff6b35"  # Orange
+CYPHER_RED = "#ff3333"  # Rouge
+CYPHER_PURPLE = "#a855f7"  # Violet
+CYPHER_YELLOW = "#ffff00"  # Jaune néon
+
+# Alias pour compatibilité
+JARVIS_BG = CYPHER_BG
+JARVIS_PANEL_BG = CYPHER_PANEL_BG
+JARVIS_CYAN = CYPHER_NEON_BLUE
+JARVIS_CYAN_DIM = CYPHER_NEON_BLUE_DARK
+JARVIS_TEXT = CYPHER_TEXT
+JARVIS_TEXT_DIM = CYPHER_TEXT_DIM
+JARVIS_BORDER = CYPHER_BORDER
+JARVIS_GREEN = CYPHER_GREEN
+JARVIS_ORANGE = CYPHER_ORANGE
+JARVIS_RED = CYPHER_RED
+JARVIS_PURPLE = CYPHER_PURPLE
+JARVIS_YELLOW = CYPHER_YELLOW
 
 class CypherGUI(ctk.CTk):
     def __init__(self, data_queue):
@@ -48,11 +64,20 @@ class CypherGUI(ctk.CTk):
         self.is_speaking = False
         self.is_processing = False
         self.is_reconnecting = False
+        self.is_sleeping = True  # Au démarrage, Cypher est en veille
         self.animation_angle = 0
         self.wave_offset = 0
         self.current_radius = 150
         self.target_radius = 150
-        self.particle_system = []  # Pour les effets de particules
+        
+        # Transitions d'état (interpolation)
+        self.current_status_color = CYPHER_NEON_BLUE
+        self.target_status_color = CYPHER_NEON_BLUE
+        self.current_status_text = "Online"
+        self.target_status_text = "Online"
+        
+        # Animation de transition pour les onglets
+        self.tab_transition_active = False
         
         # Données
         self.message_widgets = []
@@ -60,6 +85,11 @@ class CypherGUI(ctk.CTk):
         self.commands_count = 0
         self.session_start = datetime.now()
         self._weather_images = {}
+        
+        # Système de notifications
+        self.notifications = deque(maxlen=10)  # Historique des notifications
+        self.notification_widgets = []  # Widgets de notifications actives
+        self.notification_container = None  # Container pour les notifications toast
         
         # Agent Vision (Web Navigator)
         self.agent_vision_window = None
@@ -73,6 +103,24 @@ class CypherGUI(ctk.CTk):
         self.tasks_dashboard_window = None
         self.tasks_scrollable_frame = None
         self.tasks_widgets = {}  # Dictionnaire pour stocker les widgets de tâches
+        
+        # Dashboard Analytics
+        self.analytics_window = None
+        self.analytics_tabs = None
+        
+        # Workspace multi-panneaux
+        self.workspace_mode = False
+        self.workspace_tabs = None
+        self.left_tabview = None  # Onglets pour le panneau gauche
+        
+        # Mode immersif
+        self.immersive_mode = False
+        self.original_geometry = None
+        
+        # Visualisations de données
+        self.visualizations_window = None
+        self.timeline_canvas = None
+        self.mindmap_canvas = None
         
         # Statistiques pour graphiques
         self.cpu_history = deque(maxlen=50)
@@ -122,6 +170,12 @@ class CypherGUI(ctk.CTk):
                         self.set_interrupted()
                     elif content == "reconnecting":
                         self.set_reconnecting(True)
+                    elif content == "sleeping":
+                        self.is_sleeping = True
+                        self._update_sleep_button()
+                    elif content == "awake":
+                        self.is_sleeping = False
+                        self._update_sleep_button()
                 elif msg_type == "ASSISTANT_TEXT":
                     self.add_assistant_message(content)
                 elif msg_type == "USER_TEXT":
@@ -150,6 +204,10 @@ class CypherGUI(ctk.CTk):
         self.grid_rowconfigure(0, weight=0)
         self.grid_rowconfigure(1, weight=1)
         
+        # Container pour notifications toast (overlay en haut à droite)
+        self.notification_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.notification_container.place(relx=1.0, rely=0.0, anchor="ne", x=-20, y=80)
+        
         self._build_header()
         self._build_left_panel()
         self._build_center_panel()
@@ -166,7 +224,7 @@ class CypherGUI(ctk.CTk):
         
         title_label = ctk.CTkLabel(left_frame, text="C.Y.P.H.E.R", 
                                    font=("Consolas", 32, "bold"), 
-                                   text_color=JARVIS_CYAN)
+                                   text_color=CYPHER_NEON_BLUE)
         title_label.pack(side="left", padx=(0, 15))
         
         status_frame = ctk.CTkFrame(left_frame, fg_color=JARVIS_CYAN_DIM, corner_radius=15,
@@ -174,12 +232,12 @@ class CypherGUI(ctk.CTk):
         status_frame.pack(side="left")
         
         self.status_dot = ctk.CTkLabel(status_frame, text="●", font=("Arial", 12), 
-                                      text_color=JARVIS_GREEN)
+                                      text_color=CYPHER_NEON_BLUE)
         self.status_dot.pack(side="left", padx=(12, 6), pady=6)
         
         self.status_header_text = ctk.CTkLabel(status_frame, text="Online", 
                                               font=("Arial", 13, "bold"), 
-                                              text_color=JARVIS_GREEN)
+                                              text_color=CYPHER_NEON_BLUE)
         self.status_header_text.pack(side="left", padx=(0, 12), pady=6)
         
         # Centre - Horloge + Date améliorée
@@ -235,25 +293,228 @@ class CypherGUI(ctk.CTk):
                                            text_color=JARVIS_CYAN)
         self.header_location.pack(side="left", padx=(0, 15))
         
-        ctk.CTkLabel(right_frame, text="⚙", font=("Arial", 20), 
-                    text_color=JARVIS_TEXT_DIM).pack(side="left")
+        # Les boutons sont maintenant dans la zone centrale, on retire cette section
 
     def _build_left_panel(self):
         left_container = ctk.CTkFrame(self, fg_color="transparent")
         left_container.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=10)
-        left_container.grid_rowconfigure(4, weight=1)
+        left_container.grid_rowconfigure(0, weight=1)
+        left_container.grid_columnconfigure(0, weight=1)
         
-        # System Stats amélioré
-        self._build_system_stats(left_container)
+        # Système d'onglets pour le panneau gauche (Workspace)
+        self.left_tabview = ctk.CTkTabview(left_container, 
+                                          fg_color=CYPHER_PANEL_BG,
+                                          border_width=1,
+                                          border_color=CYPHER_BORDER,
+                                          corner_radius=15)
+        self.left_tabview.pack(fill="both", expand=True)
+        
+        # Onglet 1: Dashboard (vue par défaut)
+        dashboard_tab = self.left_tabview.add("📊 Dashboard")
+        self._build_dashboard_tab(dashboard_tab)
+        
+        # Onglet 2: Système
+        system_tab = self.left_tabview.add("⚙ Système")
+        self._build_system_tab(system_tab)
+        
+        # Onglet 3: Terminal (nouveau)
+        terminal_tab = self.left_tabview.add("💻 Terminal")
+        self._build_terminal_tab(terminal_tab)
+
+    def _build_dashboard_tab(self, parent):
+        """Onglet Dashboard avec toutes les infos principales"""
+        # Scrollable pour contenir tous les widgets
+        scroll_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll_frame.pack(fill="both", expand=True, padx=5, pady=5)
         
         # Weather Widget
-        self._build_weather_widget(left_container)
-        
-        # Stats Dashboard avec graphiques
-        self._build_stats_dashboard(left_container)
+        self._build_weather_widget(scroll_frame)
         
         # Camera Widget
-        self._build_camera_widget(left_container)
+        self._build_camera_widget(scroll_frame)
+    
+    def _build_system_tab(self, parent):
+        """Onglet Système avec détails avancés"""
+        # Scrollable frame pour le contenu
+        scroll_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # System Stats détaillés
+        self._build_system_stats(scroll_frame)
+        
+        # Performance détaillée
+        self._build_stats_dashboard(scroll_frame)
+        
+        # Informations système supplémentaires
+        info_frame = ctk.CTkFrame(scroll_frame, fg_color=CYPHER_PANEL_BG, 
+                                 corner_radius=20, border_width=1, 
+                                 border_color=CYPHER_BORDER)
+        info_frame.pack(fill="x", pady=(0, 15))
+        
+        header = ctk.CTkFrame(info_frame, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(15, 10))
+        
+        ctk.CTkLabel(header, text="ℹ", font=("Arial", 28), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(header, text="Informations Système", font=("Arial", 22, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left")
+        
+        content = ctk.CTkFrame(info_frame, fg_color="transparent")
+        content.pack(fill="x", padx=18, pady=(0, 15))
+        
+        # Infos système
+        try:
+            import platform
+            sys_info = [
+                ("OS", platform.system() + " " + platform.release()),
+                ("Processeur", platform.processor()[:50] if platform.processor() else "N/A"),
+                ("Python", platform.python_version()),
+            ]
+            
+            for label, value in sys_info:
+                row = ctk.CTkFrame(content, fg_color="transparent")
+                row.pack(fill="x", pady=5)
+                
+                ctk.CTkLabel(row, text=f"{label}:", font=("Arial", 14, "bold"), 
+                            text_color=CYPHER_TEXT_DIM).pack(side="left")
+                ctk.CTkLabel(row, text=value, font=("Consolas", 12), 
+                            text_color=CYPHER_TEXT).pack(side="left", padx=(10, 0))
+        except:
+            pass
+    
+    def _build_terminal_tab(self, parent):
+        """Onglet Terminal interactif"""
+        # Header
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(10, 5))
+        
+        ctk.CTkLabel(header, text="💻", font=("Arial", 28), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(header, text="Terminal", font=("Arial", 22, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left")
+        
+        # Zone de terminal
+        terminal_frame = ctk.CTkFrame(parent, fg_color=CYPHER_BG, 
+                                     corner_radius=12, border_width=1, 
+                                     border_color=CYPHER_BORDER)
+        terminal_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        # Scrollbar pour le terminal
+        scrollbar = ctk.CTkScrollbar(terminal_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Text widget pour le terminal (style console)
+        self.terminal_text = tk.Text(
+            terminal_frame,
+            bg=CYPHER_BG,
+            fg=CYPHER_NEON_BLUE,
+            font=("Consolas", 11),
+            wrap="word",
+            yscrollcommand=scrollbar.set,
+            borderwidth=0,
+            highlightthickness=0,
+            insertbackground=CYPHER_NEON_BLUE
+        )
+        self.terminal_text.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        scrollbar.configure(command=self.terminal_text.yview)
+        
+        # Input pour commandes
+        input_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        input_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        self.terminal_entry = ctk.CTkEntry(input_frame, 
+                                          placeholder_text="Entrez une commande...",
+                                          fg_color=CYPHER_NEON_BLUE_DARK, 
+                                          border_width=0,
+                                          text_color=CYPHER_TEXT, 
+                                          height=35, 
+                                          corner_radius=15, 
+                                          font=("Consolas", 12))
+        self.terminal_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.terminal_entry.bind("<Return>", lambda e: self._execute_terminal_command())
+        
+        exec_btn = ctk.CTkButton(input_frame, text="▶", width=50, height=35,
+                                fg_color=CYPHER_NEON_BLUE, 
+                                hover_color=CYPHER_NEON_BLUE_BRIGHT,
+                                text_color=CYPHER_BG, 
+                                font=("Arial", 16, "bold"),
+                                corner_radius=15, 
+                                command=self._execute_terminal_command)
+        exec_btn.pack(side="left")
+        
+        # Message initial
+        self._add_terminal_output("Cypher Terminal v1.0", "info")
+        self._add_terminal_output("Tapez 'help' pour voir les commandes disponibles", "info")
+        self._add_terminal_output("", "info")
+    
+    def _add_terminal_output(self, text: str, output_type: str = "info"):
+        """Ajoute du texte au terminal avec couleur"""
+        if not hasattr(self, 'terminal_text'):
+            return
+        
+        colors = {
+            "info": CYPHER_NEON_BLUE,
+            "success": CYPHER_GREEN,
+            "error": CYPHER_RED,
+            "warning": CYPHER_ORANGE
+        }
+        color = colors.get(output_type, CYPHER_NEON_BLUE)
+        
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prompt = f"[{timestamp}] " if output_type != "prompt" else ""
+        
+        self.terminal_text.insert("end", f"{prompt}{text}\n")
+        
+        # Colorer la ligne
+        start_line = self.terminal_text.index("end-2l")
+        end_line = self.terminal_text.index("end-1l")
+        tag_name = f"term_{len(self.terminal_text.get('1.0', 'end').split('\n'))}"
+        self.terminal_text.tag_add(tag_name, start_line, end_line)
+        self.terminal_text.tag_config(tag_name, foreground=color)
+        
+        # Scroll automatique
+        self.terminal_text.see("end")
+    
+    def _execute_terminal_command(self):
+        """Exécute une commande dans le terminal"""
+        if not hasattr(self, 'terminal_entry'):
+            return
+        
+        command = self.terminal_entry.get().strip()
+        if not command:
+            return
+        
+        # Afficher la commande
+        self._add_terminal_output(f"> {command}", "prompt")
+        self.terminal_entry.delete(0, "end")
+        
+        # Commandes internes
+        if command.lower() == "help":
+            self._add_terminal_output("Commandes disponibles:", "info")
+            self._add_terminal_output("  help - Affiche cette aide", "info")
+            self._add_terminal_output("  clear - Efface le terminal", "info")
+            self._add_terminal_output("  stats - Affiche les stats système", "info")
+            self._add_terminal_output("  tasks - Ouvre le Task Master", "info")
+            self._add_terminal_output("  analytics - Ouvre le Dashboard Analytics", "info")
+        elif command.lower() == "clear":
+            self.terminal_text.delete("1.0", "end")
+            self._add_terminal_output("Terminal effacé", "success")
+        elif command.lower() == "stats":
+            try:
+                cpu = psutil.cpu_percent()
+                ram = psutil.virtual_memory()
+                self._add_terminal_output(f"CPU: {cpu:.1f}%", "info")
+                self._add_terminal_output(f"RAM: {ram.percent:.1f}% ({ram.used / (1024**3):.1f} GB / {ram.total / (1024**3):.1f} GB)", "info")
+            except Exception as e:
+                self._add_terminal_output(f"Erreur: {e}", "error")
+        elif command.lower() == "tasks":
+            self._show_tasks_dashboard()
+            self._add_terminal_output("Task Master ouvert", "success")
+        elif command.lower() == "analytics":
+            self._show_analytics_dashboard()
+            self._add_terminal_output("Dashboard Analytics ouvert", "success")
+        else:
+            self._add_terminal_output(f"Commande inconnue: '{command}'. Tapez 'help' pour l'aide.", "error")
 
     def _build_system_stats(self, parent):
         frame = ctk.CTkFrame(parent, fg_color=JARVIS_PANEL_BG, corner_radius=20, 
@@ -518,7 +779,7 @@ class CypherGUI(ctk.CTk):
         orb_frame = ctk.CTkFrame(center, fg_color="transparent")
         orb_frame.grid(row=0, column=0, sticky="nsew")
         
-        self.orb_canvas = Canvas(orb_frame, width=500, height=500, bg=JARVIS_BG, 
+        self.orb_canvas = Canvas(orb_frame, width=500, height=500, bg=CYPHER_BG, 
                                  highlightthickness=0)
         self.orb_canvas.pack(expand=True)
         
@@ -528,19 +789,19 @@ class CypherGUI(ctk.CTk):
         
         self.jarvis_title = ctk.CTkLabel(title_frame, text="C.Y.P.H.E.R", 
                                          font=("Consolas", 56, "bold"), 
-                                         text_color=JARVIS_CYAN)
+                                         text_color=CYPHER_NEON_BLUE)
         self.jarvis_title.pack()
         
-        status_container = ctk.CTkFrame(title_frame, fg_color=JARVIS_CYAN_DIM, 
-                                       corner_radius=18, border_width=1, 
-                                       border_color=JARVIS_CYAN)
+        status_container = ctk.CTkFrame(title_frame, fg_color=CYPHER_NEON_BLUE_DARK, 
+                                       corner_radius=18, border_width=2, 
+                                       border_color=CYPHER_NEON_BLUE)
         status_container.pack(pady=(60, 0))
         
         status_inner = ctk.CTkFrame(status_container, fg_color="transparent")
         status_inner.pack(padx=20, pady=10)
         
         self.listening_dot = ctk.CTkLabel(status_inner, text="●", font=("Arial", 12), 
-                                         text_color=JARVIS_GREEN)
+                                         text_color=CYPHER_NEON_BLUE)
         self.listening_dot.pack(side="left", padx=(0, 10))
         
         self.status_text = ctk.CTkLabel(status_inner, text="Listening for wake word...", 
@@ -548,32 +809,85 @@ class CypherGUI(ctk.CTk):
                                        text_color=JARVIS_CYAN)
         self.status_text.pack(side="left")
         
-        # Contrôles interactifs
-        controls_frame = ctk.CTkFrame(title_frame, fg_color="transparent")
-        controls_frame.pack(pady=(20, 0))
+        # Contrôles interactifs - BOUTONS EN BAS DU PANNEAU CENTRAL
+        # Créer un frame pour les boutons en bas avec 50px de marge
+        controls_frame = ctk.CTkFrame(center, fg_color="transparent")
+        controls_frame.grid(row=1, column=0, sticky="s", pady=(0, 50))
         
-        # Boutons de contrôle
+        # Boutons de contrôle - UNE SEULE LIGNE CENTRÉE
         btn_frame = ctk.CTkFrame(controls_frame, fg_color="transparent")
         btn_frame.pack()
         
-        # Styles de boutons
-        btn_style = {
+        # Style de base pour tous les boutons (fond transparent, bordure)
+        base_btn_style = {
             "width": 50,
             "height": 50,
             "corner_radius": 25,
-            "font": ("Arial", 18),
-            "hover_color": JARVIS_GREEN
+            "font": ("Arial", 20),
+            "fg_color": "transparent",  # Fond transparent
+            "hover_color": JARVIS_BORDER,  # Hover légèrement visible
+            "border_width": 2,  # Contour visible
         }
         
-        # Bouton Pause (placeholder - à connecter)
-        pause_btn = ctk.CTkButton(btn_frame, text="⏸", fg_color=JARVIS_CYAN_DIM, 
-                                  text_color=JARVIS_CYAN, **btn_style)
-        pause_btn.pack(side="left", padx=5)
+        # Bouton Sleep/Wake - VERT (bascule entre veille et réveil)
+        sleep_wake_style = base_btn_style.copy()
+        sleep_wake_style["text_color"] = JARVIS_GREEN
+        sleep_wake_style["border_color"] = JARVIS_GREEN
+        self.sleep_wake_btn = ctk.CTkButton(
+            btn_frame, 
+            text="⏻",  # Icône power pour réveiller (Cypher est en veille au démarrage)
+            command=self._toggle_sleep_wake,
+            **sleep_wake_style
+        )
+        self.sleep_wake_btn.pack(side="left", padx=10)
         
-        # Bouton Stop (placeholder - à connecter)
-        stop_btn = ctk.CTkButton(btn_frame, text="⏹", fg_color=JARVIS_CYAN_DIM, 
-                                text_color=JARVIS_RED, **btn_style)
-        stop_btn.pack(side="left", padx=5)
+        # Bouton Analytics - BLEU CYAN
+        analytics_style = base_btn_style.copy()
+        analytics_style["text_color"] = JARVIS_CYAN
+        analytics_style["border_color"] = JARVIS_CYAN
+        analytics_btn = ctk.CTkButton(
+            btn_frame, 
+            text="📈", 
+            command=self._show_analytics_dashboard,
+            **analytics_style
+        )
+        analytics_btn.pack(side="left", padx=10)
+        
+        # Bouton Task Master - VIOLET
+        tasks_style = base_btn_style.copy()
+        tasks_style["text_color"] = JARVIS_PURPLE
+        tasks_style["border_color"] = JARVIS_PURPLE
+        tasks_btn = ctk.CTkButton(
+            btn_frame, 
+            text="✓", 
+            command=self._show_tasks_dashboard,
+            **tasks_style
+        )
+        tasks_btn.pack(side="left", padx=10)
+        
+        # Bouton Visualisations - ORANGE
+        viz_style = base_btn_style.copy()
+        viz_style["text_color"] = JARVIS_ORANGE
+        viz_style["border_color"] = JARVIS_ORANGE
+        viz_btn = ctk.CTkButton(
+            btn_frame, 
+            text="📊", 
+            command=self._show_visualizations,
+            **viz_style
+        )
+        viz_btn.pack(side="left", padx=10)
+        
+        # Bouton Mode Immersif - JAUNE
+        immersive_style = base_btn_style.copy()
+        immersive_style["text_color"] = JARVIS_YELLOW
+        immersive_style["border_color"] = JARVIS_YELLOW
+        immersive_btn = ctk.CTkButton(
+            btn_frame, 
+            text="⛶", 
+            command=self._toggle_immersive_mode,
+            **immersive_style
+        )
+        immersive_btn.pack(side="left", padx=10)
 
     def _build_right_panel(self):
         right_container = ctk.CTkFrame(self, fg_color="transparent")
@@ -623,12 +937,7 @@ class CypherGUI(ctk.CTk):
                                    corner_radius=8, command=self._export_conversation)
         export_btn.pack(side="left", padx=(0, 5))
         
-        # Bouton Task Master
-        tasks_btn = ctk.CTkButton(btns_frame, text="✓", width=35, height=35,
-                                  fg_color=JARVIS_CYAN_DIM, hover_color=JARVIS_BORDER,
-                                  text_color=JARVIS_PURPLE, font=("Arial", 16, "bold"),
-                                  corner_radius=8, command=self._show_tasks_dashboard)
-        tasks_btn.pack(side="left")
+        # Le bouton Task Master est maintenant dans le header, on le retire d'ici
         
         # Barre de recherche (cachée par défaut)
         self.search_frame = ctk.CTkFrame(conv_frame, fg_color="transparent")
@@ -743,35 +1052,40 @@ class CypherGUI(ctk.CTk):
         # Lissage du niveau audio pour animation fluide
         self.audio_level_smooth = self.audio_level_smooth * 0.7 + self.audio_level * 0.3
         
-        # Déterminer l'état et les couleurs (simplifié)
+        # Déterminer l'état et les couleurs (BLEU NÉON)
         if self.is_interrupted:
-            ring_color = JARVIS_RED
+            ring_color = CYPHER_RED
             inner_color = "#ff6666"
+            glow_color = "#ff0000"
             pulse_base = math.sin(self.animation_angle * 2) * 8
             self.animation_angle += 0.25
             audio_modifier = 0
         elif self.is_processing:
-            ring_color = JARVIS_ORANGE
+            ring_color = CYPHER_ORANGE
             inner_color = "#ffb833"
+            glow_color = "#ff8800"
             pulse_base = math.sin(self.animation_angle * 1.5) * 12
             self.animation_angle += 0.2
             audio_modifier = self.audio_level_smooth * 8
         elif self.is_speaking:
-            ring_color = JARVIS_ORANGE
-            inner_color = "#ff8c5a"
+            ring_color = CYPHER_NEON_BLUE
+            inner_color = CYPHER_NEON_BLUE_BRIGHT
+            glow_color = CYPHER_NEON_BLUE
             pulse_base = math.sin(self.animation_angle * 1.0) * 15
             self.animation_angle += 0.15
             audio_modifier = self.audio_level_smooth * 10
         elif self.is_listening:
-            ring_color = JARVIS_CYAN
-            inner_color = "#4dd9ff"
+            ring_color = CYPHER_NEON_BLUE
+            inner_color = CYPHER_NEON_BLUE_BRIGHT
+            glow_color = CYPHER_NEON_BLUE
             pulse_base = math.sin(self.animation_angle * 0.6) * 6
             # Réaction au volume quand l'utilisateur parle
             audio_modifier = self.audio_level_smooth * 25
             self.animation_angle += 0.1
         else:  # IDLE
-            ring_color = JARVIS_CYAN_DIM
-            inner_color = JARVIS_CYAN
+            ring_color = CYPHER_NEON_BLUE_DIM
+            inner_color = CYPHER_NEON_BLUE
+            glow_color = CYPHER_NEON_BLUE_DARK
             pulse_base = 0
             audio_modifier = 0
             self.animation_angle = 0
@@ -779,23 +1093,13 @@ class CypherGUI(ctk.CTk):
         # Base radius avec pulse et réaction audio
         base_radius = 150 + pulse_base + audio_modifier
         
-        # UN SEUL anneau extérieur simple
-        if self.is_listening or self.is_speaking or self.is_processing:
-            outer_r = base_radius + 25
-            self.orb_canvas.create_oval(cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r,
-                                       outline=ring_color, width=1)
-        
-        # Main orb ring (épaisseur variable avec volume)
-        ring_width = 3 + int(self.audio_level_smooth * 2)
-        self.orb_canvas.create_oval(cx - base_radius, cy - base_radius,
-                                   cx + base_radius, cy + base_radius,
-                                   outline=ring_color, width=ring_width)
-        
-        # Inner circle simple
-        inner_r = base_radius - 35
-        self.orb_canvas.create_oval(cx - inner_r, cy - inner_r,
-                                   cx + inner_r, cy + inner_r,
-                                   outline=ring_color, width=1)
+        # UN SEUL anneau épais - BLEU NÉON
+        ring_width = 8 + int(self.audio_level_smooth * 4)  # Anneau plus épais
+        self.orb_canvas.create_oval(
+            cx - base_radius, cy - base_radius,
+            cx + base_radius, cy + base_radius,
+            outline=ring_color, width=ring_width
+        )
         
         # Barres audio simples (7 barres seulement, design épuré)
         num_bars = 7
@@ -923,21 +1227,21 @@ class CypherGUI(ctk.CTk):
         if not self.cpu_history or not self.ram_history:
             return
         
-        # Grille
+        # Grille avec style néon
         for i in range(5):
             y = h - (i * h // 4)
-            canvas.create_line(30, y, w - 10, y, fill=JARVIS_BORDER, width=1)
+            canvas.create_line(30, y, w - 10, y, fill=CYPHER_BORDER, width=1)
             canvas.create_text(25, y, text=f"{100 - i * 25}%", 
-                             fill=JARVIS_TEXT_DIM, font=("Arial", 8), anchor="e")
+                             fill=CYPHER_TEXT_DIM, font=("Arial", 8), anchor="e")
         
-        # Graphiques
+        # Graphiques avec BLEU NÉON
         max_samples = len(self.cpu_history)
         if max_samples < 2:
             return
         
         step_x = (w - 40) / max(max_samples - 1, 1)
         
-        # CPU line
+        # CPU line - BLEU NÉON avec glow
         cpu_points = []
         for i, val in enumerate(self.cpu_history):
             x = 30 + i * step_x
@@ -945,12 +1249,18 @@ class CypherGUI(ctk.CTk):
             cpu_points.append((x, y))
         
         if len(cpu_points) > 1:
+            # Ligne principale avec glow (effet néon)
             for i in range(len(cpu_points) - 1):
+                # Glow (ligne plus épaisse en dessous)
                 canvas.create_line(cpu_points[i][0], cpu_points[i][1],
                                  cpu_points[i + 1][0], cpu_points[i + 1][1],
-                                 fill=JARVIS_CYAN, width=2)
+                                 fill=CYPHER_NEON_BLUE_DARK, width=4)
+                # Ligne principale néon
+                canvas.create_line(cpu_points[i][0], cpu_points[i][1],
+                                 cpu_points[i + 1][0], cpu_points[i + 1][1],
+                                 fill=CYPHER_NEON_BLUE, width=2)
         
-        # RAM line
+        # RAM line - VERT NÉON
         ram_points = []
         for i, val in enumerate(self.ram_history):
             x = 30 + i * step_x
@@ -959,9 +1269,14 @@ class CypherGUI(ctk.CTk):
         
         if len(ram_points) > 1:
             for i in range(len(ram_points) - 1):
+                # Glow
                 canvas.create_line(ram_points[i][0], ram_points[i][1],
                                  ram_points[i + 1][0], ram_points[i + 1][1],
-                                 fill=JARVIS_GREEN, width=2)
+                                 fill="#003300", width=4)
+                # Ligne principale
+                canvas.create_line(ram_points[i][0], ram_points[i][1],
+                                 ram_points[i + 1][0], ram_points[i + 1][1],
+                                 fill=CYPHER_GREEN, width=2)
 
     def _update_time_loop(self):
         now = datetime.now()
@@ -1045,6 +1360,13 @@ class CypherGUI(ctk.CTk):
             # Dessiner graphiques
             self._draw_stats_graph()
             
+            # Rafraîchir les graphiques analytics si la fenêtre est ouverte
+            if self.analytics_window and self.analytics_window.winfo_viewable():
+                if hasattr(self, 'analytics_cpu_canvas'):
+                    self._draw_analytics_cpu_graph()
+                if hasattr(self, 'analytics_ram_canvas'):
+                    self._draw_analytics_ram_graph()
+            
         except Exception:
             pass
         
@@ -1105,32 +1427,22 @@ class CypherGUI(ctk.CTk):
         if state:
             self.is_interrupted = False
             self.is_processing = False
-            self.status_text.configure(text="Listening...", text_color=JARVIS_CYAN)
-            self.listening_dot.configure(text_color=JARVIS_GREEN)
-            self.status_header_text.configure(text="Active", text_color=JARVIS_GREEN)
+            self._animate_status_transition("Listening...", CYPHER_NEON_BLUE, "Active")
         else:
             if not self.is_speaking and not self.is_processing:
                 self.is_interrupted = False
-            self.status_text.configure(text="Listening for wake word...", 
-                                     text_color=JARVIS_CYAN)
-            self.listening_dot.configure(text_color=JARVIS_GREEN)
             if not self.is_speaking and not self.is_processing:
-                self.status_header_text.configure(text="Online", text_color=JARVIS_GREEN)
+                self._animate_status_transition("Listening for wake word...", CYPHER_NEON_BLUE, "Online")
 
     def set_speaking(self, state: bool):
         self.is_speaking = state
         if state:
             self.is_interrupted = False
             self.is_processing = False
-            self.status_text.configure(text="Speaking...", text_color=JARVIS_ORANGE)
-            self.listening_dot.configure(text_color=JARVIS_ORANGE)
-            self.status_header_text.configure(text="Speaking", text_color=JARVIS_ORANGE)
+            self._animate_status_transition("Speaking...", CYPHER_ORANGE, "Speaking")
         else:
             if not self.is_listening and not self.is_processing:
-                self.status_text.configure(text="Listening for wake word...", 
-                                         text_color=JARVIS_CYAN)
-                self.listening_dot.configure(text_color=JARVIS_GREEN)
-                self.status_header_text.configure(text="Online", text_color=JARVIS_GREEN)
+                self._animate_status_transition("Listening for wake word...", CYPHER_NEON_BLUE, "Online")
 
     def set_interrupted(self):
         self.is_listening = False
@@ -1138,29 +1450,79 @@ class CypherGUI(ctk.CTk):
         self.is_processing = False
         self.is_interrupted = True
         
-        self.status_text.configure(text="⛔ Interrupted !", text_color=JARVIS_RED)
-        self.listening_dot.configure(text="●", text_color=JARVIS_RED)
-        self.status_header_text.configure(text="Interrupted", text_color=JARVIS_RED)
+        self._animate_status_transition("⛔ Interrupted !", CYPHER_RED, "Interrupted")
 
     def set_processing(self, state: bool):
         self.is_processing = state
         if state:
-            self.status_text.configure(text="⚙ Processing...", text_color=JARVIS_ORANGE)
-            self.listening_dot.configure(text="●", text_color=JARVIS_ORANGE)
-            self.status_header_text.configure(text="Processing", text_color=JARVIS_ORANGE)
+            self._animate_status_transition("⚙ Processing...", CYPHER_ORANGE, "Processing")
         else:
             if not self.is_speaking and not self.is_listening:
-                self.status_text.configure(text="Listening for wake word...", 
-                                         text_color=JARVIS_CYAN)
-                self.listening_dot.configure(text_color=JARVIS_GREEN)
-                self.status_header_text.configure(text="Online", text_color=JARVIS_GREEN)
+                self._animate_status_transition("Listening for wake word...", CYPHER_NEON_BLUE, "Online")
 
     def set_reconnecting(self, state: bool):
         self.is_reconnecting = state
         if state:
-            self.status_text.configure(text="🔄 Reconnecting...", text_color=JARVIS_TEXT_DIM)
-            self.listening_dot.configure(text="●", text_color=JARVIS_TEXT_DIM)
-            self.status_header_text.configure(text="Reconnecting", text_color=JARVIS_TEXT_DIM)
+            self._animate_status_transition("🔄 Reconnecting...", CYPHER_TEXT_DIM, "Reconnecting")
+        else:
+            self._animate_status_transition("Listening for wake word...", CYPHER_NEON_BLUE, "Online")
+    
+    # ========================================
+    # ANIMATIONS ET TRANSITIONS
+    # ========================================
+    
+    def _animate_status_transition(self, text: str, color: str, header_text: str):
+        """Anime la transition de statut avec interpolation de couleur"""
+        self.target_status_text = text
+        self.target_status_color = color
+        self.target_header_text = header_text
+        
+        # Interpolation de couleur fluide
+        def interpolate_color(start_color, end_color, progress):
+            """Interpole entre deux couleurs hex"""
+            def hex_to_rgb(hex_color):
+                hex_color = hex_color.lstrip('#')
+                return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            
+            def rgb_to_hex(rgb):
+                return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+            
+            start_rgb = hex_to_rgb(start_color)
+            end_rgb = hex_to_rgb(end_color)
+            
+            new_rgb = tuple(
+                int(start_rgb[i] + (end_rgb[i] - start_rgb[i]) * progress)
+                for i in range(3)
+            )
+            return rgb_to_hex(new_rgb)
+        
+        # Animation en plusieurs étapes
+        steps = 10
+        current_step = [0]
+        
+        def animate_step():
+            if current_step[0] < steps:
+                progress = current_step[0] / steps
+                # Easing function (ease-out)
+                eased = 1 - (1 - progress) ** 3
+                
+                interp_color = interpolate_color(self.current_status_color, self.target_status_color, eased)
+                
+                self.status_text.configure(text=self.target_status_text, text_color=interp_color)
+                self.listening_dot.configure(text_color=interp_color)
+                self.status_header_text.configure(text=self.target_header_text, text_color=interp_color)
+                
+                self.current_status_color = interp_color
+                current_step[0] += 1
+                self.after(20, animate_step)
+            else:
+                # Finaliser
+                self.status_text.configure(text=self.target_status_text, text_color=self.target_status_color)
+                self.listening_dot.configure(text_color=self.target_status_color)
+                self.status_header_text.configure(text=self.target_header_text, text_color=self.target_status_color)
+                self.current_status_color = self.target_status_color
+        
+        animate_step()
     
     def _create_agent_vision_window(self):
         """Crée la fenêtre flottante pour l'Agent Vision (style WEB_AGENT_VIEW)"""
@@ -1269,6 +1631,10 @@ class CypherGUI(ctk.CTk):
             self._create_agent_vision_window()
         self.agent_vision_window.deiconify()
         self.agent_vision_window.lift()
+        self.agent_vision_window.focus_force()
+        # Forcer le premier plan temporairement
+        self.agent_vision_window.attributes('-topmost', True)
+        self.after(100, lambda: self.agent_vision_window.attributes('-topmost', False))
     
     def _add_log_to_console(self, message: str, log_type: str = "info"):
         """Ajoute un message à la console avec couleur"""
@@ -1485,6 +1851,10 @@ class CypherGUI(ctk.CTk):
             self._create_tasks_dashboard()
         self.tasks_dashboard_window.deiconify()
         self.tasks_dashboard_window.lift()
+        self.tasks_dashboard_window.focus_force()
+        # Forcer le premier plan temporairement
+        self.tasks_dashboard_window.attributes('-topmost', True)
+        self.after(100, lambda: self.tasks_dashboard_window.attributes('-topmost', False))
         self._refresh_tasks_dashboard()
     
     def _refresh_tasks_dashboard(self):
@@ -1672,6 +2042,763 @@ class CypherGUI(ctk.CTk):
         
         # Stocker le widget
         self.tasks_widgets[task_id] = task_frame
+    
+    # ========================================
+    # SYSTÈME DE NOTIFICATIONS TOAST
+    # ========================================
+    
+    def show_notification(self, title: str, message: str, notification_type: str = "info", duration: int = 3000):
+        """
+        Affiche une notification toast avec style néon
+        
+        Args:
+            title: Titre de la notification
+            message: Message de la notification
+            notification_type: "info", "success", "warning", "error"
+            duration: Durée d'affichage en ms
+        """
+        if not self.notification_container:
+            return
+        
+        # Couleurs selon le type (BLEU NÉON par défaut)
+        colors = {
+            "info": CYPHER_NEON_BLUE,
+            "success": CYPHER_GREEN,
+            "warning": CYPHER_ORANGE,
+            "error": CYPHER_RED
+        }
+        color = colors.get(notification_type, CYPHER_NEON_BLUE)
+        
+        # Créer le widget de notification
+        notif_frame = ctk.CTkFrame(
+            self.notification_container,
+            fg_color=CYPHER_PANEL_BG,
+            corner_radius=12,
+            border_width=2,
+            border_color=color,
+            width=350
+        )
+        notif_frame.pack(fill="x", padx=5, pady=5)
+        
+        # Header avec titre et icône
+        header = ctk.CTkFrame(notif_frame, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(10, 5))
+        
+        # Icône selon le type
+        icons = {
+            "info": "ℹ",
+            "success": "✓",
+            "warning": "⚠",
+            "error": "✗"
+        }
+        icon = icons.get(notification_type, "ℹ")
+        
+        ctk.CTkLabel(header, text=icon, font=("Arial", 16), 
+                    text_color=color).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(header, text=title, font=("Arial", 14, "bold"), 
+                    text_color=CYPHER_TEXT).pack(side="left", fill="x", expand=True)
+        
+        # Message
+        msg_label = ctk.CTkLabel(notif_frame, text=message, font=("Arial", 12), 
+                                text_color=CYPHER_TEXT_DIM, wraplength=320,
+                                justify="left")
+        msg_label.pack(fill="x", padx=12, pady=(0, 10))
+        
+        # Ajouter à la liste
+        self.notification_widgets.append(notif_frame)
+        
+        # Animation d'entrée (fade in + slide)
+        notif_frame.pack_forget()
+        
+        def animate_in():
+            try:
+                if not notif_frame.winfo_exists():
+                    return
+                # Slide in depuis la droite
+                notif_frame.pack(fill="x", padx=5, pady=5)
+            except:
+                pass
+        
+        self.after(50, animate_in)
+        
+        # Auto-dismiss après duration
+        def dismiss():
+            if notif_frame.winfo_exists():
+                # Animation de sortie (fade out + slide)
+                opacity_steps = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+                step = [0]
+                
+                def animate_out():
+                    try:
+                        if not notif_frame.winfo_exists() or step[0] >= len(opacity_steps):
+                            notif_frame.destroy()
+                            if notif_frame in self.notification_widgets:
+                                self.notification_widgets.remove(notif_frame)
+                            return
+                        
+                        # Fade out progressif
+                        step[0] += 1
+                        self.after(30, animate_out)
+                    except:
+                        if notif_frame in self.notification_widgets:
+                            self.notification_widgets.remove(notif_frame)
+                
+                animate_out()
+        
+        self.after(duration, dismiss)
+        
+        # Stocker dans l'historique
+        self.notifications.append({
+            "title": title,
+            "message": message,
+            "type": notification_type,
+            "timestamp": datetime.now()
+        })
+    
+    # ========================================
+    # DASHBOARD ANALYTICS AVANCÉ
+    # ========================================
+    
+    def _create_analytics_dashboard(self):
+        """Crée la fenêtre du dashboard analytics complet"""
+        if self.analytics_window is not None:
+            return
+        
+        self.analytics_window = ctk.CTkToplevel(self)
+        self.analytics_window.title("Analytics Dashboard - Cypher")
+        self.analytics_window.geometry("1400x900")
+        self.analytics_window.configure(fg_color=CYPHER_BG)
+        
+        # Empêcher la fermeture complète
+        self.analytics_window.protocol("WM_DELETE_WINDOW", self._hide_analytics_dashboard)
+        
+        # Header
+        header = ctk.CTkFrame(self.analytics_window, fg_color=CYPHER_PANEL_BG, 
+                             corner_radius=0, border_width=0)
+        header.pack(fill="x", padx=0, pady=0)
+        
+        header_inner = ctk.CTkFrame(header, fg_color="transparent")
+        header_inner.pack(fill="x", padx=20, pady=15)
+        header_inner.grid_columnconfigure(1, weight=1)
+        
+        # Logo et titre
+        title_frame = ctk.CTkFrame(header_inner, fg_color="transparent")
+        title_frame.grid(row=0, column=0, sticky="w")
+        
+        ctk.CTkLabel(title_frame, text="📈", font=("Arial", 32, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(title_frame, text="ANALYTICS DASHBOARD", 
+                    font=("Consolas", 28, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left")
+        
+        # Boutons header
+        btn_frame = ctk.CTkFrame(header_inner, fg_color="transparent")
+        btn_frame.grid(row=0, column=1, sticky="e")
+        
+        refresh_btn = ctk.CTkButton(btn_frame, text="🔄", width=40, height=40,
+                                    fg_color=CYPHER_NEON_BLUE_DARK, 
+                                    hover_color=CYPHER_BORDER,
+                                    text_color=CYPHER_NEON_BLUE, 
+                                    font=("Arial", 16),
+                                    corner_radius=8, 
+                                    command=self._refresh_analytics)
+        refresh_btn.pack(side="left", padx=(0, 5))
+        
+        close_btn = ctk.CTkButton(btn_frame, text="✕", width=40, height=40,
+                                 fg_color=CYPHER_NEON_BLUE_DARK, 
+                                 hover_color=CYPHER_RED,
+                                 text_color=CYPHER_TEXT, 
+                                 font=("Arial", 16),
+                                 corner_radius=8, 
+                                 command=self._hide_analytics_dashboard)
+        close_btn.pack(side="left")
+        
+        # Contenu principal avec onglets
+        main_container = ctk.CTkFrame(self.analytics_window, fg_color="transparent")
+        main_container.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        # Système d'onglets
+        self.analytics_tabs = ctk.CTkTabview(main_container, 
+                                            fg_color=CYPHER_PANEL_BG,
+                                            border_width=1,
+                                            border_color=CYPHER_BORDER,
+                                            corner_radius=15)
+        self.analytics_tabs.pack(fill="both", expand=True)
+        
+        # Onglet 1: Performance Système
+        perf_tab = self.analytics_tabs.add("Performance")
+        self._build_performance_tab(perf_tab)
+        
+        # Onglet 2: Productivité
+        prod_tab = self.analytics_tabs.add("Productivité")
+        self._build_productivity_tab(prod_tab)
+        
+        # Onglet 3: Interactions
+        inter_tab = self.analytics_tabs.add("Interactions")
+        self._build_interactions_tab(inter_tab)
+    
+    def _build_performance_tab(self, parent):
+        """Construit l'onglet Performance avec graphiques système"""
+        # Graphiques CPU/RAM/Disk en temps réel
+        graphs_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        graphs_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        graphs_frame.grid_columnconfigure((0, 1), weight=1)
+        graphs_frame.grid_rowconfigure((0, 1), weight=1)
+        
+        # CPU Graph
+        cpu_frame = ctk.CTkFrame(graphs_frame, fg_color=CYPHER_PANEL_BG, 
+                                 corner_radius=12, border_width=1, 
+                                 border_color=CYPHER_BORDER)
+        cpu_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        
+        ctk.CTkLabel(cpu_frame, text="CPU Usage", font=("Arial", 18, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(pady=(15, 10))
+        
+        cpu_canvas = Canvas(cpu_frame, bg=CYPHER_PANEL_BG, highlightthickness=0)
+        cpu_canvas.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        self.analytics_cpu_canvas = cpu_canvas
+        
+        # RAM Graph
+        ram_frame = ctk.CTkFrame(graphs_frame, fg_color=CYPHER_PANEL_BG, 
+                                 corner_radius=12, border_width=1, 
+                                 border_color=CYPHER_BORDER)
+        ram_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+        
+        ctk.CTkLabel(ram_frame, text="RAM Usage", font=("Arial", 18, "bold"), 
+                    text_color=CYPHER_GREEN).pack(pady=(15, 10))
+        
+        ram_canvas = Canvas(ram_frame, bg=CYPHER_PANEL_BG, highlightthickness=0)
+        ram_canvas.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        self.analytics_ram_canvas = ram_canvas
+        
+        # Stats globales
+        stats_frame = ctk.CTkFrame(graphs_frame, fg_color=CYPHER_PANEL_BG, 
+                                   corner_radius=12, border_width=1, 
+                                   border_color=CYPHER_BORDER)
+        stats_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        
+        stats_inner = ctk.CTkFrame(stats_frame, fg_color="transparent")
+        stats_inner.pack(fill="x", padx=20, pady=15)
+        stats_inner.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        
+        # Stats cards
+        stats_data = [
+            ("Uptime", f"{(datetime.now() - self.session_start).total_seconds() / 3600:.1f}h", "⏱"),
+            ("Commands", str(self.commands_count), "📊"),
+            ("Avg CPU", f"{sum(self.cpu_history) / len(self.cpu_history) if self.cpu_history else 0:.1f}%", "💻"),
+            ("Avg RAM", f"{sum(self.ram_history) / len(self.ram_history) if self.ram_history else 0:.1f}%", "🧠")
+        ]
+        
+        for i, (label, value, icon) in enumerate(stats_data):
+            card = ctk.CTkFrame(stats_inner, fg_color=CYPHER_NEON_BLUE_DARK, 
+                               corner_radius=10)
+            card.grid(row=0, column=i, sticky="nsew", padx=10)
+            
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(padx=15, pady=15)
+            
+            ctk.CTkLabel(inner, text=icon, font=("Arial", 20), 
+                        text_color=CYPHER_NEON_BLUE).pack()
+            ctk.CTkLabel(inner, text=value, font=("Consolas", 24, "bold"), 
+                        text_color=CYPHER_TEXT).pack(pady=(5, 0))
+            ctk.CTkLabel(inner, text=label, font=("Arial", 12), 
+                        text_color=CYPHER_TEXT_DIM).pack()
+    
+    def _build_productivity_tab(self, parent):
+        """Construit l'onglet Productivité avec stats des tâches"""
+        content = ctk.CTkFrame(parent, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Stats des tâches
+        try:
+            from modules.task_manager import get_task_manager
+            task_mgr = get_task_manager()
+            tasks = task_mgr.list_tasks()
+            
+            todo_count = sum(1 for t in tasks if t.get('status') == 'todo')
+            in_progress_count = sum(1 for t in tasks if t.get('status') == 'in_progress')
+            done_count = sum(1 for t in tasks if t.get('status') == 'done')
+            total_count = len(tasks)
+            
+            # Cards de stats
+            stats_grid = ctk.CTkFrame(content, fg_color="transparent")
+            stats_grid.pack(fill="x", pady=(0, 20))
+            stats_grid.grid_columnconfigure((0, 1, 2, 3), weight=1)
+            
+            stats_cards = [
+                ("Total", str(total_count), CYPHER_NEON_BLUE),
+                ("À faire", str(todo_count), CYPHER_ORANGE),
+                ("En cours", str(in_progress_count), CYPHER_YELLOW),
+                ("Terminées", str(done_count), CYPHER_GREEN)
+            ]
+            
+            for i, (label, value, color) in enumerate(stats_cards):
+                card = ctk.CTkFrame(stats_grid, fg_color=CYPHER_NEON_BLUE_DARK, 
+                                   corner_radius=12, border_width=2, 
+                                   border_color=color)
+                card.grid(row=0, column=i, sticky="nsew", padx=10)
+                
+                inner = ctk.CTkFrame(card, fg_color="transparent")
+                inner.pack(padx=20, pady=20)
+                
+                ctk.CTkLabel(inner, text=value, font=("Consolas", 36, "bold"), 
+                           text_color=color).pack()
+                ctk.CTkLabel(inner, text=label, font=("Arial", 14), 
+                           text_color=CYPHER_TEXT_DIM).pack(pady=(5, 0))
+            
+        except Exception as e:
+            ctk.CTkLabel(content, text=f"Erreur: {e}", 
+                        text_color=CYPHER_RED).pack()
+    
+    def _build_interactions_tab(self, parent):
+        """Construit l'onglet Interactions avec historique"""
+        content = ctk.CTkFrame(parent, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Timeline des interactions
+        ctk.CTkLabel(content, text="Historique des Interactions", 
+                    font=("Arial", 20, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(anchor="w", pady=(0, 15))
+        
+        # Liste scrollable
+        scroll_frame = ctk.CTkScrollableFrame(content, fg_color=CYPHER_PANEL_BG, 
+                                             corner_radius=12, 
+                                             border_width=1, 
+                                             border_color=CYPHER_BORDER)
+        scroll_frame.pack(fill="both", expand=True)
+        
+        # Afficher les dernières interactions
+        for i, (msg_type, text, timestamp) in enumerate(list(self.conversation_history)[-20:]):
+            interaction_frame = ctk.CTkFrame(scroll_frame, 
+                                           fg_color=CYPHER_NEON_BLUE_DARK, 
+                                           corner_radius=8)
+            interaction_frame.pack(fill="x", padx=10, pady=5)
+            
+            inner = ctk.CTkFrame(interaction_frame, fg_color="transparent")
+            inner.pack(fill="x", padx=15, pady=10)
+            
+            ctk.CTkLabel(inner, text=f"[{timestamp}] {msg_type}:", 
+                        font=("Consolas", 11, "bold"), 
+                        text_color=CYPHER_NEON_BLUE).pack(anchor="w")
+            ctk.CTkLabel(inner, text=text[:100] + ("..." if len(text) > 100 else ""), 
+                        font=("Arial", 12), 
+                        text_color=CYPHER_TEXT, 
+                        wraplength=800,
+                        justify="left").pack(anchor="w", pady=(5, 0))
+    
+    def _show_analytics_dashboard(self):
+        """Affiche le dashboard analytics"""
+        if self.analytics_window is None:
+            self._create_analytics_dashboard()
+        self.analytics_window.deiconify()
+        self.analytics_window.lift()
+        self.analytics_window.focus_force()
+        # Forcer le premier plan temporairement
+        self.analytics_window.attributes('-topmost', True)
+        self.after(100, lambda: self.analytics_window.attributes('-topmost', False))
+        self._refresh_analytics()
+    
+    def _hide_analytics_dashboard(self):
+        """Masque le dashboard analytics"""
+        if self.analytics_window:
+            self.analytics_window.withdraw()
+    
+    def _refresh_analytics(self):
+        """Rafraîchit les données analytics"""
+        # Mise à jour des graphiques si les canvas existent
+        if hasattr(self, 'analytics_cpu_canvas'):
+            self._draw_analytics_cpu_graph()
+        if hasattr(self, 'analytics_ram_canvas'):
+            self._draw_analytics_ram_graph()
+    
+    def _draw_analytics_cpu_graph(self):
+        """Dessine le graphique CPU détaillé"""
+        canvas = self.analytics_cpu_canvas
+        canvas.delete("all")
+        
+        w = canvas.winfo_width() or 600
+        h = canvas.winfo_height() or 300
+        
+        if not self.cpu_history:
+            return
+        
+        # Grille
+        for i in range(5):
+            y = h - (i * h // 4)
+            canvas.create_line(40, y, w - 20, y, fill=CYPHER_BORDER, width=1)
+            canvas.create_text(35, y, text=f"{100 - i * 25}%", 
+                             fill=CYPHER_TEXT_DIM, font=("Arial", 10), anchor="e")
+        
+        # Graphique avec zone remplie
+        max_samples = len(self.cpu_history)
+        step_x = (w - 60) / max(max_samples - 1, 1)
+        
+        points = []
+        for i, val in enumerate(self.cpu_history):
+            x = 40 + i * step_x
+            y = h - 20 - (val / 100) * (h - 40)
+            points.append((x, y))
+        
+        if len(points) > 1:
+            # Zone remplie (gradient effect)
+            fill_points = [(points[0][0], h - 20)] + points + [(points[-1][0], h - 20)]
+            canvas.create_polygon(fill_points, fill=CYPHER_NEON_BLUE_DARK, 
+                                 outline="", stipple="gray25")
+            
+            # Ligne principale
+            for i in range(len(points) - 1):
+                canvas.create_line(points[i][0], points[i][1],
+                                 points[i + 1][0], points[i + 1][1],
+                                 fill=CYPHER_NEON_BLUE, width=3)
+    
+    def _draw_analytics_ram_graph(self):
+        """Dessine le graphique RAM détaillé"""
+        canvas = self.analytics_ram_canvas
+        canvas.delete("all")
+        
+        w = canvas.winfo_width() or 600
+        h = canvas.winfo_height() or 300
+        
+        if not self.ram_history:
+            return
+        
+        # Grille
+        for i in range(5):
+            y = h - (i * h // 4)
+            canvas.create_line(40, y, w - 20, y, fill=CYPHER_BORDER, width=1)
+            canvas.create_text(35, y, text=f"{100 - i * 25}%", 
+                             fill=CYPHER_TEXT_DIM, font=("Arial", 10), anchor="e")
+        
+        # Graphique avec zone remplie
+        max_samples = len(self.ram_history)
+        step_x = (w - 60) / max(max_samples - 1, 1)
+        
+        points = []
+        for i, val in enumerate(self.ram_history):
+            x = 40 + i * step_x
+            y = h - 20 - (val / 100) * (h - 40)
+            points.append((x, y))
+        
+        if len(points) > 1:
+            # Zone remplie
+            fill_points = [(points[0][0], h - 20)] + points + [(points[-1][0], h - 20)]
+            canvas.create_polygon(fill_points, fill="#003300", 
+                                 outline="", stipple="gray25")
+            
+            # Ligne principale
+            for i in range(len(points) - 1):
+                canvas.create_line(points[i][0], points[i][1],
+                                 points[i + 1][0], points[i + 1][1],
+                                 fill=CYPHER_GREEN, width=3)
+    
+    # ========================================
+    # MODE IMMERSIF PLEIN ÉCRAN
+    # ========================================
+    
+    def _toggle_immersive_mode(self):
+        """Active/désactive le mode immersif plein écran"""
+        if not self.immersive_mode:
+            # Sauvegarder la géométrie actuelle
+            self.original_geometry = self.geometry()
+            # Passer en plein écran
+            self.attributes('-fullscreen', True)
+            self.immersive_mode = True
+            self.show_notification("Mode Immersif", "Mode plein écran activé", "info", 2000)
+        else:
+            # Restaurer la géométrie
+            if self.original_geometry:
+                self.geometry(self.original_geometry)
+            self.attributes('-fullscreen', False)
+            self.immersive_mode = False
+            self.show_notification("Mode Immersif", "Mode plein écran désactivé", "info", 2000)
+    
+    # ========================================
+    # VISUALISATIONS DE DONNÉES
+    # ========================================
+    
+    def _create_visualizations_window(self):
+        """Crée la fenêtre de visualisations de données"""
+        if self.visualizations_window is not None:
+            return
+        
+        self.visualizations_window = ctk.CTkToplevel(self)
+        self.visualizations_window.title("Visualisations - Cypher")
+        self.visualizations_window.geometry("1400x900")
+        self.visualizations_window.configure(fg_color=CYPHER_BG)
+        
+        self.visualizations_window.protocol("WM_DELETE_WINDOW", self._hide_visualizations)
+        
+        # Header
+        header = ctk.CTkFrame(self.visualizations_window, fg_color=CYPHER_PANEL_BG, 
+                             corner_radius=0, border_width=0)
+        header.pack(fill="x", padx=0, pady=0)
+        
+        header_inner = ctk.CTkFrame(header, fg_color="transparent")
+        header_inner.pack(fill="x", padx=20, pady=15)
+        header_inner.grid_columnconfigure(1, weight=1)
+        
+        # Logo et titre
+        title_frame = ctk.CTkFrame(header_inner, fg_color="transparent")
+        title_frame.grid(row=0, column=0, sticky="w")
+        
+        ctk.CTkLabel(title_frame, text="📊", font=("Arial", 32, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(title_frame, text="VISUALISATIONS", 
+                    font=("Consolas", 28, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(side="left")
+        
+        # Boutons header
+        btn_frame = ctk.CTkFrame(header_inner, fg_color="transparent")
+        btn_frame.grid(row=0, column=1, sticky="e")
+        
+        close_btn = ctk.CTkButton(btn_frame, text="✕", width=40, height=40,
+                                 fg_color=CYPHER_NEON_BLUE_DARK, 
+                                 hover_color=CYPHER_RED,
+                                 text_color=CYPHER_TEXT, 
+                                 font=("Arial", 16),
+                                 corner_radius=8, 
+                                 command=self._hide_visualizations)
+        close_btn.pack(side="left")
+        
+        # Contenu avec onglets
+        main_container = ctk.CTkFrame(self.visualizations_window, fg_color="transparent")
+        main_container.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        viz_tabs = ctk.CTkTabview(main_container, 
+                                 fg_color=CYPHER_PANEL_BG,
+                                 border_width=1,
+                                 border_color=CYPHER_BORDER,
+                                 corner_radius=15)
+        viz_tabs.pack(fill="both", expand=True)
+        
+        # Onglet Timeline
+        timeline_tab = viz_tabs.add("⏱ Timeline")
+        self._build_timeline_tab(timeline_tab)
+        
+        # Onglet Carte Mentale
+        mindmap_tab = viz_tabs.add("🧠 Carte Mentale")
+        self._build_mindmap_tab(mindmap_tab)
+    
+    def _build_timeline_tab(self, parent):
+        """Construit l'onglet Timeline avec historique des interactions"""
+        content = ctk.CTkFrame(parent, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Header
+        ctk.CTkLabel(content, text="Timeline des Interactions", 
+                    font=("Arial", 20, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(anchor="w", pady=(0, 15))
+        
+        # Canvas pour la timeline
+        timeline_canvas = Canvas(content, bg=CYPHER_PANEL_BG, highlightthickness=0)
+        timeline_canvas.pack(fill="both", expand=True)
+        timeline_canvas._tab_type = 'timeline'
+        
+        # Dessiner la timeline
+        self._draw_timeline(timeline_canvas)
+    
+    def _draw_timeline(self, canvas):
+        """Dessine la timeline des interactions"""
+        canvas.delete("all")
+        
+        # Forcer le calcul de la taille du canvas
+        canvas.update_idletasks()
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        
+        if w <= 1 or h <= 1:
+            w, h = 1200, 600
+        
+        if not self.conversation_history:
+            canvas.create_text(w//2, h//2, text="Aucune interaction pour le moment", 
+                             fill=CYPHER_TEXT_DIM, font=("Arial", 16))
+            return
+        
+        # Ligne centrale de la timeline
+        center_y = h // 2
+        canvas.create_line(50, center_y, w - 50, center_y, 
+                          fill=CYPHER_NEON_BLUE, width=3)
+        
+        # Points sur la timeline
+        history_list = list(self.conversation_history)
+        num_points = len(history_list)
+        
+        if num_points > 0:
+            step_x = (w - 100) / max(num_points, 1)
+            
+            for i, (msg_type, text, timestamp) in enumerate(history_list):
+                x = 50 + i * step_x
+                
+                # Couleur selon le type
+                color = CYPHER_NEON_BLUE if msg_type == "USER" else CYPHER_GREEN
+                
+                # Point sur la timeline
+                canvas.create_oval(x - 8, center_y - 8, x + 8, center_y + 8, 
+                                  fill=color, outline=CYPHER_BG, width=2)
+                
+                # Ligne verticale
+                line_height = 60 if i % 2 == 0 else -60
+                canvas.create_line(x, center_y, x, center_y + line_height, 
+                                  fill=color, width=2)
+                
+                # Texte (première ligne seulement)
+                if i % 2 == 0:
+                    canvas.create_text(x, center_y + line_height + 15, 
+                                      text=timestamp, 
+                                      fill=CYPHER_TEXT_DIM, 
+                                      font=("Arial", 9))
+                    canvas.create_text(x, center_y + line_height + 30, 
+                                      text=text[:20] + ("..." if len(text) > 20 else ""), 
+                                      fill=CYPHER_TEXT, 
+                                      font=("Arial", 10))
+    
+    def _build_mindmap_tab(self, parent):
+        """Construit l'onglet Carte Mentale"""
+        content = ctk.CTkFrame(parent, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Header
+        ctk.CTkLabel(content, text="Carte Mentale des Conversations", 
+                    font=("Arial", 20, "bold"), 
+                    text_color=CYPHER_NEON_BLUE).pack(anchor="w", pady=(0, 15))
+        
+        # Canvas pour la carte mentale
+        mindmap_canvas = Canvas(content, bg=CYPHER_PANEL_BG, highlightthickness=0)
+        mindmap_canvas.pack(fill="both", expand=True)
+        mindmap_canvas._tab_type = 'mindmap'
+        
+        # Stocker la référence pour le rafraîchissement
+        self.mindmap_canvas = mindmap_canvas
+        
+        # Dessiner la carte mentale après un court délai pour que le canvas soit affiché
+        self.after(300, lambda: self._draw_mindmap(mindmap_canvas))
+    
+    def _draw_mindmap(self, canvas):
+        """Dessine la carte mentale des sujets de conversation"""
+        canvas.delete("all")
+        
+        # Forcer le calcul de la taille du canvas
+        canvas.update_idletasks()
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        
+        if w <= 1 or h <= 1:
+            w, h = 1200, 600
+        
+        if not self.conversation_history:
+            canvas.create_text(w//2, h//2, text="Aucune conversation pour générer la carte", 
+                             fill=CYPHER_TEXT_DIM, font=("Arial", 16))
+            return
+        
+        # Centre de la carte
+        center_x, center_y = w // 2, h // 2
+        
+        # Noeud central
+        canvas.create_oval(center_x - 40, center_y - 40, center_x + 40, center_y + 40, 
+                          fill=CYPHER_NEON_BLUE_DARK, outline=CYPHER_NEON_BLUE, width=3)
+        canvas.create_text(center_x, center_y, text="Cypher", 
+                          fill=CYPHER_NEON_BLUE, font=("Arial", 16, "bold"))
+        
+        # Extraire les mots-clés des conversations (simplifié)
+        keywords = {}
+        for msg_type, text, timestamp in self.conversation_history:
+            words = text.lower().split()
+            for word in words:
+                if len(word) > 4:  # Mots de plus de 4 caractères
+                    keywords[word] = keywords.get(word, 0) + 1
+        
+        # Trier et prendre les top 8
+        top_keywords = sorted(keywords.items(), key=lambda x: x[1], reverse=True)[:8]
+        
+        # Dessiner les noeuds autour du centre
+        import math
+        num_nodes = len(top_keywords)
+        if num_nodes > 0:
+            angle_step = (2 * math.pi) / num_nodes
+            radius = min(w, h) // 3
+            
+            for i, (keyword, count) in enumerate(top_keywords):
+                angle = i * angle_step
+                node_x = center_x + radius * math.cos(angle)
+                node_y = center_y + radius * math.sin(angle)
+                
+                # Ligne de connexion
+                canvas.create_line(center_x, center_y, node_x, node_y, 
+                                  fill=CYPHER_NEON_BLUE_DIM, width=2)
+                
+                # Noeud
+                node_size = 30 + (count * 5)  # Taille selon fréquence
+                canvas.create_oval(node_x - node_size, node_y - node_size, 
+                                  node_x + node_size, node_y + node_size, 
+                                  fill=CYPHER_NEON_BLUE_DARK, 
+                                  outline=CYPHER_NEON_BLUE, width=2)
+                
+                # Texte
+                canvas.create_text(node_x, node_y, text=keyword[:10], 
+                                  fill=CYPHER_NEON_BLUE, font=("Arial", 10, "bold"))
+                canvas.create_text(node_x, node_y + 20, text=f"({count})", 
+                                  fill=CYPHER_TEXT_DIM, font=("Arial", 8))
+    
+    def _show_visualizations(self):
+        """Affiche la fenêtre de visualisations"""
+        if self.visualizations_window is None:
+            self._create_visualizations_window()
+        self.visualizations_window.deiconify()
+        self.visualizations_window.lift()
+        self.visualizations_window.focus_force()
+        # Forcer le premier plan temporairement
+        self.visualizations_window.attributes('-topmost', True)
+        self.after(100, lambda: self.visualizations_window.attributes('-topmost', False))
+        # Rafraîchir les visualisations après que la fenêtre soit affichée
+        self.after(200, lambda: self._refresh_visualizations())
+    
+    def _hide_visualizations(self):
+        """Masque la fenêtre de visualisations"""
+        if self.visualizations_window:
+            self.visualizations_window.withdraw()
+    
+    def _refresh_visualizations(self):
+        """Rafraîchit les visualisations"""
+        if self.visualizations_window and self.visualizations_window.winfo_viewable():
+            # Forcer la mise à jour de la fenêtre
+            self.visualizations_window.update_idletasks()
+            
+            # Redessiner les canvas stockés
+            if self.timeline_canvas:
+                self._draw_timeline(self.timeline_canvas)
+            if self.mindmap_canvas:
+                self._draw_mindmap(self.mindmap_canvas)
+    
+    def _toggle_sleep_wake(self):
+        """Bascule entre veille et réveil de Cypher"""
+        if self.is_sleeping:
+            # Réveiller Cypher (il est actuellement en veille)
+            self.is_sleeping = False
+            self.sleep_wake_btn.configure(text="⏸", text_color=JARVIS_CYAN, border_color=JARVIS_CYAN)  # Icône pause pour mettre en veille
+            # Envoyer commande de réveil au backend
+            try:
+                self.data_queue.put(("GUI_COMMAND", "WAKE"))
+            except Exception as e:
+                print(f"Erreur envoi WAKE: {e}")
+        else:
+            # Mettre Cypher en veille (il est actuellement réveillé)
+            self.is_sleeping = True
+            self.sleep_wake_btn.configure(text="⏻", text_color=JARVIS_GREEN, border_color=JARVIS_GREEN)  # Icône power pour réveiller
+            # Envoyer commande de veille au backend
+            try:
+                self.data_queue.put(("GUI_COMMAND", "SLEEP"))
+            except Exception as e:
+                print(f"Erreur envoi SLEEP: {e}")
+    
+    def _update_sleep_button(self):
+        """Met à jour l'apparence du bouton selon l'état actuel"""
+        if hasattr(self, 'sleep_wake_btn'):
+            if self.is_sleeping:
+                # Cypher est en veille -> bouton power vert pour réveiller
+                self.sleep_wake_btn.configure(text="⏻", text_color=JARVIS_GREEN, border_color=JARVIS_GREEN)
+            else:
+                # Cypher est réveillé -> bouton pause bleu pour mettre en veille
+                self.sleep_wake_btn.configure(text="⏸", text_color=JARVIS_CYAN, border_color=JARVIS_CYAN)
 
 
 # Pour tests sans le main.py
